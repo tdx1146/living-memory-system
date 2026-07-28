@@ -20,8 +20,8 @@
 
   Layer 3 - Meta-Purpose（元目的）:
       对"自己的 precision 是否合适"的元层面评估
-      允许目的的"翻转"——不是渐进调整，是质变
-      当 coherence 持续低时，在历史中找最高惊讶维度强化
+      允许目的的"方向翻转"——不是渐进调整，是质变
+      当 coherence 持续低时，切换到最未被探索的维度
 
 对应 dandan 的概念:
   - "目的是随对话共生" → precision 在每轮对话中被调整
@@ -54,7 +54,9 @@ class PurposeLayer:
                  precision_max: float = 10.0,
                  coherence_threshold: float = 0.3,
                  min_history_length: int = 5,
-                 meta_window: int = 10) -> None:
+                 meta_window: int = 10,
+                 max_history: int = 100,
+                 habituation_rate: float = 0.05) -> None:
         """初始化目的层。
 
         参数:
@@ -65,6 +67,8 @@ class PurposeLayer:
             coherence_threshold: coherence 低于此值时考虑触发元目的翻转。
             min_history_length: 触发翻转所需的最短历史长度。
             meta_window: 元目的翻转时回看的历史窗口大小。
+            max_history: precision 历史上限，防止无界增长（默认 meta_window*10）。
+            habituation_rate: 习惯化衰减率，控制"常遇到→低precision"的速度。
         """
         self.input_dim = input_dim
         self.precision_lr = precision_lr
@@ -73,6 +77,8 @@ class PurposeLayer:
         self.coherence_threshold = coherence_threshold
         self.min_history_length = min_history_length
         self.meta_window = meta_window
+        self.max_history = max_history
+        self.habituation_rate = habituation_rate
 
         # Layer 1: Sensory Precision —— 初始均匀分布
         self.sensory_precision: torch.Tensor = torch.ones(input_dim)
@@ -84,6 +90,11 @@ class PurposeLayer:
         # Layer 3: Meta-Purpose —— 元目的状态
         self.flipped: bool = False  # 是否发生过翻转
         self.flip_count: int = 0    # 翻转次数
+
+        # 习惯化计数器：跟踪每个维度被"遇到"的次数（G2 修复）
+        # 高频激活维度 → encounter_count 高 → habituation 衰减大 → precision 降低
+        # 这是累积计数，不随 history 裁剪而重置
+        self.encounter_count: torch.Tensor = torch.zeros(input_dim)
 
         # precision 演化历史
         self.history: list[torch.Tensor] = []
@@ -159,30 +170,28 @@ class PurposeLayer:
     # ------------------------------------------------------------------ #
 
     def _meta_adjust(self) -> None:
-        """元目的翻转：当 coherence 持续低时触发。
+        """元目的方向翻转：当 coherence 持续低时触发。
 
-        不是立刻翻转，而是在历史中找到最高惊讶维度（平均 precision 最高），
-        强化它——这对应"突然对某个方向产生兴趣"。
+        真正的"方向翻转"——不是加倍下注强化已有方向，而是切换到
+        **最未被探索**的维度（encounter_count 最低的维度），
+        探索全新的关注方向。这对应"突然对某个新方向产生兴趣"。
 
-        翻转策略:
-          1. 回看近期历史，找出平均 precision 最高的维度
-          2. 将该维度 precision 设为最大值（大幅强化）
+        翻转策略（方向翻转）:
+          1. 找出 encounter_count 最低的维度（最未被探索）
+          2. 将该维度 precision 设为最大值（大幅强化新方向）
           3. 适当衰减其他维度（腾出注意力空间）
           4. 标记翻转发生
+
+        注意：方法名保持 _meta_adjust 以兼容外部调用，
+        但语义上是"方向翻转"（meta-flip），而非"加倍下注"。
         """
         if len(self.history) < 1:
             return
 
-        # 回看近期历史窗口
-        window = min(self.meta_window, len(self.history))
-        recent = self.history[-window:]
-        history_tensor = torch.stack(recent)  # [window, input_dim]
+        # 找最未被探索的维度（encounter_count 最低）
+        target_dim = int(self.encounter_count.argmin().item())
 
-        # 找历史中平均 precision 最高的维度
-        avg_precision = history_tensor.mean(dim=0)  # [input_dim]
-        target_dim = int(avg_precision.argmax().item())
-
-        # 强化目标维度：设为最大值
+        # 强化目标维度：设为最大值（探索新方向）
         self.sensory_precision[target_dim] = self.precision_max
 
         # 轻微衰减其他维度（腾出注意力空间，但不至于归零）
@@ -213,6 +222,8 @@ class PurposeLayer:
           - 高惊讶维度 → 提高 precision（更关注，学得更快）
           - 低惊讶维度 → 降低 precision（已熟悉，减少关注）
           - 但不是简单的贪心调整——有自身一致性约束（coherence）
+          - 习惯化机制：常遇到的维度 → encounter_count 高 → habituation 衰减
+            → per_dim_surprise 降低 → precision 降低（实现"已熟悉→低precision"）
 
         调整规则遵循 FEP 元层面:
           - precision 的更新 = 最小化"元自由能"
@@ -224,8 +235,22 @@ class PurposeLayer:
             surprise: 标量惊讶度（自由能），来自吸引子网络。
             activation: 激活态，用于提取每个感官维度的惊讶度。
         """
+        # --- G2: 习惯化计数器更新 ---
+        # 统计每个感官维度被"遇到"（显著激活）的次数
+        # encounter_count 是累积计数，不随 history 裁剪而重置
+        self.encounter_count += (
+            activation.state[:self.input_dim].abs() > 0.3
+        ).float()
+
         # --- Layer 1: 基于 per-dimension 惊讶度调整 sensory precision ---
         per_dim_surprise = self._compute_per_dim_surprise(activation)
+
+        # G2: 习惯化衰减——常遇到的维度 surprise 被抑制
+        # habituation = 1 / (1 + encounter_count * rate)
+        # encounter_count=0 → habituation=1.0（无衰减）
+        # encounter_count=20 → habituation=1/(1+20*0.05)=0.5（衰减一半）
+        habituation = 1.0 / (1.0 + self.encounter_count * self.habituation_rate)
+        per_dim_surprise = per_dim_surprise * habituation
 
         # 指数移动平均：precision 向 per_dim_surprise 靠拢
         # surprise 全局缩放因子：总惊讶度越高，调整幅度越大
@@ -246,17 +271,21 @@ class PurposeLayer:
         self.attention = torch.softmax(self.sensory_precision, dim=0)
         self.coherence = self._compute_coherence()
 
-        # --- Layer 3: 元目的翻转 ---
+        # --- Layer 3: 元目的方向翻转 ---
         # 重置翻转标记（每次 adjust 重新判断）
         self.flipped = False
         if (self.coherence < self.coherence_threshold
                 and len(self.history) >= self.min_history_length):
             self._meta_adjust()
-            # 翻转后重新计算 attention
+            # 翻转后重新计算 attention 和 coherence（G6 修复）
             self.attention = torch.softmax(self.sensory_precision, dim=0)
+            self.coherence = self._compute_coherence()
 
         # --- 记录历史 ---
         self.history.append(self.sensory_precision.clone())
+        # S3: 裁剪历史到上限，防止无界增长
+        if len(self.history) > self.max_history:
+            self.history = self.history[-self.max_history:]
 
     def get_precision(self) -> torch.Tensor:
         """返回当前 precision 向量。
@@ -277,3 +306,18 @@ class PurposeLayer:
             history=[p.clone() for p in self.history],
             coherence=self.coherence,
         )
+
+    def set_purpose(self, state: PurposeState) -> None:
+        """从 PurposeState 恢复目的层状态。
+
+        封装内部属性恢复逻辑，使 persistence 层通过公开接口操作，
+        而非依赖脆弱的属性直写。
+
+        参数:
+            state: PurposeState，包含 precision、history 和 coherence。
+        """
+        self.sensory_precision = state.precision.clone()
+        self.history = [p.clone() for p in state.history]
+        self.coherence = state.coherence
+        # 重算 attention（从恢复的 precision 派生）
+        self.attention = torch.softmax(self.sensory_precision, dim=0)

@@ -136,6 +136,6 @@ def loop_config():
         'input_dim': 32,
         'decoder_mode': 'text',
         'consolidation_interval': 3,
-        'infer_steps': 5,
+        'num_infer_steps': 5,
         'learning_rate': 0.01,
     }

@@ -74,13 +74,17 @@ class AttractorNetwork:
     """
 
     def __init__(self, num_nodes: int, input_dim: int,
-                 seed: int = 42) -> None:
+                 seed: int = 42,
+                 temperature: float = 0.05) -> None:
         """初始化吸引子网络。
 
         参数:
             num_nodes: 网络节点总数（建议 256-1024）。
             input_dim: 感官输入维度。前 input_dim 个节点为感官节点。
             seed: 随机种子，保证可复现。
+            temperature: Langevin 动力学温度（扩散项噪声强度）。
+                T > 0 时相似但不同的输入有机会收敛到不同吸引子，
+                使正交化学习规则能够发挥作用。设为 0 则退化为纯平均场推断。
         """
         assert input_dim <= num_nodes, (
             f"input_dim({input_dim}) 不能大于 num_nodes({num_nodes})"
@@ -112,11 +116,11 @@ class AttractorNetwork:
         self.complexity_weight: float = 0.01
         self.orth_weight: float = 0.5
 
-        # Langevin 温度：扩散项的噪声强度
+        # Langevin 温度：扩散项的噪声强度（G7 修复：从构造参数获取）
         # 物理上 Langevin 动力学 = 漂移(确定性) + 扩散(随机性)
         # temperature > 0 时，相似但不同的输入有机会收敛到不同吸引子，
         # 使正交化学习规则能够发挥作用。设为 0 则退化为纯平均场推断。
-        self.temperature: float = 0.05
+        self.temperature: float = temperature
 
     # ------------------------------------------------------------------ #
     #  推断
@@ -149,6 +153,16 @@ class AttractorNetwork:
         返回:
             收敛后的 Activation（激活态 + 熵 + 惊讶度）。
         """
+        # B7 修复：输入形状校验，防止晦涩的广播错误
+        assert sensory_input.shape == (self.input_dim,), (
+            f"sensory_input shape mismatch: {sensory_input.shape} "
+            f"!= ({self.input_dim},)"
+        )
+        assert precision.shape == (self.input_dim,), (
+            f"precision shape mismatch: {precision.shape} "
+            f"!= ({self.input_dim},)"
+        )
+
         sigma = self.sigma.clone()
 
         for _step in range(num_steps):

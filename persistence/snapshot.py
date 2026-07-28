@@ -42,6 +42,24 @@ class Snapshot:
         - precision: precision向量 [input_dim]
         - history: precision历史列表
         - coherence: 一致性值
+
+    接口设计说明（G5）:
+        save()/load() 采用 **dict 接口** 而非直接接受 core 对象。
+        这是有意的架构决策，目的是彻底解耦 persistence 与 core 层
+        （架构约束：依赖图为无环DAG core <- persistence <- runtime，
+        persistence 只负责序列化/反序列化，不做业务逻辑）。
+
+        - 使用 dict 接口：persistence 无需在运行时导入 core 的具体类
+          （如 AttractorNetwork / PurposeLayer），避免循环依赖与层间耦合。
+          符合"高内聚 + 低耦合"原则。
+        - 调用方负责对象 <-> dict 的转换：
+            * attractor_landscape 由调用方通过
+              AttractorNetwork.get_landscape() 获取后传入；
+            * purpose_state 由调用方构造为包含 precision / history /
+              coherence 键的 dict（可由 PurposeLayer.get_purpose()
+              返回的 PurposeState 拆解得到）。
+        - 架构文档 5.5 节虽描述为"接受对象"的接口，但 dict 实现是更优的
+          解耦设计，本实现以 dict 为准，并在 persistence 层内部保持一致。
     """
 
     def save(self, path: str, attractor_landscape: dict,
@@ -50,10 +68,13 @@ class Snapshot:
 
         参数:
             path: 保存路径（.pt文件）
-            attractor_landscape: 吸引子景观状态字典
-                （通常由 AttractorNetwork.get_landscape() 获取）
-            purpose_state: 目的层状态字典
-                （包含precision、history、coherence）
+            attractor_landscape: 吸引子景观状态字典，由调用方通过
+                AttractorNetwork.get_landscape() 获取后传入。应包含键：
+                J / bias / sigma（torch.Tensor）与 num_nodes / input_dim（int）。
+            purpose_state: 目的层状态字典，由调用方构造。应包含键：
+                precision（torch.Tensor）/ history（list[torch.Tensor]）/
+                coherence（float）。可由 PurposeLayer.get_purpose() 返回的
+                PurposeState 拆解得到。
         """
         data = {
             'version': SNAPSHOT_VERSION,

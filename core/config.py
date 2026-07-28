@@ -35,6 +35,14 @@ class CoreConfig:
         min_history_length: 触发元目的翻转所需的最短历史长度。
         meta_window: 元目的翻转时回看的历史窗口大小。
         seed: 随机种子，保证可复现性。
+        temperature: Langevin 动力学温度（扩散项噪声强度）。
+        max_history: 目的层 precision 历史上限，防止无界增长。
+        habituation_rate: 习惯化衰减率，控制"常遇到→低precision"的速度。
+        transfer_rate: 记忆巩固时短时→长时的迁移率。
+        replay_count: 记忆巩固时回放的条目数。
+        replay_weight: 记忆巩固时回放的权重。
+        consolidation_decay: 巩固后短时记忆的衰减系数。
+        buffer_capacity: 记忆缓冲区容量。
     """
 
     # 网络结构
@@ -44,10 +52,16 @@ class CoreConfig:
     # 学习与推断
     learning_rate: float = 0.01
     num_infer_steps: int = 10
+    temperature: float = 0.05
 
     # 记忆管理
     short_term_decay: float = 0.8
     long_term_decay: float = 0.999
+    transfer_rate: float = 0.1
+    replay_count: int = 10
+    replay_weight: float = 0.01
+    consolidation_decay: float = 0.5
+    buffer_capacity: int = 100
 
     # 目的层
     precision_min: float = 0.1
@@ -56,6 +70,8 @@ class CoreConfig:
     coherence_threshold: float = 0.3
     min_history_length: int = 5
     meta_window: int = 10
+    max_history: int = 100
+    habituation_rate: float = 0.05
 
     # FEP 学习规则
     complexity_weight: float = 0.01

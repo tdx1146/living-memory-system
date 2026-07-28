@@ -59,7 +59,7 @@ class TestMultiScaleUpdate:
         mem = MemoryManager(num_nodes=32)
         act = make_activation(32, torch.ones(32) * 0.5)
 
-        mem.update(act)
+        mem.update(act, act.surprise)
         assert not torch.allclose(mem.short_term_latent, torch.zeros(32))
 
     def test_update_changes_long_term(self):
@@ -67,7 +67,7 @@ class TestMultiScaleUpdate:
         mem = MemoryManager(num_nodes=32)
         act = make_activation(32, torch.ones(32) * 0.5)
 
-        mem.update(act)
+        mem.update(act, act.surprise)
         assert not torch.allclose(mem.long_term_latent, torch.zeros(32))
 
     def test_short_term_changes_faster(self):
@@ -79,7 +79,7 @@ class TestMultiScaleUpdate:
         )
         act = make_activation(32, torch.ones(32) * 1.0)
 
-        mem.update(act)
+        mem.update(act, act.surprise)
 
         # 短时记忆变化幅度应远大于长时记忆
         short_change = mem.short_term_latent.abs().mean().item()
@@ -98,13 +98,13 @@ class TestMultiScaleUpdate:
         # 写入一个模式
         pattern = torch.ones(32) * 1.0
         act = make_activation(32, pattern)
-        mem.update(act)
+        mem.update(act, act.surprise)
 
         short_after_write = mem.short_term_latent.clone()
 
         # 然后写入零模式（模拟"无输入"）
         for _ in range(5):
-            mem.update(make_activation(32, torch.zeros(32)))
+            mem.update(make_activation(32, torch.zeros(32)), 1.0)
 
         # 短时记忆应大幅衰减
         assert mem.short_term_latent.abs().mean() < short_after_write.abs().mean() * 0.5
@@ -119,12 +119,12 @@ class TestMultiScaleUpdate:
 
         # 写入一个模式
         pattern = torch.ones(32) * 1.0
-        mem.update(make_activation(32, pattern))
+        mem.update(make_activation(32, pattern), 1.0)
         long_after_write = mem.long_term_latent.clone()
 
         # 然后写入不同模式
         for _ in range(5):
-            mem.update(make_activation(32, torch.zeros(32)))
+            mem.update(make_activation(32, torch.zeros(32)), 1.0)
 
         # 长时记忆应保留大部分原始值
         retention = (mem.long_term_latent * long_after_write).sum().item() / (
@@ -139,12 +139,12 @@ class TestMultiScaleUpdate:
         act = make_activation(32, pattern)
 
         # 第一次更新
-        mem.update(act)
+        mem.update(act, act.surprise)
         long_after_1 = mem.long_term_latent.abs().sum().item()
 
         # 再更新 9 次
         for _ in range(9):
-            mem.update(act)
+            mem.update(act, act.surprise)
 
         long_after_10 = mem.long_term_latent.abs().sum().item()
 
@@ -167,7 +167,7 @@ class TestConsolidation:
         # 写入短时记忆
         pattern = torch.ones(32) * 0.5
         for _ in range(5):
-            mem.update(make_activation(32, pattern))
+            mem.update(make_activation(32, pattern), 1.0)
 
         long_before = mem.long_term_latent.clone()
         short_before = mem.short_term_latent.clone()
@@ -186,7 +186,7 @@ class TestConsolidation:
         # 写入短时记忆
         pattern = torch.ones(32) * 0.5
         for _ in range(5):
-            mem.update(make_activation(32, pattern))
+            mem.update(make_activation(32, pattern), 1.0)
 
         short_before = mem.short_term_latent.abs().sum().item()
 
@@ -207,7 +207,7 @@ class TestConsolidation:
         pattern[0] = 1.0
         pattern[1] = 1.0
         for _ in range(5):
-            mem.update(make_activation(32, pattern))
+            mem.update(make_activation(32, pattern), 1.0)
 
         total_before = (
             mem.short_term_latent.abs().sum().item()
@@ -231,7 +231,7 @@ class TestConsolidation:
         # 持续更新和巩固
         for _ in range(10):
             pattern = torch.randn(32) * 0.5
-            mem.update(make_activation(32, pattern))
+            mem.update(make_activation(32, pattern), 1.0)
             mem.consolidate()
 
         # 不应产生 NaN/Inf
@@ -274,7 +274,7 @@ class TestRecall:
         pattern[0] = 1.0
         pattern[1] = 1.0
         for _ in range(20):
-            mem.update(make_activation(32, pattern))
+            mem.update(make_activation(32, pattern), 1.0)
 
         # 用相同模式作为 cue 检索
         cue = pattern.clone()
@@ -291,7 +291,7 @@ class TestRecall:
         # 存入均匀模式
         pattern = torch.ones(32) * 0.5
         for _ in range(20):
-            mem.update(make_activation(32, pattern))
+            mem.update(make_activation(32, pattern), 1.0)
 
         # cue 只激活前半部分
         cue = torch.zeros(32)
@@ -329,7 +329,7 @@ class TestMemoryState:
         mem = MemoryManager(num_nodes=32)
         pattern = torch.randn(32) * 0.5
         for _ in range(5):
-            mem.update(make_activation(32, pattern))
+            mem.update(make_activation(32, pattern), 1.0)
 
         state = mem.get_state()
 
@@ -344,7 +344,7 @@ class TestMemoryState:
         """get_state 返回副本。"""
         mem = MemoryManager(num_nodes=32)
         pattern = torch.ones(32) * 0.5
-        mem.update(make_activation(32, pattern))
+        mem.update(make_activation(32, pattern), 1.0)
 
         state = mem.get_state()
         state["short_term_latent"].fill_(0.0)

@@ -14,6 +14,7 @@ consolidation（巩固）机制将短时记忆迁移到长时记忆，
 """
 
 import torch
+from collections import deque
 
 from core.types import Activation
 
@@ -32,7 +33,12 @@ class MemoryManager:
 
     def __init__(self, num_nodes: int,
                  short_term_decay: float = 0.8,
-                 long_term_decay: float = 0.999) -> None:
+                 long_term_decay: float = 0.999,
+                 transfer_rate: float = 0.1,
+                 replay_count: int = 10,
+                 replay_weight: float = 0.01,
+                 consolidation_decay: float = 0.5,
+                 buffer_capacity: int = 100) -> None:
         """初始化记忆管理器。
 
         参数:
@@ -41,20 +47,30 @@ class MemoryManager:
                 越小遗忘越快。0.8 表示每步保留 80%，遗忘 20%。
             long_term_decay: 长时记忆衰减系数。
                 越接近 1 保留越久。0.999 表示每步保留 99.9%。
+            transfer_rate: 巩固时短时→长时的迁移率。
+            replay_count: 巩固时回放的条目数。
+            replay_weight: 巩固时回放的权重。
+            consolidation_decay: 巩固后短时记忆的衰减系数。
+            buffer_capacity: 经验缓冲区容量。
         """
         self.num_nodes = num_nodes
         self.short_term_decay = short_term_decay
         self.long_term_decay = long_term_decay
+        self.transfer_rate = transfer_rate
+        self.replay_count = replay_count
+        self.replay_weight = replay_weight
+        self.consolidation_decay = consolidation_decay
+        self._buffer_capacity = buffer_capacity
 
         # EMA 潜变量：初始为零
         self.short_term_latent: torch.Tensor = torch.zeros(num_nodes)
         self.long_term_latent: torch.Tensor = torch.zeros(num_nodes)
 
-        # 缓冲区：存储近期激活，用于 consolidation 回放
-        self._buffer: list[torch.Tensor] = []
-        self._buffer_capacity: int = 100
+        # 缓冲区：存储 (state, surprise) 元组，用于 consolidation 重要性加权回放
+        # 使用 deque 自动处理容量限制（B4 修复），O(1) 追加与淘汰
+        self._buffer: deque = deque(maxlen=self._buffer_capacity)
 
-    def update(self, activation: Activation) -> None:
+    def update(self, activation: Activation, surprise: float = 0.0) -> None:
         """更新短时/长时记忆潜变量。
 
         使用指数移动平均（EMA）:
@@ -66,6 +82,8 @@ class MemoryManager:
 
         参数:
             activation: 当前激活态。
+            surprise: 当前激活态的惊讶度（自由能），用于后续 consolidation
+                的重要性加权回放。从 activation.surprise 获取。
         """
         state = activation.state
         alpha_s = 1.0 - self.short_term_decay  # 短时 EMA 权重
@@ -78,39 +96,40 @@ class MemoryManager:
             self.long_term_decay * self.long_term_latent + alpha_l * state
         )
 
-        # 缓冲近期激活用于回放
-        self._buffer.append(state.clone())
-        if len(self._buffer) > self._buffer_capacity:
-            self._buffer.pop(0)
+        # 缓冲 (state, surprise) 用于回放（deque 自动处理容量限制）
+        self._buffer.append((state.clone(), surprise))
 
     def consolidate(self) -> None:
         """记忆巩固：短时 -> 长时迁移，回放重要经验。
 
         模拟睡眠期间的记忆巩固:
           1. 将短时潜变量的部分内容迁移到长时潜变量
-          2. 回放缓冲区中的近期激活（模拟 REM 睡眠回放）
+          2. 按 surprise 排序回放缓冲区中的经验（模拟 REM 睡眠回放）
+             优先回放高 surprise（重要/意外）的条目，而非简单的最近条目
           3. 衰减短时潜变量（为新记忆腾出空间）
 
         这个过程是"身份"稳定的关键——
         短暂的经历被筛选、强化后固化为长期记忆。
         """
         # 短时 -> 长时迁移
-        transfer_rate = 0.1
         self.long_term_latent = (
-            self.long_term_latent + transfer_rate * self.short_term_latent
+            self.long_term_latent + self.transfer_rate * self.short_term_latent
         )
 
-        # 回放近期激活（模拟 REM 睡眠回放）
+        # 按 surprise 排序回放重要经验（G3 修复：重要性加权而非时间序）
         if self._buffer:
-            replay_count = min(10, len(self._buffer))
-            replay_weight = 0.01
-            for state in self._buffer[-replay_count:]:
+            # 按 surprise 降序排列，优先回放高 surprise 条目
+            sorted_buffer = sorted(self._buffer, key=lambda x: x[1], reverse=True)
+            replay_count = min(self.replay_count, len(sorted_buffer))
+            for state, surprise in sorted_buffer[:replay_count]:
+                # 回放权重也按 surprise 加权（高 surprise = 重要经验）
+                weight = self.replay_weight * max(surprise, 0.0)
                 self.long_term_latent = (
-                    self.long_term_latent + replay_weight * state
+                    self.long_term_latent + weight * state
                 )
 
         # 衰减短时记忆（为新记忆腾出空间）
-        self.short_term_latent = self.short_term_latent * 0.5
+        self.short_term_latent = self.short_term_latent * self.consolidation_decay
 
     def recall(self, cue: torch.Tensor) -> torch.Tensor:
         """从记忆中检索：用线索激活相关记忆。
