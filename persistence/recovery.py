@@ -9,8 +9,9 @@
     本模块通过 Protocol 接口操作 core 层对象，不直接依赖 core 的具体类，
     以实现 persistence 与 core 的彻底解耦
     （架构约束：依赖图为无环DAG core <- persistence <- runtime）。
-    recover() / _restore_attractor() / _restore_purpose() 接受的是 Protocol
-    类型，而非具体的 AttractorNetwork / PurposeLayer。
+    recover() / _restore_attractor() / _restore_purpose() / _restore_memory()
+    接受的是 Protocol 类型，而非具体的 AttractorNetwork / PurposeLayer /
+    MemoryManager。
 
     快照数据以 dict 形式在 persistence 层流转（而非 core 对象），
     persistence 只负责序列化/反序列化，不做业务逻辑（高内聚 + 低耦合）：
@@ -18,12 +19,14 @@
       获取后传入，包含 J / bias / sigma / num_nodes / input_dim 键。
     - purpose_state: 由调用方构造为包含 precision / history / coherence
       键的 dict。
+    - memory_state: 由调用方通过 MemoryManager.get_state() 获取后传入，
+      包含 short_term_latent / long_term_latent / num_nodes 键（N1）。
 """
 
 import os
 import logging
 import torch
-from typing import Protocol, runtime_checkable
+from typing import Protocol, runtime_checkable, Optional
 
 from persistence.snapshot import Snapshot, SNAPSHOT_VERSION, _torch_load
 from core.types import PurposeState
@@ -72,6 +75,19 @@ class RestorablePurpose(Protocol):
     attention: torch.Tensor
 
 
+@runtime_checkable
+class RestorableMemory(Protocol):
+    """可恢复的记忆管理器接口（N1）。
+
+    定义 persistence 层恢复记忆潜变量所需的最小接口契约。
+    core 层的 MemoryManager 满足此 Protocol（已实现 set_state）。
+    """
+
+    def set_state(self, state: dict) -> None:
+        """从状态字典恢复记忆潜变量。"""
+        ...
+
+
 class Recovery:
     """断点续传管理器。
 
@@ -87,12 +103,14 @@ class Recovery:
         self.snapshot = Snapshot()
 
     def recover(self, path: str, attractor: RestorableAttractor,
-                purpose: RestorablePurpose) -> bool:
+                purpose: RestorablePurpose,
+                memory: Optional[RestorableMemory] = None) -> bool:
         """从快照恢复吸引子和目的层状态。
 
         兼容不同core实现：
         - AttractorNetwork: 优先调用set_landscape，否则直接设置属性
         - PurposeLayer: 优先调用set_purpose，否则直接设置属性
+        - MemoryManager: 优先调用set_state（N1），否则跳过
 
         参数:
             path: 快照文件路径
@@ -100,6 +118,9 @@ class Recovery:
                 （如 core 层的 AttractorNetwork 实例）
             purpose: 满足 RestorablePurpose 协议的对象
                 （如 core 层的 PurposeLayer 实例）
+            memory: 满足 RestorableMemory 协议的对象（可选，N1）
+                （如 core 层的 MemoryManager 实例）。为 None 时跳过
+                memory 恢复（向后兼容旧版调用方）。
 
         返回:
             True表示恢复成功，False表示恢复失败
@@ -107,7 +128,7 @@ class Recovery:
         说明:
             快照内部以 dict 形式存储状态（见 Snapshot），本方法不直接操作
             core 对象的业务方法，仅做反序列化与状态回填，实现 persistence
-            与 core 的解耦。
+            与 core 的解耦。memory 字段为可选——旧版快照无此字段时优雅降级。
         """
         try:
             if not self.validate(path):
@@ -122,6 +143,16 @@ class Recovery:
 
             # 恢复目的层
             self._restore_purpose(purpose, purpose_state)
+
+            # N1: 恢复记忆潜变量（如果提供了 memory 对象且快照包含 memory 字段）
+            if memory is not None:
+                raw_data = self.snapshot.load_raw(path)
+                memory_state = raw_data.get('memory')
+                if memory_state is not None:
+                    self._restore_memory(memory, memory_state)
+                    logger.info("记忆潜变量已恢复")
+                else:
+                    logger.info("快照不含 memory 字段，跳过记忆恢复（向后兼容）")
 
             logger.info(f"从 {path} 恢复成功")
             return True
@@ -164,15 +195,17 @@ class Recovery:
 
         优先调用set_purpose方法，否则直接设置属性。
         兼容没有set_purpose方法的PurposeLayer实现。
+        N3: 同时恢复 encounter_count（如果快照中包含此字段）。
 
         参数:
             purpose: 满足 RestorablePurpose 协议的对象
             purpose_state: 目的层状态字典（由调用方构造，包含
-                precision / history / coherence 键）
+                precision / history / coherence / encounter_count 键）
         """
         precision = purpose_state.get('precision')
         history = purpose_state.get('history', [])
         coherence = purpose_state.get('coherence', 1.0)
+        encounter_count = purpose_state.get('encounter_count')  # N3
 
         if hasattr(purpose, 'set_purpose'):
             # 有set_purpose方法的实现
@@ -180,6 +213,7 @@ class Recovery:
                 precision=precision,
                 history=history,
                 coherence=coherence,
+                encounter_count=encounter_count,
             )
             purpose.set_purpose(purpose_state_obj)
             logger.info("目的层状态已恢复（via set_purpose）")
@@ -192,11 +226,31 @@ class Recovery:
                                    for h in history]
             if hasattr(purpose, 'coherence'):
                 purpose.coherence = coherence
+            # N3: 恢复 encounter_count
+            if encounter_count is not None and hasattr(purpose, 'encounter_count'):
+                purpose.encounter_count = encounter_count.clone()
             # 重新计算attention
             if hasattr(purpose, 'sensory_precision') and hasattr(purpose, 'attention'):
                 import torch.nn.functional as F
                 purpose.attention = F.softmax(purpose.sensory_precision, dim=0)
             logger.info("目的层状态已恢复（via direct attributes）")
+
+    def _restore_memory(self, memory: RestorableMemory,
+                        memory_state: dict) -> None:
+        """恢复记忆潜变量状态（N1）。
+
+        优先调用set_state方法，否则跳过（向后兼容）。
+
+        参数:
+            memory: 满足 RestorableMemory 协议的对象
+            memory_state: 记忆状态字典（由 MemoryManager.get_state() 获取，
+                包含 short_term_latent / long_term_latent / num_nodes 键）
+        """
+        if hasattr(memory, 'set_state'):
+            memory.set_state(memory_state)
+            logger.info("记忆潜变量已恢复（via set_state）")
+        else:
+            logger.warning("memory 对象不支持 set_state，跳过记忆恢复")
 
     def validate(self, path: str) -> bool:
         """验证快照完整性。

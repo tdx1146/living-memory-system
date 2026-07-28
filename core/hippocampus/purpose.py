@@ -56,7 +56,8 @@ class PurposeLayer:
                  min_history_length: int = 5,
                  meta_window: int = 10,
                  max_history: int = 100,
-                 habituation_rate: float = 0.05) -> None:
+                 habituation_rate: float = 0.05,
+                 activation_threshold: float = 0.3) -> None:
         """初始化目的层。
 
         参数:
@@ -69,6 +70,10 @@ class PurposeLayer:
             meta_window: 元目的翻转时回看的历史窗口大小。
             max_history: precision 历史上限，防止无界增长（默认 meta_window*10）。
             habituation_rate: 习惯化衰减率，控制"常遇到→低precision"的速度。
+            activation_threshold: 习惯化激活阈值，感官节点激活绝对值超过此值
+                才被计入 encounter_count（N4 修复）。当 temperature 较低时
+                （如 temperature=0 确定性推断），激活值偏小，应适当降低此阈值
+                以保证习惯化机制生效。
         """
         self.input_dim = input_dim
         self.precision_lr = precision_lr
@@ -79,6 +84,7 @@ class PurposeLayer:
         self.meta_window = meta_window
         self.max_history = max_history
         self.habituation_rate = habituation_rate
+        self.activation_threshold = activation_threshold
 
         # Layer 1: Sensory Precision —— 初始均匀分布
         self.sensory_precision: torch.Tensor = torch.ones(input_dim)
@@ -238,8 +244,9 @@ class PurposeLayer:
         # --- G2: 习惯化计数器更新 ---
         # 统计每个感官维度被"遇到"（显著激活）的次数
         # encounter_count 是累积计数，不随 history 裁剪而重置
+        # N4: 阈值可配置（self.activation_threshold），不再硬编码 0.3
         self.encounter_count += (
-            activation.state[:self.input_dim].abs() > 0.3
+            activation.state[:self.input_dim].abs() > self.activation_threshold
         ).float()
 
         # --- Layer 1: 基于 per-dimension 惊讶度调整 sensory precision ---
@@ -299,12 +306,13 @@ class PurposeLayer:
         """返回当前目的状态。
 
         返回:
-            PurposeState，包含 precision、history 和 coherence。
+            PurposeState，包含 precision、history、coherence 和 encounter_count。
         """
         return PurposeState(
             precision=self.sensory_precision.clone(),
             history=[p.clone() for p in self.history],
             coherence=self.coherence,
+            encounter_count=self.encounter_count.clone(),
         )
 
     def set_purpose(self, state: PurposeState) -> None:
@@ -314,10 +322,14 @@ class PurposeLayer:
         而非依赖脆弱的属性直写。
 
         参数:
-            state: PurposeState，包含 precision、history 和 coherence。
+            state: PurposeState，包含 precision、history、coherence 和
+                encounter_count（可选，向后兼容旧版快照）。
         """
         self.sensory_precision = state.precision.clone()
         self.history = [p.clone() for p in state.history]
         self.coherence = state.coherence
+        # N3: 恢复 encounter_count（向后兼容：旧版快照无此字段时保持初始零值）
+        if state.encounter_count is not None:
+            self.encounter_count = state.encounter_count.clone()
         # 重算 attention（从恢复的 precision 派生）
         self.attention = torch.softmax(self.sensory_precision, dim=0)

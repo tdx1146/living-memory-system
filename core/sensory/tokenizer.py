@@ -110,3 +110,25 @@ class SimpleTokenizer(Tokenizer):
     def vocab_size(self) -> int:
         """当前词表大小。"""
         return len(self._vocab)
+
+    def get_vocab(self) -> dict[str, int]:
+        """返回当前词表（用于持久化）。
+
+        N2 修复：支持词表跨会话持久化，确保两个独立 tokenizer 实例
+        对相同文本产生相同的 token IDs。
+
+        返回:
+            词表字典的副本，键为 token 字符串，值为 token id。
+        """
+        return dict(self._vocab)
+
+    def set_vocab(self, vocab: dict[str, int]) -> None:
+        """从持久化数据恢复词表。
+
+        N2 修复：跨会话恢复词表，保证感官输入可复现。
+
+        参数:
+            vocab: 由 get_vocab() 返回的词表字典。
+        """
+        self._vocab = dict(vocab)
+        self._next_id = max(vocab.values()) + 1 if vocab else 0

@@ -2,11 +2,12 @@
 
 测试 runtime/loop.py 的 LivingMemoryLoop 类，覆盖以下场景：
   1. process_turn() 完整循环
-  2. save_state() / load_state() 往返一致性
+  2. save_state() / load_state() 往返一致性（含 N1 memory + N2 tokenizer + N3 encounter_count）
   3. query_llm() 端到端
-  4. 配置参数生效 (S2 验证)
+  4. 配置参数生效 (S2 验证 + N4 activation_threshold)
   5. 长对话场景 (S3 验证)
   6. 自动快照 (G4 验证)
+  7. 向后兼容性（旧版快照加载）
 
 测试设计原则:
   - 不修改源代码，仅验证行为
@@ -14,7 +15,6 @@
   - 小规模配置加速测试
   - 所有文件操作使用 tmp_path
   - 浮点比较使用 pytest.approx
-  - 已知限制（memory 潜变量未持久化）以测试确认而非掩盖
 """
 
 import os
@@ -25,7 +25,6 @@ import torch
 from runtime.loop import LivingMemoryLoop
 from runtime.config import default_config
 from core.types import Activation
-from core.sensory.tokenizer import SimpleTokenizer
 
 
 # ============================================================
@@ -296,9 +295,11 @@ class TestProcessTurn:
 class TestSaveLoadState:
     """测试 save_state() 和 load_state() 的往返一致性。
 
-    注意已知限制：当前 save_state/load_state 只保存 attractor 和 purpose，
-    不保存 memory 潜变量（short_term_latent / long_term_latent）。
-    测试应确认此行为而非掩盖。
+    N1+N2+N3 修复后，save_state/load_state 现在保存和恢复：
+      - attractor 景观（J, bias, sigma）
+      - purpose 状态（precision, history, coherence, encounter_count）
+      - memory 潜变量（short_term_latent, long_term_latent）
+      - tokenizer 词表
     """
 
     def test_save_creates_file(self, loop, tmp_path):
@@ -370,18 +371,14 @@ class TestSaveLoadState:
         """保存→恢复后，相同输入产生相似的激活态输出。
 
         使用 temperature=0 消除推断随机性，确保可比性。
-        共享 tokenizer 以消除词表差异（tokenizer 词表未持久化是已知限制）。
+        N2 修复后 tokenizer 词表持久化，无需共享 tokenizer。
         验证：
           - attractor 和 purpose 恢复后，推断产生的熵/惊讶度一致
-          - memory 未恢复导致记忆检索部分不同（已知限制）
+          - N1: memory 潜变量恢复后，记忆检索强度也一致
+          - N2: tokenizer 词表恢复后，感官输入可复现
         """
         torch.manual_seed(42)
-        # 共享 tokenizer：tokenizer 词表是动态构建的，未持久化。
-        # 不共享时，两个 loop 对相同文本产生不同 token IDs，
-        # 导致不同感官输入。共享后可隔离测试 attractor/purpose 的往返一致性。
-        shared_tokenizer = SimpleTokenizer()
-
-        config_a = make_test_config(temperature=0.0, tokenizer=shared_tokenizer)
+        config_a = make_test_config(temperature=0.0)
         loop_a = LivingMemoryLoop(config_a)
 
         # 运行5轮积累状态
@@ -392,8 +389,8 @@ class TestSaveLoadState:
         path = str(tmp_path / "roundtrip.pt")
         loop_a.save_state(path)
 
-        # 创建新 loop 并加载（共享同一个 tokenizer）
-        config_b = make_test_config(temperature=0.0, tokenizer=shared_tokenizer)
+        # 创建新 loop 并加载（N2: 无需共享 tokenizer，词表已持久化）
+        config_b = make_test_config(temperature=0.0)
         loop_b = LivingMemoryLoop(config_b)
         loop_b.load_state(path)
 
@@ -402,6 +399,24 @@ class TestSaveLoadState:
         assert torch.allclose(loop_b.attractor.sigma, loop_a.attractor.sigma)
         assert torch.allclose(
             loop_b.purpose.get_precision(), loop_a.purpose.get_precision()
+        )
+
+        # N1: 验证 memory 潜变量恢复一致
+        assert torch.allclose(
+            loop_b.memory.short_term_latent, loop_a.memory.short_term_latent
+        ), "short_term_latent 应在 load_state 后恢复一致"
+        assert torch.allclose(
+            loop_b.memory.long_term_latent, loop_a.memory.long_term_latent
+        ), "long_term_latent 应在 load_state 后恢复一致"
+
+        # N3: 验证 encounter_count 恢复一致
+        assert torch.allclose(
+            loop_b.purpose.encounter_count, loop_a.purpose.encounter_count
+        ), "encounter_count 应在 load_state 后恢复一致"
+
+        # N2: 验证 tokenizer 词表恢复一致
+        assert loop_b.tokenizer.get_vocab() == loop_a.tokenizer.get_vocab(), (
+            "tokenizer 词表应在 load_state 后恢复一致"
         )
 
         # 相同输入产生相同激活态（temperature=0 保证确定性）
@@ -423,24 +438,21 @@ class TestSaveLoadState:
             f"惊讶度不一致: A={surprise_a}, B={surprise_b}"
         )
 
-        # 记忆检索部分应不同（loop_a 有积累，loop_b 记忆归零）
+        # N1: 记忆检索部分也应一致（memory 已恢复）
         strength_a = parse_memory_strength(context_a)
         strength_b = parse_memory_strength(context_b)
         assert strength_a is not None and strength_b is not None
-        # loop_a 经过5轮积累，记忆强度应大于 loop_b（记忆未恢复）
-        assert strength_a >= strength_b, (
-            f"已保存的系统记忆强度({strength_a})应 >= 恢复后的({strength_b})"
+        assert strength_a == pytest.approx(strength_b, abs=1e-6), (
+            f"记忆强度应一致（memory 已恢复）: A={strength_a}, B={strength_b}"
         )
 
-    def test_memory_latents_not_persisted(self, loop, tmp_path):
-        """已知限制验证：memory 潜变量未被 save_state/load_state 持久化。
+    def test_memory_latents_persisted(self, loop, tmp_path):
+        """N1+N3 验证：memory 潜变量和 encounter_count 已持久化。
 
-        save_state 只保存 attractor（J, bias, sigma）和 purpose（precision,
-        history, coherence），不保存 memory 的 short_term_latent 和
-        long_term_latent。恢复后这些潜变量归零。
-
-        此测试确认该已知行为，而非视为 bug。Wave 4 应评估是否需要
-        将 memory 状态纳入持久化范围。
+        N1 修复后，save_state/load_state 现在保存和恢复：
+          - memory.short_term_latent
+          - memory.long_term_latent
+        N3 修复后，encounter_count 也已持久化。
         """
         # 运行多轮积累记忆
         for i in range(6):
@@ -454,6 +466,11 @@ class TestSaveLoadState:
             "运行多轮后 short_term_latent 应非零"
         )
 
+        # 保存原始 memory 状态用于后续比较
+        original_short = loop.memory.short_term_latent.clone()
+        original_long = loop.memory.long_term_latent.clone()
+        original_encounter = loop.purpose.encounter_count.clone()
+
         # 保存
         path = str(tmp_path / "memory_test.pt")
         loop.save_state(path)
@@ -462,18 +479,99 @@ class TestSaveLoadState:
         new_loop = LivingMemoryLoop(make_test_config())
         new_loop.load_state(path)
 
-        # 确认 memory 潜变量归零（未持久化）
-        assert new_loop.memory.long_term_latent.abs().sum() == 0, (
-            "load_state 后 long_term_latent 应归零（未持久化）"
-        )
-        assert new_loop.memory.short_term_latent.abs().sum() == 0, (
-            "load_state 后 short_term_latent 应归零（未持久化）"
+        # N1: 确认 memory 潜变量已恢复（不再是零）
+        assert torch.allclose(
+            new_loop.memory.short_term_latent, original_short
+        ), "load_state 后 short_term_latent 应恢复一致"
+        assert torch.allclose(
+            new_loop.memory.long_term_latent, original_long
+        ), "load_state 后 long_term_latent 应恢复一致"
+
+        # N3: 确认 encounter_count 已恢复
+        assert torch.allclose(
+            new_loop.purpose.encounter_count, original_encounter
+        ), "load_state 后 encounter_count 应恢复一致"
+
+    def test_tokenizer_vocab_persisted(self, loop, tmp_path):
+        """N2 验证：tokenizer 词表已持久化。
+
+        两个独立的 tokenizer 实例在 load_state 后应有相同的词表，
+        对相同文本产生相同的 token IDs。
+        """
+        # 运行几轮使 tokenizer 积累词表
+        loop.process_turn("你好世界")
+        loop.process_turn("测试文本")
+
+        original_vocab = loop.tokenizer.get_vocab()
+        assert len(original_vocab) > 0, "运行后应有非空词表"
+
+        # 保存
+        path = str(tmp_path / "tokenizer_test.pt")
+        loop.save_state(path)
+
+        # 创建新 loop 并加载（tokenizer 是全新的空词表）
+        new_loop = LivingMemoryLoop(make_test_config())
+        assert len(new_loop.tokenizer.get_vocab()) == 0, (
+            "新 loop 的 tokenizer 词表初始应为空"
         )
 
-        # 同时确认 encounter_count 也未持久化
-        assert new_loop.purpose.encounter_count.abs().sum() == 0, (
-            "load_state 后 encounter_count 应归零（未持久化）"
+        new_loop.load_state(path)
+
+        # N2: 验证词表已恢复
+        assert new_loop.tokenizer.get_vocab() == original_vocab, (
+            "load_state 后 tokenizer 词表应恢复一致"
         )
+
+        # 验证对相同文本产生相同 token IDs
+        text = "你好世界测试"
+        ids_original = loop.tokenizer.tokenize(text)
+        ids_restored = new_loop.tokenizer.tokenize(text)
+        assert ids_original == ids_restored, (
+            "恢复后的 tokenizer 对相同文本应产生相同 token IDs"
+        )
+
+    def test_backward_compat_old_snapshot(self, loop, tmp_path):
+        """向后兼容性验证：旧版快照（无 memory/tokenizer 字段）可正常加载。
+
+        模拟旧版 0.1.0 快照格式（仅含 version/timestamp/attractor/purpose），
+        验证新版 load_state 能优雅降级。
+        """
+        # 运行几轮产生状态
+        for i in range(3):
+            loop.process_turn(f"兼容性测试第{i+1}轮")
+
+        # 手动构造旧版格式的快照（无 memory/tokenizer 字段）
+        import time as _time
+        old_data = {
+            'version': '0.1.0',
+            'timestamp': _time.time(),
+            'attractor': loop.attractor.get_landscape(),
+            'purpose': {
+                'precision': loop.purpose.get_precision(),
+                'history': loop.purpose.history,
+                'coherence': loop.purpose.coherence,
+                # 旧版无 encounter_count 字段
+            },
+        }
+
+        path = str(tmp_path / "old_snapshot.pt")
+        torch.save(old_data, path)
+
+        # 创建新 loop 并加载旧版快照
+        new_loop = LivingMemoryLoop(make_test_config())
+        new_loop.load_state(path)
+
+        # attractor 和 purpose 应正常恢复
+        assert torch.allclose(new_loop.attractor.J, loop.attractor.J)
+        assert torch.allclose(
+            new_loop.purpose.get_precision(), loop.purpose.get_precision()
+        )
+
+        # memory 和 tokenizer 未能从旧快照恢复（优雅降级，不报错）
+        # memory 保持初始零值
+        assert new_loop.memory.long_term_latent.abs().sum() == 0
+        # tokenizer 保持空词表
+        assert len(new_loop.tokenizer.get_vocab()) == 0
 
 
 # ============================================================
@@ -624,10 +722,9 @@ class TestConfigWiring:
         habituation_rate 控制习惯化衰减速度：
           habituation = 1 / (1 + encounter_count * habituation_rate)
 
-        需要 temperature > 0 使激活值超过 0.3 阈值，触发 encounter_count
+        需要 temperature > 0 使激活值超过默认 0.3 阈值，触发 encounter_count
         累积，从而使 habituation_rate 对 precision 产生影响。
-        temperature=0 时激活值过小，encounter_count 始终为 0，
-        habituation 机制无法生效。
+        （N4: 可通过降低 activation_threshold 在 temperature=0 时也触发）
         """
         config = make_test_config(habituation_rate=0.5)
         loop = LivingMemoryLoop(config)
@@ -667,6 +764,43 @@ class TestConfigWiring:
         # 两组 precision 不应完全相同
         assert not torch.allclose(precision_low, precision_high), (
             "不同 habituation_rate 应产生不同的 precision"
+        )
+
+    def test_custom_activation_threshold_n4(self):
+        """N4 验证：activation_threshold 可配置且影响习惯化行为。
+
+        N4 修复：习惯化激活阈值从硬编码 0.3 提取为可配置参数。
+        当 temperature=0（确定性推断）时，激活值偏小，默认阈值 0.3
+        导致 encounter_count 始终为 0。降低阈值后习惯化机制可以生效。
+        """
+        # 默认阈值（0.3）+ temperature=0：激活值偏小，encounter_count 应为 0
+        config_default = make_test_config(
+            temperature=0.0, activation_threshold=0.3
+        )
+        loop_default = LivingMemoryLoop(config_default)
+        assert loop_default.purpose.activation_threshold == pytest.approx(0.3)
+
+        for i in range(5):
+            torch.manual_seed(42)
+            loop_default.process_turn(f"阈值测试第{i+1}轮")
+
+        assert loop_default.purpose.encounter_count.sum() == 0, (
+            "temperature=0 + 默认阈值 0.3 时 encounter_count 应为 0"
+        )
+
+        # 降低阈值（0.001）+ temperature=0：激活值可超过低阈值
+        config_low = make_test_config(
+            temperature=0.0, activation_threshold=0.001
+        )
+        loop_low = LivingMemoryLoop(config_low)
+        assert loop_low.purpose.activation_threshold == pytest.approx(0.001)
+
+        for i in range(5):
+            torch.manual_seed(42)
+            loop_low.process_turn(f"阈值测试第{i+1}轮")
+
+        assert loop_low.purpose.encounter_count.sum() > 0, (
+            "temperature=0 + 降低阈值 0.001 时 encounter_count 应非零"
         )
 
 

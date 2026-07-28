@@ -43,6 +43,7 @@ class RuntimeConfig:
         meta_window: 元目的翻转时回看的历史窗口大小
         max_history: 目的层 precision 历史上限
         habituation_rate: 习惯化衰减率
+        activation_threshold: 习惯化激活阈值（N4，解耦与 temperature 的耦合）
         # FEP 学习规则
         complexity_weight: 自由能中复杂性项的权重
         orth_weight: 正交化压力权重
@@ -83,6 +84,7 @@ class RuntimeConfig:
     meta_window: int = 10
     max_history: int = 100
     habituation_rate: float = 0.05
+    activation_threshold: float = 0.3
 
     # FEP 学习规则
     complexity_weight: float = 0.01
@@ -145,6 +147,7 @@ def default_config() -> dict:
         'meta_window': config.meta_window,
         'max_history': config.max_history,
         'habituation_rate': config.habituation_rate,
+        'activation_threshold': config.activation_threshold,
         # FEP 学习规则
         'complexity_weight': config.complexity_weight,
         'orth_weight': config.orth_weight,

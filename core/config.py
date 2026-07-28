@@ -38,6 +38,9 @@ class CoreConfig:
         temperature: Langevin 动力学温度（扩散项噪声强度）。
         max_history: 目的层 precision 历史上限，防止无界增长。
         habituation_rate: 习惯化衰减率，控制"常遇到→低precision"的速度。
+        activation_threshold: 习惯化激活阈值，感官节点激活绝对值超过此值
+            才被计入 encounter_count。当 temperature 较低时应适当降低此值
+            （N4 修复：解耦阈值与 temperature 的硬编码耦合）。
         transfer_rate: 记忆巩固时短时→长时的迁移率。
         replay_count: 记忆巩固时回放的条目数。
         replay_weight: 记忆巩固时回放的权重。
@@ -72,6 +75,7 @@ class CoreConfig:
     meta_window: int = 10
     max_history: int = 100
     habituation_rate: float = 0.05
+    activation_threshold: float = 0.3
 
     # FEP 学习规则
     complexity_weight: float = 0.01

@@ -81,7 +81,8 @@ class LivingMemoryLoop:
                 - complexity_weight, orth_weight: 自由能复杂性与正交化权重
                 - precision_lr, precision_min, precision_max,
                   coherence_threshold, min_history_length, meta_window,
-                  max_history, habituation_rate: 目的层参数
+                  max_history, habituation_rate, activation_threshold:
+                  目的层参数（N4: activation_threshold 解耦习惯化阈值与 temperature）
                 - short_term_decay, long_term_decay, transfer_rate,
                   replay_count, replay_weight, consolidation_decay,
                   buffer_capacity: 记忆管理器参数
@@ -127,6 +128,7 @@ class LivingMemoryLoop:
             meta_window=config.get('meta_window', 10),
             max_history=config.get('max_history', 100),
             habituation_rate=config.get('habituation_rate', 0.05),
+            activation_threshold=config.get('activation_threshold', 0.3),
         )
 
         self.memory = config.get('memory') or MemoryManager(
@@ -285,7 +287,9 @@ class LivingMemoryLoop:
     def save_state(self, path: str) -> None:
         """保存当前状态到快照文件。
 
-        保存吸引子景观（J矩阵、bias、sigma）和目的层状态（precision、history）。
+        保存吸引子景观（J矩阵、bias、sigma）、目的层状态（precision、history、
+        coherence、encounter_count）、记忆潜变量（short/long_term_latent）
+        和分词器词表。
 
         参数:
             path: 快照文件路径
@@ -294,18 +298,33 @@ class LivingMemoryLoop:
         landscape = self.attractor.get_landscape()
 
         # 获取目的层状态并转为字典
+        # N3: encounter_count 纳入持久化
         purpose = self.purpose.get_purpose()
         purpose_dict = {
             'precision': purpose.precision,
             'history': purpose.history,
             'coherence': purpose.coherence,
+            'encounter_count': purpose.encounter_count,
         }
 
-        self.snapshot.save(path, landscape, purpose_dict)
+        # N1: 获取记忆潜变量状态
+        memory_state = self.memory.get_state()
+
+        # N2: 获取 tokenizer 词表（tokenizer 是 runtime 层依赖）
+        tokenizer_state = None
+        if hasattr(self.tokenizer, 'get_vocab'):
+            tokenizer_state = self.tokenizer.get_vocab()
+
+        self.snapshot.save(path, landscape, purpose_dict,
+                           memory_state=memory_state,
+                           tokenizer_state=tokenizer_state)
         logger.info(f"状态已保存到 {path}")
 
     def load_state(self, path: str) -> None:
         """从快照文件恢复状态。
+
+        恢复吸引子景观、目的层状态（含 encounter_count）、记忆潜变量
+        和分词器词表。向后兼容：旧版快照无 memory/tokenizer 字段时优雅降级。
 
         参数:
             path: 快照文件路径
@@ -313,9 +332,23 @@ class LivingMemoryLoop:
         异常:
             RuntimeError: 恢复失败时抛出
         """
-        success = self.recovery.recover(path, self.attractor, self.purpose)
+        # N1: 传入 memory 对象，recovery 会自动检测并恢复 memory 字段
+        success = self.recovery.recover(
+            path, self.attractor, self.purpose, memory=self.memory
+        )
         if not success:
             raise RuntimeError(f"无法从 {path} 恢复状态")
+
+        # N2: 恢复 tokenizer 词表（tokenizer 是 runtime 层依赖，
+        # 不经过 persistence 层的 Protocol，在 loop.py 中直接处理）
+        raw_data = self.snapshot.load_raw(path)
+        tokenizer_state = raw_data.get('tokenizer')
+        if tokenizer_state is not None and hasattr(self.tokenizer, 'set_vocab'):
+            self.tokenizer.set_vocab(tokenizer_state)
+            logger.info("tokenizer 词表已恢复")
+        else:
+            logger.info("快照不含 tokenizer 字段，跳过词表恢复（向后兼容）")
+
         logger.info(f"已从 {path} 恢复状态")
 
     def get_status(self) -> dict:

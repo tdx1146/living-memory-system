@@ -9,7 +9,7 @@
 """
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Optional
 
 import torch
 
@@ -57,8 +57,12 @@ class PurposeState:
         precision: 感官精度向量，形状 [input_dim]，每个感官维度的信任度。
         history: precision 演化历史，列表中的每个元素是一份 precision 快照。
         coherence: 目的的内部一致性，标量。衡量 precision 是否稳定、自洽。
+        encounter_count: 习惯化计数器，形状 [input_dim]，记录每个感官维度
+            被显著激活的累积次数。用于习惯化机制（N3 修复：跨会话持久化）。
+            为可选字段，向后兼容旧版快照（无此字段时为 None）。
     """
 
     precision: torch.Tensor
     history: list[torch.Tensor]
     coherence: float
+    encounter_count: Optional[torch.Tensor] = None

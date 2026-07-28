@@ -5,17 +5,19 @@
 
 遵循架构文档 5.5 节的接口定义。
 保存内容：J矩阵、bias、sigma状态、precision向量、目的层历史。
+可选保存：memory潜变量、tokenizer词表（N1+N2 修复）。
 包含版本号和时间戳。
 """
 
 import time
 import torch
 import logging
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# 快照格式版本号
-SNAPSHOT_VERSION = "0.1.0"
+# 快照格式版本号（N1+N2: 0.2.0 增加 memory 和 tokenizer 可选字段）
+SNAPSHOT_VERSION = "0.2.0"
 
 
 class Snapshot:
@@ -23,12 +25,14 @@ class Snapshot:
 
     保存"火种"（J矩阵 + precision状态），恢复时"重新点燃"。
 
-    快照格式：
+    快照格式（v0.2.0）：
         {
             'version': str,           # 快照版本号
             'timestamp': float,       # 保存时间戳
             'attractor': dict,        # 吸引子景观状态
             'purpose': dict,          # 目的层状态
+            'memory': dict,           # 记忆潜变量（可选，N1）
+            'tokenizer': dict,        # 分词器词表（可选，N2）
         }
 
     attractor字典包含：
@@ -42,6 +46,15 @@ class Snapshot:
         - precision: precision向量 [input_dim]
         - history: precision历史列表
         - coherence: 一致性值
+        - encounter_count: 习惯化计数器 [input_dim]（N3，可选）
+
+    memory字典包含（N1）：
+        - short_term_latent: 短时潜变量 [num_nodes]
+        - long_term_latent: 长时潜变量 [num_nodes]
+        - num_nodes: 节点数
+
+    tokenizer字典包含（N2）：
+        - vocab: 词表字典 {token_str: token_id}
 
     接口设计说明（G5）:
         save()/load() 采用 **dict 接口** 而非直接接受 core 对象。
@@ -63,7 +76,9 @@ class Snapshot:
     """
 
     def save(self, path: str, attractor_landscape: dict,
-             purpose_state: dict) -> None:
+             purpose_state: dict,
+             memory_state: Optional[dict] = None,
+             tokenizer_state: Optional[dict] = None) -> None:
         """保存吸引子景观和目的层状态到文件。
 
         参数:
@@ -75,6 +90,11 @@ class Snapshot:
                 precision（torch.Tensor）/ history（list[torch.Tensor]）/
                 coherence（float）。可由 PurposeLayer.get_purpose() 返回的
                 PurposeState 拆解得到。
+            memory_state: 记忆潜变量状态字典（可选，N1）。由 MemoryManager
+                的 get_state() 获取后传入。包含 short_term_latent /
+                long_term_latent / num_nodes 键。为 None 时不保存此字段。
+            tokenizer_state: 分词器词表字典（可选，N2）。由 SimpleTokenizer
+                的 get_vocab() 获取后传入。为 None 时不保存此字段。
         """
         data = {
             'version': SNAPSHOT_VERSION,
@@ -82,6 +102,14 @@ class Snapshot:
             'attractor': attractor_landscape,
             'purpose': purpose_state,
         }
+
+        # N1: 可选保存 memory 潜变量
+        if memory_state is not None:
+            data['memory'] = memory_state
+
+        # N2: 可选保存 tokenizer 词表
+        if tokenizer_state is not None:
+            data['tokenizer'] = tokenizer_state
 
         # 确保目录存在
         import os
@@ -117,6 +145,20 @@ class Snapshot:
         )
 
         return data['attractor'], data['purpose']
+
+    def load_raw(self, path: str) -> dict:
+        """加载完整快照数据（包括可选字段 memory/tokenizer）。
+
+        供 runtime 层获取 persistence 层未直接恢复的可选状态
+        （如 tokenizer 词表——N2: tokenizer 在 runtime 层直接处理）。
+
+        参数:
+            path: 快照文件路径
+
+        返回:
+            完整的快照数据字典
+        """
+        return _torch_load(path)
 
     def get_metadata(self, path: str) -> dict:
         """获取快照元数据（不加载完整状态）。
