@@ -35,6 +35,13 @@ import torch
 from runtime.loop import LivingMemoryLoop
 from runtime.config import default_config
 
+# 预训练模型本地路径（modelscope 下载缓存）
+_PRETRAINED_MODEL_PATH = (
+    r"C:\Users\dandan\.cache\modelscope\models"
+    r"\sentence-transformers--paraphrase-multilingual-MiniLM-L12-v2"
+    r"\snapshots\master"
+)
+
 
 # ===========================================================================
 # 对话设计
@@ -60,11 +67,12 @@ _SEP_WIDTH = 40
 # ===========================================================================
 # 配置构建
 # ===========================================================================
-def build_config(api_key: str) -> dict:
+def build_config(api_key: str, embedder_type: str = 'pretrained') -> dict:
     """构建测试配置：基于 default_config 覆盖指定参数。
 
     参数:
         api_key: DeepSeek API 密钥。
+        embedder_type: 'pretrained' 使用预训练语义 embedder，'simple' 使用随机 embedder。
 
     返回:
         完整配置字典，可直接传给 LivingMemoryLoop。
@@ -79,6 +87,14 @@ def build_config(api_key: str) -> dict:
     config['auto_snapshot'] = True
     config['auto_snapshot_interval'] = 10
     config['snapshot_dir'] = './snapshots'
+
+    # --- Embedder 选择 ---
+    if embedder_type == 'pretrained':
+        from core.sensory.embedder import PretrainedEmbedder
+        config['embedder'] = PretrainedEmbedder(
+            dim=64, model_name=_PRETRAINED_MODEL_PATH)
+        # 预训练 embedder 输出幅度约 0.42，阈值适配
+        config['activation_threshold'] = 0.02
 
     # --- DeepSeek API 配置 ---
     config['llm_api'] = {
@@ -261,6 +277,10 @@ def main() -> None:
     parser.add_argument(
         '--api-key', type=str, default=None,
         help='DeepSeek API Key（也可通过环境变量 DEEPSEEK_API_KEY 提供）')
+    parser.add_argument(
+        '--embedder', type=str, default='pretrained',
+        choices=['pretrained', 'simple'],
+        help='感官嵌入器: pretrained(预训练语义) 或 simple(随机)')
     args = parser.parse_args()
 
     # --- 获取 API Key ---
@@ -282,7 +302,7 @@ def main() -> None:
         sys.exit(1)
 
     # --- 构建配置 ---
-    config = build_config(api_key)
+    config = build_config(api_key, args.embedder)
 
     # --- 打印测试头部 ---
     print('=' * 50)
@@ -295,6 +315,7 @@ def main() -> None:
     print(f"激活阈值:    {config['activation_threshold']}")
     print(f"自动快照:    每 {config['auto_snapshot_interval']} 轮")
     print(f"对话轮数:    {len(CONVERSATIONS)}")
+    print(f"Embedder:    {args.embedder}")
     print('=' * 50)
 
     # --- 确保快照目录存在（auto_snapshot 可能需要）---

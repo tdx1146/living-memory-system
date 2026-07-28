@@ -15,8 +15,30 @@ consolidation（巩固）机制将短时记忆迁移到长时记忆，
 
 import torch
 from collections import deque
+from dataclasses import dataclass, field
+from typing import List, Optional, Tuple
 
 from core.types import Activation
+
+
+@dataclass
+class EpisodicEntry:
+    """情景记忆条目：保存原始文本与语义向量，用于逆向解码。
+
+    海马体不仅存储抽象的吸引子模式，也保存情景记忆的原始内容
+    （"发生了什么"），使记忆能够被还原为 LLM 可理解的语义文本。
+
+    属性:
+        text: 原始对话文本（用户输入或包含LLM输出的拼接）。
+        semantic_vector: 原始语义嵌入向量（PretrainedEmbedder 输出，
+            投影前的高维向量），用于基于语义相似度的检索。
+        surprise: 该条目的惊讶度（自由能），用于重要性加权。
+        turn: 对话轮次编号。
+    """
+    text: str
+    semantic_vector: torch.Tensor
+    surprise: float
+    turn: int
 
 
 class MemoryManager:
@@ -38,7 +60,8 @@ class MemoryManager:
                  replay_count: int = 10,
                  replay_weight: float = 0.01,
                  consolidation_decay: float = 0.5,
-                 buffer_capacity: int = 100) -> None:
+                 buffer_capacity: int = 100,
+                 episodic_capacity: int = 200) -> None:
         """初始化记忆管理器。
 
         参数:
@@ -51,7 +74,8 @@ class MemoryManager:
             replay_count: 巩固时回放的条目数。
             replay_weight: 巩固时回放的权重。
             consolidation_decay: 巩固后短时记忆的衰减系数。
-            buffer_capacity: 经验缓冲区容量。
+            buffer_capacity: 经验缓冲区容量（用于回放）。
+            episodic_capacity: 情景记忆缓冲区容量（保存原始文本+语义向量）。
         """
         self.num_nodes = num_nodes
         self.short_term_decay = short_term_decay
@@ -69,6 +93,10 @@ class MemoryManager:
         # 缓冲区：存储 (state, surprise) 元组，用于 consolidation 重要性加权回放
         # 使用 deque 自动处理容量限制（B4 修复），O(1) 追加与淘汰
         self._buffer: deque = deque(maxlen=self._buffer_capacity)
+
+        # 情景记忆缓冲区：保存 (text, semantic_vector, surprise, turn)
+        # 用于将记忆逆向解码为 LLM 可理解的语义文本
+        self._episodic_buffer: deque = deque(maxlen=episodic_capacity)
 
     def update(self, activation: Activation, surprise: float = 0.0) -> None:
         """更新短时/长时记忆潜变量。
@@ -152,16 +180,79 @@ class MemoryManager:
         recalled = self.long_term_latent * gate
         return recalled
 
+    def store_episodic(self, text: str, semantic_vector: torch.Tensor,
+                       surprise: float, turn: int) -> None:
+        """存入情景记忆条目（原始文本 + 语义向量）。
+
+        将对话的原始文本和高维语义向量一起保存，使记忆系统不仅能
+        在吸引子空间中运作，还能将记忆逆向还原为 LLM 可理解的语义文本。
+
+        参数:
+            text: 原始对话文本。
+            semantic_vector: 原始语义嵌入向量（投影前的高维向量）。
+            surprise: 该条目的惊讶度，用于后续重要性加权。
+            turn: 对话轮次编号。
+        """
+        entry = EpisodicEntry(
+            text=text,
+            semantic_vector=semantic_vector.detach().clone(),
+            surprise=surprise,
+            turn=turn,
+        )
+        self._episodic_buffer.append(entry)
+
+    def recall_episodic(self, query_vector: torch.Tensor,
+                        top_k: int = 3) -> List[EpisodicEntry]:
+        """基于语义相似度检索情景记忆，返回最相关的文本条目。
+
+        用查询向量与缓冲区中所有条目的语义向量做余弦相似度，
+        返回相似度最高的 top_k 个条目。
+
+        参数:
+            query_vector: 查询的语义向量（与存储时同维度）。
+            top_k: 返回的最大条目数。
+
+        返回:
+            最相关的 EpisodicEntry 列表（按相似度降序）。
+            缓冲区为空时返回空列表。
+        """
+        if len(self._episodic_buffer) == 0:
+            return []
+
+        # 拼接所有语义向量 [N, dim]
+        vectors = torch.stack(
+            [e.semantic_vector for e in self._episodic_buffer])
+        query = query_vector.detach().cpu().float()
+
+        # 确保维度一致
+        if query.dim() == 1:
+            query = query.unsqueeze(0)  # [1, dim]
+
+        # 余弦相似度（向量已 L2 归一化时等价于点积）
+        query_norm = torch.nn.functional.normalize(query, dim=-1)
+        vec_norm = torch.nn.functional.normalize(vectors, dim=-1)
+        sims = torch.mm(query_norm, vec_norm.t()).squeeze(0)  # [N]
+
+        k = min(top_k, len(self._episodic_buffer))
+        top_sims, top_indices = torch.topk(sims, k=k)
+
+        results = []
+        for sim_val, idx in zip(top_sims, top_indices):
+            entry = self._episodic_buffer[int(idx)]
+            results.append(entry)
+        return results
+
     def get_state(self) -> dict:
         """返回记忆管理器当前状态（用于快照）。
 
         返回:
-            包含短时/长时潜变量的字典。
+            包含短时/长时潜变量和情景记忆缓冲区的字典。
         """
         return {
             "short_term_latent": self.short_term_latent.clone(),
             "long_term_latent": self.long_term_latent.clone(),
             "num_nodes": self.num_nodes,
+            "episodic_buffer": list(self._episodic_buffer),
         }
 
     def set_state(self, state: dict) -> None:
@@ -173,3 +264,7 @@ class MemoryManager:
         self.short_term_latent = state["short_term_latent"].clone()
         self.long_term_latent = state["long_term_latent"].clone()
         self.num_nodes = state["num_nodes"]
+        # 情景记忆缓冲区恢复（向后兼容：旧快照无此字段时跳过）
+        if "episodic_buffer" in state:
+            maxlen = self._episodic_buffer.maxlen or 200
+            self._episodic_buffer = deque(state["episodic_buffer"], maxlen=maxlen)

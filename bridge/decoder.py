@@ -7,7 +7,7 @@
 不依赖具体的LLM实现。
 """
 
-from typing import Optional
+from typing import List, Optional
 
 import torch
 from core.types import Activation
@@ -46,7 +46,8 @@ class Decoder:
         self.threshold = threshold
 
     def decode(self, activation: Activation,
-               recalled_memory: Optional[torch.Tensor] = None) -> str:
+               recalled_memory: Optional[torch.Tensor] = None,
+               episodic_texts: Optional[List[str]] = None) -> str:
         """将激活态转换为context文本。
 
         参数:
@@ -56,24 +57,31 @@ class Decoder:
                 会附加"长时记忆检索"段落（text模式）或 [MEMORY:...] 段
                 （vector模式），使长期记忆参与输出路径。
                 为 None 时退化为原有行为，保证向后兼容。
+            episodic_texts: 可选，情景记忆检索到的原始文本列表。
+                由 MemoryManager.recall_episodic() 返回的条目文本提取而来。
+                非空时在 context 中附加"历史记忆"段落，使 LLM 能直接
+                获取此前对话的语义内容。
 
         返回:
             context文本字符串
         """
         if self.mode == 'vector':
             return self._decode_vector(activation, recalled_memory)
-        return self._decode_text(activation, recalled_memory)
+        return self._decode_text(activation, recalled_memory, episodic_texts)
 
     def _decode_text(self, activation: Activation,
-                     recalled_memory: Optional[torch.Tensor] = None) -> str:
+                     recalled_memory: Optional[torch.Tensor] = None,
+                     episodic_texts: Optional[List[str]] = None) -> str:
         """text模式：将激活值最高的节点映射为关键词描述。
 
         生成包含激活熵、惊讶度和强激活节点的描述性文本。
         若提供 recalled_memory，则追加"长时记忆检索"段落。
+        若提供 episodic_texts，则追加"历史记忆"段落（原始语义文本）。
 
         参数:
             activation: 海马体激活态
             recalled_memory: 可选，长时记忆检索结果。
+            episodic_texts: 可选，情景记忆检索到的原始文本列表。
 
         返回:
             描述性context文本
@@ -119,6 +127,18 @@ class Decoder:
         if recalled_memory is not None:
             memory_section = self._decode_memory_recall(recalled_memory)
             context = f"{context} | {memory_section}"
+
+        # 情景记忆段落：将检索到的原始文本直接注入 context
+        # 这是"记忆有量无质"问题的核心修复——LLM 能直接读到此前对话内容
+        if episodic_texts:
+            excerpts = []
+            for i, text in enumerate(episodic_texts, 1):
+                # 截断过长的文本（避免 context 膨胀）
+                truncated = text[:200] + "..." if len(text) > 200 else text
+                excerpts.append(f"{i}. \"{truncated}\"")
+            context = (
+                f"{context} | 历史记忆: {' | '.join(excerpts)}"
+            )
 
         return context
 

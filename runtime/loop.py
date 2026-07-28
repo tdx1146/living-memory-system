@@ -195,6 +195,12 @@ class LivingMemoryLoop:
         text = f"用户: {user_input}\n助手: {llm_output}" if llm_output else user_input
         sensory_input = self.encoder.encode(text, self.tokenizer, self.embedder)
 
+        # 1.5 获取语义向量（用于情景记忆存储与检索）
+        # PretrainedEmbedder 提供 embed_text；SimpleEmbedder 无此方法时跳过
+        semantic_vector = None
+        if hasattr(self.embedder, 'embed_text'):
+            semantic_vector = self.embedder.embed_text(text)
+
         # 2. FEP推断
         precision = self.purpose.get_precision()
         activation = self.attractor.infer(
@@ -216,13 +222,28 @@ class LivingMemoryLoop:
             self.memory.consolidate()
             logger.debug(f"第{self.turn_count}轮：执行记忆巩固")
 
-        # 5.5 记忆检索（S1 修复：用当前激活态作为线索，检索长时记忆）
+        # 5.5 长时记忆检索（S1 修复：用当前激活态作为线索，检索长时记忆）
         # recall() 返回 [num_nodes] 维向量，与 activation.state 同维。
         # 这是"记忆只写不读"缺陷的核心修复点：长时记忆通过此步进入输出路径。
         recalled = self.memory.recall(activation.state)
 
-        # 6. 解码context（传入检索到的记忆，使长期记忆参与输出）
-        memory_context = self.decoder.decode(activation, recalled_memory=recalled)
+        # 5.6 情景记忆检索（用语义向量找最相关的历史文本）
+        # 先检索后存储：避免当前轮文本出现在检索结果中
+        episodic_texts = None
+        if semantic_vector is not None:
+            entries = self.memory.recall_episodic(semantic_vector, top_k=3)
+            if entries:
+                episodic_texts = [e.text for e in entries]
+
+        # 6. 解码context（传入检索到的记忆和情景文本，使长期记忆+语义文本参与输出）
+        memory_context = self.decoder.decode(
+            activation, recalled_memory=recalled,
+            episodic_texts=episodic_texts)
+
+        # 6.5 情景记忆存储（当前轮文本存入缓冲区，供后续检索）
+        if semantic_vector is not None:
+            self.memory.store_episodic(
+                text, semantic_vector, activation.surprise, self.turn_count)
 
         # 更新状态
         self.last_activation = activation
@@ -268,11 +289,19 @@ class LivingMemoryLoop:
         if self.bridge is None:
             raise RuntimeError("未配置LLM Bridge，无法查询LLM")
 
-        # 获取记忆context（同样接入长时记忆检索，保持读取路径一致）
+        # 获取记忆context（同样接入长时记忆检索和情景记忆，保持读取路径一致）
         if self.last_activation is not None:
             recalled = self.memory.recall(self.last_activation.state)
+            # 情景记忆检索
+            episodic_texts = None
+            if hasattr(self.embedder, 'embed_text'):
+                sem_vec = self.embedder.embed_text(user_input)
+                entries = self.memory.recall_episodic(sem_vec, top_k=3)
+                if entries:
+                    episodic_texts = [e.text for e in entries]
             memory_context = self.decoder.decode(
-                self.last_activation, recalled_memory=recalled)
+                self.last_activation, recalled_memory=recalled,
+                episodic_texts=episodic_texts)
         else:
             memory_context = "[无记忆]"
 
