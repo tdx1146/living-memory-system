@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>活体记忆系统 — 完整架构全景</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #0d1117;
+    color: #c9d1d9;
+    font-family: -apple-system, "Noto Sans CJK SC", "Microsoft YaHei", sans-serif;
+    padding: 24px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+  h1 {
+    font-size: 22px;
+    color: #58a6ff;
+    margin-bottom: 6px;
+    text-align: center;
+  }
+  .subtitle {
+    font-size: 13px;
+    color: #8b949e;
+    margin-bottom: 20px;
+    text-align: center;
+  }
+  svg {
+    width: 100%;
+    max-width: 1000px;
+    height: auto;
+  }
+  .legend-section {
+    max-width: 1000px;
+    width: 100%;
+    margin-top: 20px;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+  }
+  .legend-card {
+    background: #161b22;
+    border: 1px solid #30363d;
+    border-radius: 8px;
+    padding: 16px;
+  }
+  .legend-card h3 {
+    font-size: 14px;
+    color: #58a6ff;
+    margin-bottom: 10px;
+    border-bottom: 1px solid #30363d;
+    padding-bottom: 6px;
+  }
+  .legend-card table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+  }
+  .legend-card th, .legend-card td {
+    text-align: left;
+    padding: 5px 8px;
+    border-bottom: 1px solid #21262d;
+  }
+  .legend-card th {
+    color: #8b949e;
+    font-weight: 600;
+  }
+  .legend-card td:first-child {
+    color: #79c0ff;
+  }
+  .footer {
+    margin-top: 16px;
+    font-size: 12px;
+    color: #484f58;
+    text-align: center;
+  }
+</style>
+</head>
+<body>
+
+<h1>活体记忆系统 — 完整架构全景</h1>
+<p class="subtitle">Living Memory System Architecture | v0.2.0 | 2026-07-28 | dandan + AI</p>
+
+<svg viewBox="0 0 960 820" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <!-- Arrow marker -->
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0 0 L10 5 L0 10 Z" fill="#58a6ff"/>
+    </marker>
+    <marker id="arrow-muted" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M0 0 L10 5 L0 10 Z" fill="#8b949e"/>
+    </marker>
+    <marker id="arrow-green" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M0 0 L10 5 L0 10 Z" fill="#56d364"/>
+    </marker>
+    <marker id="arrow-purple" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M0 0 L10 5 L0 10 Z" fill="#bc8cff"/>
+    </marker>
+    <marker id="arrow-dash" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M0 0 L10 5 L0 10 Z" fill="#d29922"/>
+    </marker>
+  </defs>
+
+  <!-- ===== 1. 顶部输入 ===== -->
+  <rect x="30" y="15" width="180" height="40" rx="20" fill="#1c2128" stroke="#58a6ff" stroke-width="1.5"/>
+  <text x="120" y="40" text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="600">用户输入</text>
+
+  <rect x="250" y="15" width="180" height="40" rx="20" fill="#1c2128" stroke="#8b949e" stroke-width="1.5"/>
+  <text x="340" y="40" text-anchor="middle" fill="#8b949e" font-size="13" font-weight="600">LLM输出 (上轮)</text>
+
+  <!-- Arrows down to sensory -->
+  <path d="M120 55 L120 80" fill="none" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <path d="M340 55 L340 80" fill="none" stroke="#8b949e" stroke-width="1.5" marker-end="url(#arrow-muted)"/>
+
+  <!-- ===== 2. 感官层 ===== -->
+  <rect x="20" y="75" width="640" height="90" rx="8" fill="#0d1117" stroke="#30363d" stroke-width="1" stroke-dasharray="4 3"/>
+  <text x="35" y="92" fill="#8b949e" font-size="11" font-weight="600">感官层 — 冻结，不参与学习</text>
+
+  <rect x="40" y="100" width="220" height="50" rx="6" fill="#161b22" stroke="#30363d" stroke-width="1.5"/>
+  <text x="150" y="122" text-anchor="middle" fill="#c9d1d9" font-size="13" font-weight="600">Tokenizer</text>
+  <text x="150" y="138" text-anchor="middle" fill="#8b949e" font-size="10">文本 → token id 序列</text>
+
+  <rect x="300" y="100" width="220" height="50" rx="6" fill="#161b22" stroke="#30363d" stroke-width="1.5"/>
+  <text x="410" y="122" text-anchor="middle" fill="#c9d1d9" font-size="13" font-weight="600">Embedder (冻结)</text>
+  <text x="410" y="138" text-anchor="middle" fill="#8b949e" font-size="10">token → 向量 (不调参)</text>
+
+  <!-- 角色标注 -->
+  <rect x="560" y="100" width="80" height="50" rx="6" fill="#0d1117" stroke="#d29922" stroke-width="1" stroke-dasharray="3 2"/>
+  <text x="600" y="122" text-anchor="middle" fill="#d29922" font-size="10" font-weight="600">感官受体</text>
+  <text x="600" y="136" text-anchor="middle" fill="#d29922" font-size="9">视网膜/耳蜗</text>
+
+  <!-- Arrow tokenizer → embedder -->
+  <path d="M260 125 L300 125" fill="none" stroke="#8b949e" stroke-width="1.5" marker-end="url(#arrow-muted)"/>
+
+  <!-- Arrow sensory → core -->
+  <path d="M410 150 L410 175" fill="none" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <text x="420" y="168" fill="#58a6ff" font-size="10">sensory_vector</text>
+
+  <!-- ===== 3. 海马体核心 ===== -->
+  <rect x="20" y="170" width="640" height="340" rx="10" fill="#0d1117" stroke="#58a6ff" stroke-width="1.5"/>
+  <rect x="20" y="170" width="640" height="28" rx="10" fill="#1c2128" stroke="#58a6ff" stroke-width="1.5"/>
+  <text x="340" y="189" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="600">海马体核心 — FEP驱动，每轮被对话塑形</text>
+
+  <!-- Step 2: FEP推断 -->
+  <rect x="40" y="215" width="280" height="120" rx="8" fill="#161b22" stroke="#58a6ff" stroke-width="1.5"/>
+  <text x="60" y="235" fill="#58a6ff" font-size="11" font-weight="600">① AttractorNetwork</text>
+  <text x="60" y="252" fill="#c9d1d9" font-size="12" font-weight="600">FEP吸引子网络 (J矩阵)</text>
+  <text x="60" y="268" fill="#8b949e" font-size="10">• infer(): Langevin激活 + 感官clamping</text>
+  <text x="60" y="282" fill="#8b949e" font-size="10">• learn(): ΔJ = -η∂F/∂J (无反向传播)</text>
+  <text x="60" y="296" fill="#8b949e" font-size="10">• J矩阵 = 被塑形的当下 (海马体)</text>
+  <text x="60" y="312" fill="#56d364" font-size="10" font-weight="600">→ 输出: Activation(state, entropy, surprise)</text>
+
+  <!-- Step 4: PurposeLayer -->
+  <rect x="360" y="215" width="280" height="120" rx="8" fill="#161b22" stroke="#bc8cff" stroke-width="1.5"/>
+  <text x="380" y="235" fill="#bc8cff" font-size="11" font-weight="600">③ PurposeLayer</text>
+  <text x="380" y="252" fill="#c9d1d9" font-size="12" font-weight="600">目的层 (precision)</text>
+  <text x="380" y="268" fill="#8b949e" font-size="10">• L1: 感官精度 (常遇到→低precision)</text>
+  <text x="380" y="282" fill="#8b949e" font-size="10">• L2: 注意力分配 + coherence</text>
+  <text x="380" y="296" fill="#8b949e" font-size="10">• L3: 元目的方向翻转 (质变)</text>
+  <text x="380" y="312" fill="#bc8cff" font-size="10" font-weight="600">→ 前额叶: 选择性关注</text>
+
+  <!-- precision → attractor arrow -->
+  <path d="M360 275 L320 275" fill="none" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arrow-purple)"/>
+  <text x="340" y="268" text-anchor="middle" fill="#bc8cff" font-size="9">precision</text>
+
+  <!-- surprise → purpose arrow -->
+  <path d="M320 295 L360 295" fill="none" stroke="#56d364" stroke-width="1.5" marker-end="url(#arrow-green)"/>
+  <text x="340" y="308" text-anchor="middle" fill="#56d364" font-size="9">surprise</text>
+
+  <!-- Step 5: MemoryManager -->
+  <rect x="40" y="355" width="600" height="135" rx="8" fill="#161b22" stroke="#56d364" stroke-width="1.5"/>
+  <text x="60" y="375" fill="#56d364" font-size="11" font-weight="600">④⑤ MemoryManager</text>
+  <text x="60" y="392" fill="#c9d1d9" font-size="12" font-weight="600">多尺度记忆管理 (短时/长时 EMA)</text>
+
+  <!-- Memory internal boxes -->
+  <rect x="60" y="400" width="160" height="75" rx="5" fill="#0d1117" stroke="#30363d" stroke-width="1"/>
+  <text x="140" y="418" text-anchor="middle" fill="#c9d1d9" font-size="11" font-weight="600">短时记忆</text>
+  <text x="140" y="434" text-anchor="middle" fill="#8b949e" font-size="9">decay=0.8 (快)</text>
+  <text x="140" y="448" text-anchor="middle" fill="#8b949e" font-size="9">update() 每轮</text>
+  <text x="140" y="462" text-anchor="middle" fill="#8b949e" font-size="9">快速跟踪近期</text>
+
+  <rect x="260" y="400" width="160" height="75" rx="5" fill="#0d1117" stroke="#30363d" stroke-width="1"/>
+  <text x="340" y="418" text-anchor="middle" fill="#c9d1d9" font-size="11" font-weight="600">长时记忆</text>
+  <text x="340" y="434" text-anchor="middle" fill="#8b949e" font-size="9">decay=0.999 (慢)</text>
+  <text x="340" y="448" text-anchor="middle" fill="#8b949e" font-size="9">consolidate() 定期</text>
+  <text x="340" y="462" text-anchor="middle" fill="#8b949e" font-size="9">surprise加权回放</text>
+
+  <rect x="460" y="400" width="160" height="75" rx="5" fill="#0d1117" stroke="#30363d" stroke-width="1"/>
+  <text x="540" y="418" text-anchor="middle" fill="#c9d1d9" font-size="11" font-weight="600">recall() 检索</text>
+  <text x="540" y="434" text-anchor="middle" fill="#8b949e" font-size="9">线索门控</text>
+  <text x="540" y="448" text-anchor="middle" fill="#8b949e" font-size="9">gate=sigmoid(cue)</text>
+  <text x="540" y="462" text-anchor="middle" fill="#56d364" font-size="9" font-weight="600">S1修复: 接入输出</text>
+
+  <!-- Arrow attractor → memory -->
+  <path d="M180 335 L180 355" fill="none" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <text x="190" y="350" fill="#58a6ff" font-size="9">activation</text>
+
+  <!-- Arrow purpose → memory (surprise for consolidation) -->
+  <path d="M500 335 L500 355" fill="none" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arrow-purple)"/>
+  <text x="510" y="350" fill="#bc8cff" font-size="9">surprise</text>
+
+  <!-- ===== Step 5.5: recall arrow to output ===== -->
+  <path d="M540 475 L540 530" fill="none" stroke="#56d364" stroke-width="1.5" marker-end="url(#arrow-green)"/>
+  <text x="550" y="505" fill="#56d364" font-size="9">recalled_memory</text>
+
+  <!-- ===== 4. 输出层 ===== -->
+  <rect x="20" y="525" width="640" height="65" rx="8" fill="#0d1117" stroke="#30363d" stroke-width="1" stroke-dasharray="4 3"/>
+  <text x="35" y="542" fill="#8b949e" font-size="11" font-weight="600">桥接层 — 连接核心与外部LLM</text>
+
+  <rect x="40" y="548" width="200" height="35" rx="5" fill="#161b22" stroke="#30363d" stroke-width="1.5"/>
+  <text x="140" y="570" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="600">⑥ Decoder 解码</text>
+
+  <rect x="280" y="548" width="200" height="35" rx="5" fill="#161b22" stroke="#30363d" stroke-width="1.5"/>
+  <text x="380" y="570" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="600">⑦ LLM Bridge</text>
+
+  <rect x="520" y="548" width="120" height="35" rx="5" fill="#161b22" stroke="#58a6ff" stroke-width="1.5"/>
+  <text x="580" y="570" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="600">主LLM (黑箱)</text>
+
+  <!-- Arrow decoder → llm_bridge -->
+  <path d="M240 565 L280 565" fill="none" stroke="#8b949e" stroke-width="1.5" marker-end="url(#arrow-muted)"/>
+  <!-- Arrow llm_bridge → main llm -->
+  <path d="M480 565 L520 565" fill="none" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <!-- activation → decoder arrow -->
+  <path d="M140 335 L140 548" fill="none" stroke="#58a6ff" stroke-width="1" stroke-dasharray="3 2" marker-end="url(#arrow)"/>
+  <text x="100" y="440" fill="#58a6ff" font-size="9" transform="rotate(-90 100 440)">activation</text>
+
+  <!-- ===== 5. 循环回箭头 ===== -->
+  <path d="M580 583 L580 605 L860 605 L860 35 L430 35 L430 55" fill="none" stroke="#d29922" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#arrow-dash)"/>
+  <text x="700" y="600" fill="#d29922" font-size="10" font-weight="600">⑧ 循环: LLM输出回到记忆系统</text>
+
+  <!-- ===== 6. 持久化层 ===== -->
+  <rect x="20" y="615" width="640" height="80" rx="8" fill="#0d1117" stroke="#d29922" stroke-width="1" stroke-dasharray="4 3"/>
+  <text x="35" y="632" fill="#d29922" font-size="11" font-weight="600">持久化层 — 快照 (火种传递)</text>
+
+  <rect x="40" y="640" width="140" height="42" rx="5" fill="#161b22" stroke="#d29922" stroke-width="1.5"/>
+  <text x="110" y="660" text-anchor="middle" fill="#c9d1d9" font-size="11" font-weight="600">Snapshot</text>
+  <text x="110" y="674" text-anchor="middle" fill="#8b949e" font-size="9">save() 火种</text>
+
+  <rect x="200" y="640" width="140" height="42" rx="5" fill="#161b22" stroke="#d29922" stroke-width="1.5"/>
+  <text x="270" y="660" text-anchor="middle" fill="#c9d1d9" font-size="11" font-weight="600">Recovery</text>
+  <text x="270" y="674" text-anchor="middle" fill="#8b949e" font-size="9">load() 重新点燃</text>
+
+  <!-- 持久化内容标注 -->
+  <rect x="370" y="640" width="270" height="42" rx="5" fill="#0d1117" stroke="#30363d" stroke-width="1"/>
+  <text x="505" y="657" text-anchor="middle" fill="#8b949e" font-size="9">J矩阵 | precision | encounter_count</text>
+  <text x="505" y="671" text-anchor="middle" fill="#8b949e" font-size="9">memory潜变量 | tokenizer词表</text>
+  <text x="505" y="678" text-anchor="middle" fill="#d29922" font-size="8">v0.2.0 (N1-N4修复)</text>
+
+  <!-- 虚线连接 core → snapshot -->
+  <path d="M340 510 L340 615" fill="none" stroke="#d29922" stroke-width="1" stroke-dasharray="3 3" marker-end="url(#arrow-dash)"/>
+
+  <!-- ===== 右侧: 数据流步骤 ===== -->
+  <rect x="690" y="75" width="260" height="280" rx="8" fill="#161b22" stroke="#30363d" stroke-width="1.5"/>
+  <text x="705" y="95" fill="#58a6ff" font-size="12" font-weight="600">完整记忆循环 (8步)</text>
+
+  <text x="705" y="118" fill="#c9d1d9" font-size="10">① 编码: 文本→感官向量</text>
+  <text x="705" y="135" fill="#c9d1d9" font-size="10">② FEP推断: 向量→激活态</text>
+  <text x="705" y="152" fill="#c9d1d9" font-size="10">③ FEP学习: 更新J矩阵</text>
+  <text x="705" y="169" fill="#c9d1d9" font-size="10">④ 调整目的: 更新precision</text>
+  <text x="705" y="186" fill="#c9d1d9" font-size="10">⑤ 记忆更新+巩固</text>
+  <text x="705" y="203" fill="#56d364" font-size="10" font-weight="600">⑤.5 检索: recall()→输出</text>
+  <text x="705" y="220" fill="#c9d1d9" font-size="10">⑥ 解码: 激活→context</text>
+  <text x="705" y="237" fill="#c9d1d9" font-size="10">⑦ 查询LLM (可选)</text>
+  <text x="705" y="254" fill="#d29922" font-size="10">⑧ 循环回到顶部</text>
+
+  <line x1="705" y1="265" x2="935" y2="265" stroke="#30363d" stroke-width="1"/>
+
+  <text x="705" y="282" fill="#58a6ff" font-size="12" font-weight="600">关键修复记录</text>
+  <text x="705" y="300" fill="#56d364" font-size="10">S1: recall()接入输出路径</text>
+  <text x="705" y="315" fill="#56d364" font-size="10">S2: 24个FEP参数全部接线</text>
+  <text x="705" y="330" fill="#56d364" font-size="10">S3: history无界增长修复</text>
+  <text x="705" y="345" fill="#56d364" font-size="10">N1: memory潜变量持久化</text>
+
+  <!-- ===== 右侧: 角色映射 ===== -->
+  <rect x="690" y="370" width="260" height="160" rx="8" fill="#161b22" stroke="#30363d" stroke-width="1.5"/>
+  <text x="705" y="390" fill="#bc8cff" font-size="12" font-weight="600">生物结构对应</text>
+
+  <text x="705" y="412" fill="#d29922" font-size="10">Embedder → 视网膜/耳蜗 (冻结)</text>
+  <text x="705" y="428" fill="#58a6ff" font-size="10">J矩阵 → 海马体突触 (塑形)</text>
+  <text x="705" y="444" fill="#bc8cff" font-size="10">precision → 前额叶 (关注)</text>
+  <text x="705" y="460" fill="#56d364" font-size="10">短/长时记忆 → EMA潜变量</text>
+  <text x="705" y="476" fill="#d29922" font-size="10">快照 → 火种 (非火焰)</text>
+
+  <line x1="705" y1="488" x2="935" y2="488" stroke="#30363d" stroke-width="1"/>
+  <text x="705" y="505" fill="#8b949e" font-size="9">"被塑形的当下"在J矩阵里</text>
+  <text x="705" y="518" fill="#8b949e" font-size="9">不在embedding的冻结权重里</text>
+
+  <!-- ===== 右侧: 测试与架构约束 ===== -->
+  <rect x="690" y="545" width="260" height="150" rx="8" fill="#161b22" stroke="#30363d" stroke-width="1.5"/>
+  <text x="705" y="565" fill="#56d364" font-size="12" font-weight="600">系统状态</text>
+
+  <text x="705" y="587" fill="#c9d1d9" font-size="10">测试: 134项全部通过</text>
+  <text x="705" y="603" fill="#c9d1d9" font-size="10">快照: v0.2.0 (向后兼容)</text>
+  <text x="705" y="619" fill="#c9d1d9" font-size="10">Git: 6 commits, 已推送GitHub</text>
+
+  <line x1="705" y1="630" x2="935" y2="630" stroke="#30363d" stroke-width="1"/>
+
+  <text x="705" y="648" fill="#58a6ff" font-size="12" font-weight="600">架构约束</text>
+  <text x="705" y="668" fill="#8b949e" font-size="10">core/ 无IO依赖</text>
+  <text x="705" y="682" fill="#8b949e" font-size="10">高内聚低耦合, DAG无环</text>
+
+  <!-- ===== 底部标注 ===== -->
+  <text x="340" y="720" text-anchor="middle" fill="#484f58" font-size="10">记忆是吸引子网络动起来的过程 — 不是存档，是塑形</text>
+  <text x="340" y="735" text-anchor="middle" fill="#484f58" font-size="9">身份是吸引子景观（经历的总和），不是参数值（船板）</text>
+
+</svg>
+
+<div class="legend-section">
+  <div class="legend-card">
+    <h3>组件角色与可调参性</h3>
+    <table>
+      <tr><th>组件</th><th>角色</th><th>可调参</th></tr>
+      <tr><td>Embedder</td><td>感官受体 (视网膜)</td><td>冻结，不学习</td></tr>
+      <tr><td>AttractorNetwork J矩阵</td><td>记忆引擎 (海马体)</td><td>每轮FEP塑形</td></tr>
+      <tr><td>PurposeLayer precision</td><td>注意力调控 (前额叶)</td><td>每轮调整</td></tr>
+      <tr><td>MemoryManager</td><td>多尺度记忆 (短时/长时)</td><td>每轮EMA更新</td></tr>
+      <tr><td>Tokenizer</td><td>前处理 (分词)</td><td>词表动态扩展</td></tr>
+    </table>
+  </div>
+  <div class="legend-card">
+    <h3>跨会话持久化 (N1-N4)</h3>
+    <table>
+      <tr><th>编号</th><th>持久化内容</th><th>机制</th></tr>
+      <tr><td>N1</td><td>memory潜变量</td><td>get_state()/set_state()</td></tr>
+      <tr><td>N2</td><td>tokenizer词表</td><td>get_vocab()/set_vocab()</td></tr>
+      <tr><td>N3</td><td>encounter_count</td><td>PurposeState字段</td></tr>
+      <tr><td>N4</td><td>activation_threshold</td><td>构造参数解耦</td></tr>
+      <tr><td>—</td><td>J矩阵 + precision</td><td>快照 v0.1.0 起支持</td></tr>
+    </table>
+  </div>
+</div>
+
+<p class="footer">dandan + AI | 活体记忆系统 v0.2.0 | 2026-07-28 | GitHub: tdx1146/living-memory-system</p>
+
+</body>
+</html>
