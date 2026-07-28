@@ -198,8 +198,14 @@ class LivingMemoryLoop:
         # 1.5 获取语义向量（用于情景记忆存储与检索）
         # PretrainedEmbedder 提供 embed_text；SimpleEmbedder 无此方法时跳过
         semantic_vector = None
+        raw_semantic_vector = None
         if hasattr(self.embedder, 'embed_text'):
             semantic_vector = self.embedder.embed_text(text)
+            # 384 维原始语义向量（投影前），用于 episodic buffer 高精度检索
+            # PretrainedEmbedder 提供 embed_text_raw；无此方法时退化为 None
+            # （如自定义 embedder 仅有 embed_text），此时退化为用投影向量
+            if hasattr(self.embedder, 'embed_text_raw'):
+                raw_semantic_vector = self.embedder.embed_text_raw(text)
 
         # 2. FEP推断
         precision = self.purpose.get_precision()
@@ -229,9 +235,15 @@ class LivingMemoryLoop:
 
         # 5.6 情景记忆检索（用语义向量找最相关的历史文本）
         # 先检索后存储：避免当前轮文本出现在检索结果中
+        # 优先用 384 维 raw 向量查询（高精度）；fallback 用 64 维投影向量
+        # （向后兼容旧快照中 64 维条目）；无 raw 向量时退化为投影向量查询
         episodic_texts = None
         if semantic_vector is not None:
-            entries = self.memory.recall_episodic(semantic_vector, top_k=3)
+            episodic_query = (raw_semantic_vector
+                              if raw_semantic_vector is not None
+                              else semantic_vector)
+            entries = self.memory.recall_episodic(
+                episodic_query, top_k=3, fallback_query=semantic_vector)
             if entries:
                 episodic_texts = [e.text for e in entries]
 
@@ -241,9 +253,11 @@ class LivingMemoryLoop:
             episodic_texts=episodic_texts)
 
         # 6.5 情景记忆存储（当前轮文本存入缓冲区，供后续检索）
+        # 优先存 384 维 raw 向量；无 raw 向量时退化为投影向量（向后兼容）
         if semantic_vector is not None:
             self.memory.store_episodic(
-                text, semantic_vector, activation.surprise, self.turn_count)
+                text, semantic_vector, activation.surprise, self.turn_count,
+                raw_semantic_vector=raw_semantic_vector)
 
         # 更新状态
         self.last_activation = activation
@@ -292,11 +306,16 @@ class LivingMemoryLoop:
         # 获取记忆context（同样接入长时记忆检索和情景记忆，保持读取路径一致）
         if self.last_activation is not None:
             recalled = self.memory.recall(self.last_activation.state)
-            # 情景记忆检索
+            # 情景记忆检索：优先用 384 维 raw 向量，fallback 用投影向量
             episodic_texts = None
             if hasattr(self.embedder, 'embed_text'):
                 sem_vec = self.embedder.embed_text(user_input)
-                entries = self.memory.recall_episodic(sem_vec, top_k=3)
+                raw_vec = None
+                if hasattr(self.embedder, 'embed_text_raw'):
+                    raw_vec = self.embedder.embed_text_raw(user_input)
+                episodic_query = raw_vec if raw_vec is not None else sem_vec
+                entries = self.memory.recall_episodic(
+                    episodic_query, top_k=3, fallback_query=sem_vec)
                 if entries:
                     episodic_texts = [e.text for e in entries]
             memory_context = self.decoder.decode(

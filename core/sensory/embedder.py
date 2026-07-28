@@ -238,6 +238,44 @@ class PretrainedEmbedder(Embedder):
 
         return vector.detach()
 
+    def embed_text_raw(self, text: str) -> torch.Tensor:
+        """原始文本 -> 预训练模型原始语义向量（投影前，384 维）。
+
+        与 embed_text 不同，本方法返回预训练模型的原始输出（未经随机投影
+        降维），供 episodic buffer 做高精度语义检索——保留完整 384 维语义
+        信息，避免投影造成的信息损失，从而提升检索精度。
+
+        embed_text（投影后 64 维）仍用于吸引子网络输入，两者职责分离：
+          - embed_text     -> 吸引子网络感官输入（低维、稳定幅度）
+          - embed_text_raw -> episodic buffer 检索（高维、保留语义细节）
+
+        向量在模型编码时已做 L2 归一化（normalize_embeddings=True），
+        故余弦相似度等价于点积。
+
+        参数:
+            text: 原始文本字符串（可中英混合）。
+
+        返回:
+            形状 [raw_dim] 的 L2 归一化语义向量（如 384 维）。
+            空文本返回 raw_dim 维零向量。
+        """
+        if not text or not text.strip():
+            return torch.zeros(self._raw_dim)
+
+        with torch.no_grad():
+            raw = self._model.encode(
+                text,
+                convert_to_tensor=True,
+                normalize_embeddings=True,
+            )
+            # sentence-transformers 对单条输入可能返回 [raw_dim] 或 [1, raw_dim]
+            if raw.dim() == 2:
+                raw = raw.squeeze(0)
+            # 统一到 CPU float
+            raw = raw.detach().cpu().float()
+
+        return raw.detach()
+
     def embed(self, tokens: list[int]) -> torch.Tensor:
         """token id 路径（本实现不适用）。
 

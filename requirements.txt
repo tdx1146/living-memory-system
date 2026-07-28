@@ -10,5 +10,12 @@ numpy>=1.21
 # LLM API客户端（OpenAI兼容格式）
 openai>=1.0
 
+# 预训练语义嵌入（感官层，可选但推荐）
+sentence-transformers>=2.2
+
+# FastAPI 服务层（api 包）
+fastapi>=0.100
+uvicorn[standard]>=0.23
+
 # 测试框架（开发依赖）
 pytest>=7.0

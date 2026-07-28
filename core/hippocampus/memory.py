@@ -30,8 +30,11 @@ class EpisodicEntry:
 
     属性:
         text: 原始对话文本（用户输入或包含LLM输出的拼接）。
-        semantic_vector: 原始语义嵌入向量（PretrainedEmbedder 输出，
-            投影前的高维向量），用于基于语义相似度的检索。
+        semantic_vector: 用于检索的语义向量。优先存储预训练模型的原始
+            高维向量（PretrainedEmbedder.embed_text_raw 输出，384 维，
+            投影前、L2 归一化），以保留完整语义信息、提升检索精度；
+            当无法获取原始向量时（如 SimpleEmbedder）退化为存储投影后
+            的低维向量（64 维），保证向后兼容。
         surprise: 该条目的惊讶度（自由能），用于重要性加权。
         turn: 对话轮次编号。
     """
@@ -181,36 +184,62 @@ class MemoryManager:
         return recalled
 
     def store_episodic(self, text: str, semantic_vector: torch.Tensor,
-                       surprise: float, turn: int) -> None:
+                       surprise: float, turn: int,
+                       raw_semantic_vector: Optional[torch.Tensor] = None
+                       ) -> None:
         """存入情景记忆条目（原始文本 + 语义向量）。
 
-        将对话的原始文本和高维语义向量一起保存，使记忆系统不仅能
+        将对话的原始文本和语义向量一起保存，使记忆系统不仅能
         在吸引子空间中运作，还能将记忆逆向还原为 LLM 可理解的语义文本。
+
+        向量选择策略（高精度优先 + 向后兼容）：
+          - 若提供 raw_semantic_vector（预训练模型原始 384 维向量，投影前），
+            则存储它——保留完整语义信息，提升检索精度；
+          - 否则退化为存储 semantic_vector（投影后低维向量），兼容
+            SimpleEmbedder 等无原始向量的嵌入器。
 
         参数:
             text: 原始对话文本。
-            semantic_vector: 原始语义嵌入向量（投影前的高维向量）。
+            semantic_vector: 投影后的语义向量（低维，用于吸引子网络路径，
+                亦作为无 raw 向量时的检索退化存储）。
             surprise: 该条目的惊讶度，用于后续重要性加权。
             turn: 对话轮次编号。
+            raw_semantic_vector: 可选，预训练模型原始高维语义向量（投影前、
+                L2 归一化）。提供时优先存入 episodic 缓冲区用于高精度检索。
         """
+        # 优先存储原始高维向量；无原始向量时退化为投影向量（向后兼容）
+        store_vector = (raw_semantic_vector if raw_semantic_vector is not None
+                        else semantic_vector)
         entry = EpisodicEntry(
             text=text,
-            semantic_vector=semantic_vector.detach().clone(),
+            semantic_vector=store_vector.detach().clone(),
             surprise=surprise,
             turn=turn,
         )
         self._episodic_buffer.append(entry)
 
     def recall_episodic(self, query_vector: torch.Tensor,
-                        top_k: int = 3) -> List[EpisodicEntry]:
+                        top_k: int = 3,
+                        fallback_query: Optional[torch.Tensor] = None
+                        ) -> List[EpisodicEntry]:
         """基于语义相似度检索情景记忆，返回最相关的文本条目。
 
         用查询向量与缓冲区中所有条目的语义向量做余弦相似度，
         返回相似度最高的 top_k 个条目。
 
+        维度兼容与向后兼容：
+          - 优先用 query_vector（384 维原始向量）检索维度匹配的条目；
+          - 若某条目维度与 query_vector 不一致（如旧快照存的 64 维投影
+            向量），但与 fallback_query 维度一致，则改用 fallback_query
+            计算该条目相似度（退化为原有投影向量检索行为）；
+          - 维度均不匹配的条目被跳过。这保证旧快照恢复后检索不崩溃，
+            也支持"旧 64 维 + 新 384 维"混合缓冲区。
+
         参数:
-            query_vector: 查询的语义向量（与存储时同维度）。
+            query_vector: 查询的原始语义向量（384 维，投影前）。
             top_k: 返回的最大条目数。
+            fallback_query: 可选，投影后的查询向量（64 维）。用于与旧快照
+                中 64 维条目的兼容检索。
 
         返回:
             最相关的 EpisodicEntry 列表（按相似度降序）。
@@ -219,28 +248,49 @@ class MemoryManager:
         if len(self._episodic_buffer) == 0:
             return []
 
-        # 拼接所有语义向量 [N, dim]
-        vectors = torch.stack(
-            [e.semantic_vector for e in self._episodic_buffer])
+        # 准备主查询向量（归一化）
         query = query_vector.detach().cpu().float()
-
-        # 确保维度一致
         if query.dim() == 1:
-            query = query.unsqueeze(0)  # [1, dim]
-
-        # 余弦相似度（向量已 L2 归一化时等价于点积）
+            query = query.unsqueeze(0)  # [1, qd]
         query_norm = torch.nn.functional.normalize(query, dim=-1)
-        vec_norm = torch.nn.functional.normalize(vectors, dim=-1)
-        sims = torch.mm(query_norm, vec_norm.t()).squeeze(0)  # [N]
+        qd = query.shape[-1]
 
-        k = min(top_k, len(self._episodic_buffer))
-        top_sims, top_indices = torch.topk(sims, k=k)
+        # 准备 fallback 查询向量（归一化），用于与旧 64 维条目兼容
+        if fallback_query is not None:
+            fb = fallback_query.detach().cpu().float()
+            if fb.dim() == 1:
+                fb = fb.unsqueeze(0)  # [1, fd]
+            fb_norm = torch.nn.functional.normalize(fb, dim=-1)
+            fd = fb.shape[-1]
+        else:
+            fb_norm = None
+            fd = None
 
-        results = []
-        for sim_val, idx in zip(top_sims, top_indices):
-            entry = self._episodic_buffer[int(idx)]
-            results.append(entry)
-        return results
+        # 逐条计算相似度，按维度自动选择查询向量（支持混合维度缓冲区）
+        scored: List[Tuple[float, EpisodicEntry]] = []
+        for entry in self._episodic_buffer:
+            v = entry.semantic_vector.detach().cpu().float()
+            if v.dim() > 1:
+                v = v.squeeze()  # 防御性处理，统一为 1-D
+            vd = v.shape[-1]
+            if vd == qd:
+                v_norm = torch.nn.functional.normalize(v, dim=0)
+                sim = torch.dot(query_norm.squeeze(0), v_norm).item()
+            elif fb_norm is not None and vd == fd:
+                v_norm = torch.nn.functional.normalize(v, dim=0)
+                sim = torch.dot(fb_norm.squeeze(0), v_norm).item()
+            else:
+                # 维度均不匹配，跳过该条目（优雅降级，不崩溃）
+                continue
+            scored.append((sim, entry))
+
+        if not scored:
+            return []
+
+        # 按相似度降序取 top_k
+        k = min(top_k, len(scored))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [entry for _, entry in scored[:k]]
 
     def get_state(self) -> dict:
         """返回记忆管理器当前状态（用于快照）。
