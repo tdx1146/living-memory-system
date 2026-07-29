@@ -46,6 +46,17 @@ class CoreConfig:
         replay_weight: 记忆巩固时回放的权重。
         consolidation_decay: 巩固后短时记忆的衰减系数。
         buffer_capacity: 记忆缓冲区容量。
+        meta_enabled: 是否启用元学习（元可塑性）。
+        meta_interval: 元更新频率（每 N 轮触发一次元参数调整）。
+        meta_lr: 元学习率。
+        meta_bounds_min: 元倍率下限（钳制学习规则参数的自适应倍率）。
+        meta_bounds_max: 元倍率上限。
+        meta_surprise_window: surprise 历史窗口大小。
+        meta_orth_alpha: coherence→orth 系数。
+        meta_temp_beta: collapse→temp 系数。
+        meta_cw_gamma: ||J||→cw 系数。
+        meta_lr_delta: surprise 趋势→lr 系数。
+        meta_shy_target_norm: SHY 目标范数（元层用）。
     """
 
     # 网络结构
@@ -80,6 +91,19 @@ class CoreConfig:
     # FEP 学习规则
     complexity_weight: float = 0.01
     orth_weight: float = 0.5
+
+    # 元可塑性（Meta-Plasticity）
+    meta_enabled: bool = True              # 是否启用元学习
+    meta_interval: int = 10               # 元更新频率（每N轮）
+    meta_lr: float = 0.01                 # 元学习率
+    meta_bounds_min: float = 0.5          # 倍率下限
+    meta_bounds_max: float = 2.0          # 倍率上限
+    meta_surprise_window: int = 20        # surprise历史窗口
+    meta_orth_alpha: float = 1.0          # coherence→orth 系数
+    meta_temp_beta: float = 5.0           # collapse→temp 系数
+    meta_cw_gamma: float = 1.0            # ||J||→cw 系数
+    meta_lr_delta: float = 2.0            # surprise趋势→lr 系数
+    meta_shy_target_norm: float = 10.0   # SHY目标范数（元层用）
 
     # 随机种子
     seed: int = 42

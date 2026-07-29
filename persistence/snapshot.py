@@ -5,8 +5,12 @@
 
 遵循架构文档 5.5 节的接口定义。
 保存内容：J矩阵、bias、sigma状态、precision向量、目的层历史。
-可选保存：memory潜变量、tokenizer词表（N1+N2 修复）。
+可选保存：memory潜变量、tokenizer词表（N1+N2 修复）、meta元可塑性状态（0.3.0）。
 包含版本号和时间戳。
+
+版本历史:
+    - 0.2.0: 增加 memory 和 tokenizer 可选字段（N1+N2 修复）。
+    - 0.3.0: 增加 meta 元可塑性可选字段（向后兼容：旧快照无此字段时跳过）。
 """
 
 import time
@@ -16,8 +20,9 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# 快照格式版本号（N1+N2: 0.2.0 增加 memory 和 tokenizer 可选字段）
-SNAPSHOT_VERSION = "0.2.0"
+# 快照格式版本号（N1+N2: 0.2.0 增加 memory 和 tokenizer 可选字段；
+#                  0.3.0 增加 meta 元可塑性可选字段）
+SNAPSHOT_VERSION = "0.3.0"
 
 
 class Snapshot:
@@ -25,7 +30,7 @@ class Snapshot:
 
     保存"火种"（J矩阵 + precision状态），恢复时"重新点燃"。
 
-    快照格式（v0.2.0）：
+    快照格式（v0.3.0）：
         {
             'version': str,           # 快照版本号
             'timestamp': float,       # 保存时间戳
@@ -33,6 +38,7 @@ class Snapshot:
             'purpose': dict,          # 目的层状态
             'memory': dict,           # 记忆潜变量（可选，N1）
             'tokenizer': dict,        # 分词器词表（可选，N2）
+            'meta': dict,             # 元可塑性状态（可选，0.3.0）
         }
 
     attractor字典包含：
@@ -56,6 +62,11 @@ class Snapshot:
     tokenizer字典包含（N2）：
         - vocab: 词表字典 {token_str: token_id}
 
+    meta字典包含（0.3.0，可选）：
+        - 元可塑性层的自适应状态（如各学习规则参数的倍率、surprise历史等）。
+          具体结构由 core.meta 层定义；persistence 层仅做透传，不解释其内容。
+          旧版快照（v0.2.0）无此字段，加载时优雅跳过（向后兼容）。
+
     接口设计说明（G5）:
         save()/load() 采用 **dict 接口** 而非直接接受 core 对象。
         这是有意的架构决策，目的是彻底解耦 persistence 与 core 层
@@ -78,7 +89,8 @@ class Snapshot:
     def save(self, path: str, attractor_landscape: dict,
              purpose_state: dict,
              memory_state: Optional[dict] = None,
-             tokenizer_state: Optional[dict] = None) -> None:
+             tokenizer_state: Optional[dict] = None,
+             meta_state: Optional[dict] = None) -> None:
         """保存吸引子景观和目的层状态到文件。
 
         参数:
@@ -95,6 +107,9 @@ class Snapshot:
                 long_term_latent / num_nodes 键。为 None 时不保存此字段。
             tokenizer_state: 分词器词表字典（可选，N2）。由 SimpleTokenizer
                 的 get_vocab() 获取后传入。为 None 时不保存此字段。
+            meta_state: 元可塑性状态字典（可选，0.3.0）。由 core.meta 层的
+                get_state() 获取后传入。persistence 层仅透传，不解释其内容。
+                为 None 时不保存此字段。
         """
         data = {
             'version': SNAPSHOT_VERSION,
@@ -111,6 +126,10 @@ class Snapshot:
         if tokenizer_state is not None:
             data['tokenizer'] = tokenizer_state
 
+        # 0.3.0: 可选保存 meta 元可塑性状态
+        if meta_state is not None:
+            data['meta'] = meta_state
+
         # 确保目录存在
         import os
         dir_path = os.path.dirname(path)
@@ -122,6 +141,14 @@ class Snapshot:
 
     def load(self, path: str) -> tuple[dict, dict]:
         """从文件加载吸引子景观和目的层状态。
+
+        仅返回必需的 attractor / purpose 两个状态；可选字段
+        （memory / tokenizer / meta）不在返回值中，需通过 load_raw()
+        获取（与 N1/N2 既定模式一致；保持本方法二元组返回以兼容
+        recovery.py 及现有测试的解包调用）。
+
+        向后兼容：旧版快照（v0.2.0，无 meta 字段）可正常加载——
+        本方法仅读取 attractor / purpose，不依赖任何可选字段。
 
         参数:
             path: 快照文件路径（.pt文件）
@@ -144,13 +171,17 @@ class Snapshot:
             f"(版本: {version}, 时间: {data.get('timestamp', 'unknown')})"
         )
 
+        # 可选字段（memory/tokenizer/meta）不在此返回，由调用方通过
+        # load_raw() 按需取用；旧快照无 meta 字段时自动跳过（向后兼容）。
         return data['attractor'], data['purpose']
 
     def load_raw(self, path: str) -> dict:
-        """加载完整快照数据（包括可选字段 memory/tokenizer）。
+        """加载完整快照数据（包括可选字段 memory/tokenizer/meta）。
 
         供 runtime 层获取 persistence 层未直接恢复的可选状态
-        （如 tokenizer 词表——N2: tokenizer 在 runtime 层直接处理）。
+        （如 tokenizer 词表——N2: tokenizer 在 runtime 层直接处理；
+        meta 元可塑性状态——0.3.0: 由 core.meta 层通过
+        raw_data.get('meta') 取用，旧快照无此字段时返回 None）。
 
         参数:
             path: 快照文件路径

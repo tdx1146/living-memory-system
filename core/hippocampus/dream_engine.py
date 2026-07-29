@@ -41,7 +41,8 @@ logger = logging.getLogger("dream_engine")
 
 # 快照格式版本（与 persistence.snapshot.SNAPSHOT_VERSION 保持一致，
 # 此处硬编码以避免 core 层反向依赖 persistence 层，保持架构 DAG 无环）
-_SNAPSHOT_VERSION = "0.2.0"
+# 0.3.0: 新增可选 meta 字段（元可塑性状态）
+_SNAPSHOT_VERSION = "0.3.0"
 
 
 class DreamEngine:
@@ -66,10 +67,12 @@ class DreamEngine:
         phase_weights: 七阶段做梦周期的权重分配。
         step_count: 累计做梦步数。
         activation_history: 近期激活态历史（用于坍缩检测）。
+        meta: 元可塑性控制器引用（MetaPlasticityController），可选。
+            为 None 时做梦引擎行为与之前完全一致。
     """
 
     def __init__(self, attractor, purpose, memory, embedder,
-                 config: dict) -> None:
+                 config: dict, meta=None) -> None:
         """初始化做梦引擎。
 
         接收现有组件引用（不创建新实例），从 config 读取空闲态参数。
@@ -95,11 +98,15 @@ class DreamEngine:
                 - forget_prune_rate: 遗忘修剪衰减率（默认 0.005）
                 - forget_max_age: 情景记忆最大保留年龄（默认 50 轮）
                 - purpose_evolve_nudge: 目的演化偏移幅度（默认 0.05）
+            meta: 元可塑性控制器（MetaPlasticityController）实例，可选。
+                当提供时，空闲态计算将使用元调整后的学习参数（学习率、
+                正交化权重、温度、复杂度权重）。为 None 时行为与之前完全一致。
         """
         self.attractor = attractor
         self.purpose = purpose
         self.memory = memory
         self.embedder = embedder
+        self.meta = meta
 
         # --- 便捷属性（转发到 attractor，便于测试与外部访问） ---
         self.num_nodes = attractor.num_nodes
@@ -146,7 +153,8 @@ class DreamEngine:
         logger.info(
             f"DreamEngine 已初始化 "
             f"(idle_lr={self.idle_lr}, idle_temp={self.idle_temperature}, "
-            f"idle_steps={self.idle_num_steps})"
+            f"idle_steps={self.idle_num_steps}, "
+            f"meta={'启用' if self.meta is not None else '未启用'})"
         )
 
     # ================================================================== #
@@ -341,7 +349,7 @@ class DreamEngine:
         """
         purpose_state = self.purpose.get_purpose()
         j_norm = float(torch.norm(self.attractor.J, p='fro').item())
-        return {
+        status = {
             'step_count': self.step_count,
             'num_nodes': self.num_nodes,
             'input_dim': self.input_dim,
@@ -360,6 +368,13 @@ class DreamEngine:
             'purpose_coherence': purpose_state.coherence,
             'phase_weights': dict(self.phase_weights),
         }
+        # 元可塑性状态
+        if self.meta is not None:
+            status['meta_enabled'] = True
+            status['meta'] = self.meta.get_status()
+        else:
+            status['meta_enabled'] = False
+        return status
 
     # ================================================================== #
     #  采样
@@ -434,8 +449,18 @@ class DreamEngine:
 
         try:
             # 切换到空闲态参数
-            self.attractor.temperature = self.idle_temperature
-            self.attractor.orth_weight = self.idle_orth_weight
+            # 若 meta 可用，使用元调整后的温度（base * temp_multiplier）
+            effective_temp = self.idle_temperature
+            if self.meta is not None:
+                adjusted = self.meta.get_adjusted_params(
+                    base_lr=self.idle_lr,
+                    base_orth=self.idle_orth_weight,
+                    base_temp=self.idle_temperature,
+                    base_cw=self.attractor.complexity_weight,
+                )
+                effective_temp = adjusted['temperature']
+            self.attractor.temperature = effective_temp
+            self.attractor.orth_weight = self.idle_orth_weight  # 会被 _idle_learn 覆盖
 
             # 用记忆状态作为生成式回放的种子（设为网络初始 sigma）
             if sensory_input.shape[0] == self.attractor.num_nodes:
@@ -462,7 +487,8 @@ class DreamEngine:
         精细调整 J 矩阵以巩固回放的记忆。低学习率确保巩固是温和的微调，
         而非剧烈重塑。
 
-        临时切换 orth_weight 到空闲态值，执行后恢复。
+        临时切换 orth_weight 和 complexity_weight 到空闲态值，执行后恢复。
+        若 meta 可用，使用元调整后的学习率、正交化权重和复杂度权重。
 
         参数:
             activation: 生成式回放得到的激活态。
@@ -470,12 +496,31 @@ class DreamEngine:
                 当前实现中 learn 不直接使用此参数，但保留以兼容接口）。
         """
         orig_orth_weight = self.attractor.orth_weight
+        orig_cw = self.attractor.complexity_weight
         try:
-            self.attractor.orth_weight = self.idle_orth_weight
+            effective_lr = self.idle_lr
+            effective_orth = self.idle_orth_weight
+            effective_cw = orig_cw
+
+            # 若 meta 可用，使用元调整后的 lr / orth / cw（base * multiplier）
+            if self.meta is not None:
+                adjusted = self.meta.get_adjusted_params(
+                    base_lr=self.idle_lr,
+                    base_orth=self.idle_orth_weight,
+                    base_temp=self.idle_temperature,
+                    base_cw=orig_cw,
+                )
+                effective_lr = adjusted['learning_rate']
+                effective_orth = adjusted['orth_weight']
+                effective_cw = adjusted['complexity_weight']
+
+            self.attractor.orth_weight = effective_orth
+            self.attractor.complexity_weight = effective_cw
             self.attractor.learn(activation, sensory_input,
-                                 learning_rate=self.idle_lr)
+                                 learning_rate=effective_lr)
         finally:
             self.attractor.orth_weight = orig_orth_weight
+            self.attractor.complexity_weight = orig_cw
 
     # ================================================================== #
     #  阶段2: 突触稳态下调（SHY）
@@ -495,9 +540,21 @@ class DreamEngine:
         当 norm <= target_norm 时不做缩放（因子为 1），仅下调不过调。
 
         归一化后保持对称性与零对角线。
+
+        若 meta 可用，通过 cw_multiplier 缩放目标范数：J 矩阵饱和度越高
+        （cw_multiplier > 1），目标越小，归一化越积极；饱和度越低
+        （cw_multiplier < 1），目标越大，归一化越温和。
         """
+        # 计算有效目标范数
+        effective_target = self.shy_target_norm
+        if self.meta is not None:
+            # 元可塑性通过 cw_multiplier 影响 shy_target_norm
+            # cw_multiplier > 1 表示 J 饱和度高 → 应该更积极地下调
+            # 因此用 cw_multiplier 缩放 target_norm（缩小目标 = 更积极归一化）
+            effective_target = self.shy_target_norm / self.meta.state.cw_multiplier
+
         norm = float(torch.norm(self.attractor.J, p='fro').item())
-        target = self.shy_target_norm
+        target = effective_target
         denom = max(norm, target)
         if denom < 1e-10:
             return  # J 近似为零，无需归一化
@@ -824,7 +881,8 @@ class DreamEngine:
         使用 torch.save 直接序列化为与 persistence.snapshot 兼容的格式
         （避免 core 层反向依赖 persistence 层，保持架构 DAG 无环）。
         保存吸引子景观（J/bias/sigma）、目的层状态（precision/history/
-        coherence/encounter_count）和记忆潜变量。
+        coherence/encounter_count）和记忆潜变量。当 meta 可用时，
+        额外保存元可塑性状态（meta 字段）。
 
         返回:
             快照文件路径，保存失败时返回 None。
@@ -847,6 +905,9 @@ class DreamEngine:
                 'purpose': purpose_dict,
                 'memory': memory_state,
             }
+            # 元可塑性状态（可选）
+            if self.meta is not None:
+                data['meta'] = self.meta.get_state()
 
             snap_dir = self.snapshot_dir
             os.makedirs(snap_dir, exist_ok=True)

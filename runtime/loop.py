@@ -13,6 +13,8 @@ import os
 import logging
 from typing import Optional
 
+import torch
+
 from core.types import Activation
 from core.hippocampus.attractor import AttractorNetwork
 from core.hippocampus.purpose import PurposeLayer
@@ -165,6 +167,24 @@ class LivingMemoryLoop:
         self.last_activation: Optional[Activation] = None
         self.consolidation_interval = consolidation_interval
 
+        # 元可塑性控制器（可选，根据 config 决定是否启用）
+        self.meta = None
+        if config.get('meta_enabled', True):
+            from core.meta.meta_plasticity import MetaPlasticityController
+            meta_config = {
+                'meta_interval': config.get('meta_interval', 10),
+                'meta_lr': config.get('meta_lr', 0.01),
+                'bounds_min': config.get('meta_bounds_min', 0.5),
+                'bounds_max': config.get('meta_bounds_max', 2.0),
+                'surprise_window': config.get('meta_surprise_window', 20),
+                'orth_alpha': config.get('meta_orth_alpha', 1.0),
+                'temp_beta': config.get('meta_temp_beta', 5.0),
+                'cw_gamma': config.get('meta_cw_gamma', 1.0),
+                'lr_delta': config.get('meta_lr_delta', 2.0),
+                'shy_target_norm': config.get('meta_shy_target_norm', 10.0),
+            }
+            self.meta = MetaPlasticityController(meta_config)
+
         # 做梦引擎（懒加载，首次调用 get_dream_engine() 时创建）
         self.dream_engine = None
 
@@ -210,6 +230,26 @@ class LivingMemoryLoop:
             if hasattr(self.embedder, 'embed_text_raw'):
                 raw_semantic_vector = self.embedder.embed_text_raw(text)
 
+        # --- 元可塑性：临时应用调整后的参数 ---
+        _meta_orig = None
+        _effective_lr = self.config.get('learning_rate', 0.01)
+        if self.meta is not None:
+            _meta_orig = {
+                'temperature': self.attractor.temperature,
+                'orth_weight': self.attractor.orth_weight,
+                'complexity_weight': self.attractor.complexity_weight,
+            }
+            adjusted = self.meta.get_adjusted_params(
+                base_lr=_effective_lr,
+                base_orth=_meta_orig['orth_weight'],
+                base_temp=_meta_orig['temperature'],
+                base_cw=_meta_orig['complexity_weight'],
+            )
+            self.attractor.temperature = adjusted['temperature']
+            self.attractor.orth_weight = adjusted['orth_weight']
+            self.attractor.complexity_weight = adjusted['complexity_weight']
+            _effective_lr = adjusted['learning_rate']
+
         # 2. FEP推断
         precision = self.purpose.get_precision()
         activation = self.attractor.infer(
@@ -218,11 +258,23 @@ class LivingMemoryLoop:
         )
 
         # 3. FEP学习
-        learning_rate = self.config.get('learning_rate', 0.01)
-        self.attractor.learn(activation, sensory_input.vector, learning_rate)
+        self.attractor.learn(activation, sensory_input.vector, _effective_lr)
+
+        # --- 恢复原始参数（元调整仅影响本轮推断与学习）---
+        if _meta_orig is not None:
+            self.attractor.temperature = _meta_orig['temperature']
+            self.attractor.orth_weight = _meta_orig['orth_weight']
+            self.attractor.complexity_weight = _meta_orig['complexity_weight']
 
         # 4. 调整目的
         self.purpose.adjust(activation.surprise, activation)
+
+        # --- 元可塑性：收集信号并更新 ---
+        if self.meta is not None:
+            j_norm = float(torch.norm(self.attractor.J, p='fro').item())
+            collapse_occurred = self.purpose.flipped  # 元目的翻转视为坍缩信号
+            coherence = self.purpose.coherence
+            self.meta.update(activation.surprise, coherence, collapse_occurred, j_norm)
 
         # 5. 记忆更新与巩固
         self.memory.update(activation, activation.surprise)
@@ -366,9 +418,15 @@ class LivingMemoryLoop:
         if hasattr(self.tokenizer, 'get_vocab'):
             tokenizer_state = self.tokenizer.get_vocab()
 
+        # 元可塑性状态
+        meta_state = None
+        if self.meta is not None:
+            meta_state = self.meta.get_state()
+
         self.snapshot.save(path, landscape, purpose_dict,
                            memory_state=memory_state,
-                           tokenizer_state=tokenizer_state)
+                           tokenizer_state=tokenizer_state,
+                           meta_state=meta_state)
         logger.info(f"状态已保存到 {path}")
 
     def load_state(self, path: str) -> None:
@@ -400,6 +458,16 @@ class LivingMemoryLoop:
         else:
             logger.info("快照不含 tokenizer 字段，跳过词表恢复（向后兼容）")
 
+        # 元可塑性状态恢复
+        meta_state = raw_data.get('meta')
+        if meta_state is not None and self.meta is not None:
+            self.meta.set_state(meta_state)
+            logger.info("元可塑性状态已恢复")
+        elif meta_state is not None and self.meta is None:
+            logger.info("快照含 meta 字段但元学习未启用，跳过恢复")
+        else:
+            logger.info("快照不含 meta 字段，跳过元状态恢复（向后兼容）")
+
         logger.info(f"已从 {path} 恢复状态")
 
     def get_status(self) -> dict:
@@ -422,6 +490,10 @@ class LivingMemoryLoop:
         status['purpose_coherence'] = purpose.coherence
         status['precision_mean'] = float(purpose.precision.mean())
         status['precision_std'] = float(purpose.precision.std())
+
+        # 元可塑性状态（可选）
+        if self.meta is not None:
+            status['meta'] = self.meta.get_status()
 
         return status
 
@@ -452,6 +524,7 @@ class LivingMemoryLoop:
                 memory=self.memory,
                 embedder=self.embedder,
                 config=dream_config,
+                meta=self.meta,  # 新增
             )
             logger.info("DreamEngine 已懒加载创建")
         return self.dream_engine
