@@ -165,6 +165,9 @@ class LivingMemoryLoop:
         self.last_activation: Optional[Activation] = None
         self.consolidation_interval = consolidation_interval
 
+        # 做梦引擎（懒加载，首次调用 get_dream_engine() 时创建）
+        self.dream_engine = None
+
         logger.info(
             f"LivingMemoryLoop已初始化 "
             f"(nodes={self.attractor.num_nodes}, dim={self.attractor.input_dim})"
@@ -421,3 +424,74 @@ class LivingMemoryLoop:
         status['precision_std'] = float(purpose.precision.std())
 
         return status
+
+    # ================================================================== #
+    #  做梦引擎集成
+    # ================================================================== #
+
+    def get_dream_engine(self):
+        """获取做梦引擎实例（懒加载）。
+
+        首次调用时创建 DreamEngine 实例，传入当前组件引用和配置。
+        后续调用直接返回已创建的实例。
+
+        返回:
+            DreamEngine 实例。
+        """
+        if self.dream_engine is None:
+            from core.hippocampus.dream_engine import DreamEngine
+            # 合并做梦相关配置：从 self.config 读取，补充默认值
+            dream_config = dict(self.config)
+            # 确保快照目录指向系统快照目录
+            dream_config.setdefault(
+                'snapshot_dir',
+                self.config.get('snapshot_dir', 'snapshots'))
+            self.dream_engine = DreamEngine(
+                attractor=self.attractor,
+                purpose=self.purpose,
+                memory=self.memory,
+                embedder=self.embedder,
+                config=dream_config,
+            )
+            logger.info("DreamEngine 已懒加载创建")
+        return self.dream_engine
+
+    def dream(self, n_steps: int = 20, full_cycle: bool = False) -> dict:
+        """触发记忆系统的"做梦"过程。
+
+        在空闲时进行记忆巩固、遗忘和整合，让记忆系统在无对话输入时
+        持续运转。做梦后自动保存快照。
+
+        参数:
+            n_steps: 做梦步数（默认 20）。
+            full_cycle: False 时执行 MVP 做梦（dream_mvp），
+                True 时执行完整做梦周期（dream_cycle）。
+
+        返回:
+            做梦统计字典（由 DreamEngine 返回），额外包含
+            'snapshot_saved' 字段表示是否成功保存快照。
+        """
+        dream_engine = self.get_dream_engine()
+
+        if full_cycle:
+            result = dream_engine.dream_cycle(max_steps=n_steps)
+        else:
+            result = dream_engine.dream_mvp(n_steps=n_steps)
+
+        # 做梦后自动保存快照（完整状态，含 tokenizer）
+        snapshot_saved = False
+        try:
+            snapshot_dir = self.config.get(
+                'snapshot_dir', os.path.join(
+                    os.path.dirname(os.path.abspath(__file__)),
+                    '..', 'snapshots'))
+            os.makedirs(snapshot_dir, exist_ok=True)
+            snapshot_path = os.path.join(snapshot_dir, 'latest.pt')
+            self.save_state(snapshot_path)
+            snapshot_saved = True
+            logger.info(f"做梦后快照已保存: {snapshot_path}")
+        except Exception as e:
+            logger.warning(f"做梦后快照保存失败（不影响做梦结果）: {e}")
+
+        result['snapshot_saved'] = snapshot_saved
+        return result

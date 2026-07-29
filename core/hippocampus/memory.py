@@ -296,12 +296,13 @@ class MemoryManager:
         """返回记忆管理器当前状态（用于快照）。
 
         返回:
-            包含短时/长时潜变量和情景记忆缓冲区的字典。
+            包含短时/长时潜变量、回放缓冲区和情景记忆缓冲区的字典。
         """
         return {
             "short_term_latent": self.short_term_latent.clone(),
             "long_term_latent": self.long_term_latent.clone(),
             "num_nodes": self.num_nodes,
+            "buffer": list(self._buffer),
             "episodic_buffer": list(self._episodic_buffer),
         }
 
@@ -314,6 +315,10 @@ class MemoryManager:
         self.short_term_latent = state["short_term_latent"].clone()
         self.long_term_latent = state["long_term_latent"].clone()
         self.num_nodes = state["num_nodes"]
+        # 回放缓冲区恢复（向后兼容：旧快照无此字段时跳过）
+        if "buffer" in state:
+            maxlen = self._buffer.maxlen or 100
+            self._buffer = deque(state["buffer"], maxlen=maxlen)
         # 情景记忆缓冲区恢复（向后兼容：旧快照无此字段时跳过）
         if "episodic_buffer" in state:
             maxlen = self._episodic_buffer.maxlen or 200

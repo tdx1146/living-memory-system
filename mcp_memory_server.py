@@ -5,6 +5,7 @@
   1. recall_memory  — 检索与查询相关的历史对话记忆
   2. store_memory   — 将当前对话存储到记忆系统
   3. get_memory_status — 获取记忆系统运行状态
+  4. dream_memory   — 触发记忆系统"做梦"（空闲态记忆巩固与整合）
 
 基于 mcp 2.0.0 的 Server 类（构造器注册 handler，非装饰器模式）。
 通过 stdio 传输与 MCP 客户端通信。
@@ -124,11 +125,38 @@ def _build_config() -> dict:
     return config
 
 
+def _get_snapshot_dir() -> str:
+    """获取快照目录路径。"""
+    return os.path.join(_SCRIPT_DIR, 'snapshots')
+
+
+def _get_latest_snapshot() -> str | None:
+    """查找最新的快照文件路径。
+
+    返回:
+        最新快照文件路径，若无则返回 None。
+    """
+    snap_dir = _get_snapshot_dir()
+    if not os.path.isdir(snap_dir):
+        return None
+
+    # 查找 .pt 文件并按修改时间排序
+    import glob
+    snapshots = glob.glob(os.path.join(snap_dir, '*.pt'))
+    if not snapshots:
+        return None
+
+    # 按修改时间排序，取最新
+    snapshots.sort(key=lambda x: os.path.getmtime(x), reverse=True)
+    return snapshots[0]
+
+
 def get_loop() -> LivingMemoryLoop:
     """获取全局 LivingMemoryLoop 实例（懒加载）。
 
-    首次调用时初始化记忆系统（加载预训练模型等）。
-    若初始化失败，记录错误并抛出 RuntimeError；后续调用直接抛出已记录的错误。
+    首次调用时初始化记忆系统（加载预训练模型等），并自动加载最新快照
+    以恢复跨会话记忆。若初始化失败，记录错误并抛出 RuntimeError；
+    后续调用直接抛出已记录的错误。
 
     返回:
         已初始化的 LivingMemoryLoop 实例。
@@ -149,6 +177,18 @@ def get_loop() -> LivingMemoryLoop:
         config = _build_config()
         _loop = LivingMemoryLoop(config)
         logger.info("LivingMemoryLoop 初始化完成")
+
+        # 自动加载最新快照，恢复跨会话记忆
+        latest_snap = _get_latest_snapshot()
+        if latest_snap:
+            try:
+                _loop.load_state(latest_snap)
+                logger.info(f"已从快照恢复记忆: {latest_snap}")
+            except Exception as e:
+                logger.warning(f"快照加载失败（忽略，使用空白记忆）: {e}")
+        else:
+            logger.info("未找到快照文件，使用空白记忆")
+
         return _loop
     except Exception as e:
         _init_error = str(e)
@@ -271,6 +311,18 @@ def do_store_memory(text: str) -> str:
     status = loop.get_status()
     buffer_size = len(loop.memory._episodic_buffer)
 
+    # 自动保存快照，确保持久化跨会话记忆
+    snapshot_saved = False
+    try:
+        snap_dir = _get_snapshot_dir()
+        os.makedirs(snap_dir, exist_ok=True)
+        snap_path = os.path.join(snap_dir, 'latest.pt')
+        loop.save_state(snap_path)
+        snapshot_saved = True
+        logger.info(f"记忆已保存到快照: {snap_path}")
+    except Exception as e:
+        logger.warning(f"快照保存失败（不影响当前操作）: {e}")
+
     result = {
         "status": "已存储",
         "turn_count": status.get('turn_count', 0),
@@ -279,6 +331,7 @@ def do_store_memory(text: str) -> str:
         "last_surprise": status.get('last_surprise'),
         "precision_mean": status.get('precision_mean'),
         "purpose_coherence": status.get('purpose_coherence'),
+        "snapshot_saved": snapshot_saved,
         "memory_context": memory_context,
     }
     return _to_json(result)
@@ -302,6 +355,28 @@ def do_get_memory_status() -> str:
     if hasattr(embedder, 'raw_dim'):
         status['embedder_raw_dim'] = embedder.raw_dim
     return _to_json(status)
+
+
+def do_dream_memory(steps: int = 20, full_cycle: bool = False) -> str:
+    """触发记忆系统的"做梦"过程。
+
+    在空闲时进行记忆巩固、遗忘和整合，让记忆系统在无对话输入时持续运转。
+    建议在对话间歇时调用。做梦会精炼吸引子景观、衰减低价值记忆、
+    演化目的层，并自动保存快照。
+
+    参数:
+        steps: 做梦步数（默认 20）。full_cycle=False 时为 MVP 做梦步数，
+            full_cycle=True 时为完整做梦周期步数。
+        full_cycle: True 执行完整七阶段做梦周期（NREM巩固/SHY/遗忘修剪/
+            景观漂移/目的演化/REM整合/快照），False 执行 MVP 简化版做梦。
+
+    返回:
+        做梦统计（JSON 格式），包含模式、步数、平均惊讶度、坍缩次数、
+        快照保存状态等。
+    """
+    loop = get_loop()
+    result = loop.dream(n_steps=steps, full_cycle=full_cycle)
+    return _to_json(result)
 
 
 # ---------------------------------------------------------------------------
@@ -361,7 +436,41 @@ GET_MEMORY_STATUS_TOOL = types.Tool(
     },
 )
 
-ALL_TOOLS = [RECALL_MEMORY_TOOL, STORE_MEMORY_TOOL, GET_MEMORY_STATUS_TOOL]
+DREAM_MEMORY_TOOL = types.Tool(
+    name="dream_memory",
+    description=(
+        "触发记忆系统的'做梦'过程，在空闲时进行记忆巩固、遗忘和整合。"
+        "建议在对话间歇时调用。做梦会让记忆系统在无输入时持续运转，"
+        "精炼吸引子景观、衰减低价值记忆、演化目的层，使记忆从'冷工具'"
+        "变为'活体'。"
+    ),
+    inputSchema={
+        "type": "object",
+        "properties": {
+            "steps": {
+                "type": "integer",
+                "description": "做梦步数（默认 20）",
+                "default": 20,
+            },
+            "full_cycle": {
+                "type": "boolean",
+                "description": (
+                    "True 执行完整七阶段做梦周期，False 执行 MVP 简化版"
+                    "（默认 false）"
+                ),
+                "default": False,
+            },
+        },
+        "required": [],
+    },
+)
+
+ALL_TOOLS = [
+    RECALL_MEMORY_TOOL,
+    STORE_MEMORY_TOOL,
+    GET_MEMORY_STATUS_TOOL,
+    DREAM_MEMORY_TOOL,
+]
 
 
 # ---------------------------------------------------------------------------
@@ -415,12 +524,22 @@ async def handle_call_tool(
                 content=[types.TextContent(type="text", text=result_text)]
             )
 
+        elif name == "dream_memory":
+            steps = arguments.get("steps", 20)
+            full_cycle = arguments.get("full_cycle", False)
+            result_text = do_dream_memory(
+                steps=steps, full_cycle=full_cycle)
+            return types.CallToolResult(
+                content=[types.TextContent(type="text", text=result_text)]
+            )
+
         else:
             return types.CallToolResult(
                 content=[types.TextContent(
                     type="text",
                     text=f"错误：未知工具 '{name}'。"
-                         f"可用工具: recall_memory, store_memory, get_memory_status")],
+                         f"可用工具: recall_memory, store_memory, "
+                         f"get_memory_status, dream_memory")],
                 is_error=True,
             )
 
