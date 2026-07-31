@@ -22,6 +22,7 @@ import os
 import sys
 import json
 import logging
+from typing import Any
 
 # ---------------------------------------------------------------------------
 # 路径设置
@@ -210,7 +211,7 @@ def cmd_dream(steps: int, full_cycle: bool) -> str:
         }, ensure_ascii=False)
 
 
-def _json_default(obj):
+def _json_default(obj: Any) -> Any:
     """JSON 序列化的 default 回调，处理 torch.Tensor / numpy 标量。"""
     if hasattr(obj, 'item'):
         return obj.item()
@@ -219,7 +220,7 @@ def _json_default(obj):
     return str(obj)
 
 
-def main():
+def main() -> None:
     if len(sys.argv) < 2:
         print(json.dumps({
             "status": "error",
