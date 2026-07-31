@@ -24,6 +24,10 @@ venv/
 .DS_Store
 Thumbs.db
 
+# Secrets / 环境变量（含敏感信息，禁止提交）
+.env
+*.key
+
 # Snapshots (runtime data, not source)
 *.pt
 snapshots/

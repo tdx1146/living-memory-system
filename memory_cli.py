@@ -30,16 +30,21 @@ _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if _SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _SCRIPT_DIR)
 
-# 设置环境变量
-os.environ.setdefault(
-    "DEEPSEEK_API_KEY", "sk-d91a6339112040a98c6f0617e6142307")
-
 # 抑制详细日志（只保留错误），避免干扰 JSON 输出
 logging.basicConfig(
     level=logging.WARNING,
     stream=sys.stderr,
     format="%(levelname)s: %(message)s",
 )
+
+# 检查 LLM API Key（从环境变量读取，不再硬编码）
+# 未配置时仅打印警告，不退出，避免被 import 时阻塞；
+# 下游 mcp_memory_server 会自行处理缺失的 Key（记忆检索/存储不受影响）。
+if not (os.environ.get("DEEPSEEK_API_KEY") or os.environ.get("LMS_LLM_API_KEY")):
+    logging.warning(
+        "未配置 DEEPSEEK_API_KEY / LMS_LLM_API_KEY 环境变量，"
+        "LLM 相关功能将不可用。请参考 .env.example 配置环境变量。"
+    )
 
 # ---------------------------------------------------------------------------
 # 导入记忆系统

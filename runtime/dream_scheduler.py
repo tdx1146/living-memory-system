@@ -293,8 +293,9 @@ class DreamScheduler:
                 continue
 
             try:
-                self._is_dreaming = True
-                self._dreaming_session = activity.session_id
+                with self._lock:
+                    self._is_dreaming = True
+                    self._dreaming_session = activity.session_id
 
                 logger.info(
                     f"[{activity.session_id}] 空闲 {idle_time:.0f}s，"
@@ -326,8 +327,9 @@ class DreamScheduler:
                     f"[{activity.session_id}] 做梦失败: {e}",
                     exc_info=True)
             finally:
-                self._is_dreaming = False
-                self._dreaming_session = None
+                with self._lock:
+                    self._is_dreaming = False
+                    self._dreaming_session = None
                 self._busy_lock.release()
 
     # ------------------------------------------------------------------ #
@@ -359,8 +361,9 @@ class DreamScheduler:
             return {'status': 'error', 'error': '获取做梦锁超时'}
 
         try:
-            self._is_dreaming = True
-            self._dreaming_session = session_id
+            with self._lock:
+                self._is_dreaming = True
+                self._dreaming_session = session_id
 
             result = loop.dream(n_steps=steps, full_cycle=full_cycle)
 
@@ -376,8 +379,9 @@ class DreamScheduler:
             logger.error(f"[{session_id}] 手动做梦失败: {e}", exc_info=True)
             return {'status': 'error', 'error': str(e)}
         finally:
-            self._is_dreaming = False
-            self._dreaming_session = None
+            with self._lock:
+                self._is_dreaming = False
+                self._dreaming_session = None
             self._busy_lock.release()
 
     # ------------------------------------------------------------------ #
@@ -397,14 +401,16 @@ class DreamScheduler:
                     'last_dream_steps': act.last_dream_result.get('steps', 0),
                 })
 
-        return {
-            'running': self._running,
-            'is_dreaming': self._is_dreaming,
-            'dreaming_session': self._dreaming_session,
-            'idle_threshold': self.idle_threshold,
-            'dream_steps': self.dream_steps,
-            'dream_full_cycle': self.dream_full_cycle,
-            'check_interval': self.check_interval,
-            'registered_sessions': len(self._activities),
-            'sessions': sessions,
-        }
+            # _is_dreaming / _dreaming_session 在 _check_and_dream 与
+            # trigger_dream 中写入，此处需在同一把锁下读取以避免数据竞争
+            return {
+                'running': self._running,
+                'is_dreaming': self._is_dreaming,
+                'dreaming_session': self._dreaming_session,
+                'idle_threshold': self.idle_threshold,
+                'dream_steps': self.dream_steps,
+                'dream_full_cycle': self.dream_full_cycle,
+                'check_interval': self.check_interval,
+                'registered_sessions': len(self._activities),
+                'sessions': sessions,
+            }

@@ -13,7 +13,9 @@
     - 0.3.0: 增加 meta 元可塑性可选字段（向后兼容：旧快照无此字段时跳过）。
 """
 
+import os
 import time
+import tempfile
 import torch
 import logging
 from typing import Optional
@@ -131,12 +133,22 @@ class Snapshot:
             data['meta'] = meta_state
 
         # 确保目录存在
-        import os
         dir_path = os.path.dirname(path)
         if dir_path:
             os.makedirs(dir_path, exist_ok=True)
 
-        torch.save(data, path)
+        # 原子写入：先写临时文件，再原子替换，避免崩溃时截断原有快照
+        fd, tmp_path = tempfile.mkstemp(
+            prefix=".snap_", suffix=".tmp",
+            dir=dir_path if dir_path else ".")
+        try:
+            with os.fdopen(fd, "wb") as f:
+                torch.save(data, f)  # 写到文件句柄而非路径
+            os.replace(tmp_path, path)  # 原子替换
+        except Exception:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+            raise
         logger.info(f"快照已保存到 {path}")
 
     def load(self, path: str) -> tuple[dict, dict]:

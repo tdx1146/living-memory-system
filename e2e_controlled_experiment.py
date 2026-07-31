@@ -86,8 +86,8 @@ _PRETRAINED_MODEL_PATH = (
     r"\snapshots\master"
 )
 
-# DeepSeek API 配置
-DEEPSEEK_API_KEY = "sk-d91a6339112040a98c6f0617e6142307"
+# DeepSeek API 配置（从环境变量读取，避免硬编码泄露）
+DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
 DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
 DEEPSEEK_MODEL = "deepseek-chat"
 

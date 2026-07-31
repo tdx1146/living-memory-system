@@ -17,5 +17,8 @@ sentence-transformers>=2.2
 fastapi>=0.100
 uvicorn[standard]>=0.23
 
+# MCP 协议层（mcp_memory_server 依赖）
+mcp>=1.0
+
 # 测试框架（开发依赖）
 pytest>=7.0

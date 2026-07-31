@@ -30,6 +30,7 @@ import os
 import time
 import random
 import logging
+import tempfile
 from collections import deque
 from typing import Optional, Tuple, List
 
@@ -912,7 +913,17 @@ class DreamEngine:
             snap_dir = self.snapshot_dir
             os.makedirs(snap_dir, exist_ok=True)
             path = os.path.join(snap_dir, 'latest.pt')
-            torch.save(data, path)
+            # 原子写入：先写临时文件，再原子替换，避免崩溃时截断原有快照
+            fd, tmp_path = tempfile.mkstemp(
+                prefix=".snap_", suffix=".tmp", dir=snap_dir)
+            try:
+                with os.fdopen(fd, "wb") as f:
+                    torch.save(data, f)
+                os.replace(tmp_path, path)
+            except Exception:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+                raise
             logger.info(f"做梦快照已保存: {path}")
             return path
         except Exception as e:

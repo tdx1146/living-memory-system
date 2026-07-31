@@ -22,6 +22,7 @@ run_in_executor 将阻塞调用交给线程池，避免阻塞事件循环。
 
 import os
 import time
+import asyncio
 import logging
 from datetime import datetime
 from typing import Optional
@@ -193,17 +194,26 @@ async def chat(req: ChatRequest):
     scheduler.register_session(req.session_id)
 
     # 获取对话权限（等待做梦完成），更新活动时间
-    scheduler.acquire_conversation(req.session_id)
+    acquired = scheduler.acquire_conversation(req.session_id)
     scheduler.touch(req.session_id)
+    if not acquired:
+        # 做梦未结束且等待超时：拒绝请求以避免对话处理与后台做梦并发写
+        # 同一份记忆状态（J矩阵/precision/latent）
+        raise HTTPException(
+            status_code=503,
+            detail="系统正在做梦（记忆巩固中），请稍后重试。")
     try:
-        # 1. 处理本轮，生成记忆 context（同步阻塞调用）
-        memory_context = loop.process_turn(req.user_input, req.llm_output)
+        # 1. 处理本轮，生成记忆 context（同步阻塞调用，交由线程池执行）
+        memory_context = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: loop.process_turn(req.user_input, req.llm_output))
 
         # 2. 查询 LLM（若已配置）
         response_text = memory_context
         if loop.bridge is not None:
             try:
-                response_text = loop.bridge.query(req.user_input, memory_context)
+                response_text = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: loop.bridge.query(req.user_input, memory_context))
                 logger.info(
                     f"[{req.session_id}] LLM 回复长度: {len(response_text)}")
             except Exception as e:
@@ -248,7 +258,8 @@ async def chat_simple(req: SimpleChatRequest):
         )
 
     try:
-        response_text = loop.query_llm(req.user_input)
+        response_text = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: loop.query_llm(req.user_input))
         logger.info(
             f"[{req.session_id}] (simple) LLM 回复长度: {len(response_text)}")
     except HTTPException:
@@ -409,7 +420,6 @@ async def trigger_dream(session_id: str, req: Optional[DreamRequest] = None):
     full_cycle = req.full_cycle if req else False
 
     # 在线程池中执行（避免阻塞事件循环）
-    import asyncio
     loop_result = await asyncio.get_event_loop().run_in_executor(
         None,
         lambda: scheduler.trigger_dream(

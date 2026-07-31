@@ -24,10 +24,18 @@ setup(
         'torch>=2.0',
         'numpy>=1.21',
         'openai>=1.0',
+        'fastapi>=0.100',
+        'uvicorn[standard]>=0.20',
+        'sentence-transformers>=2.2',
+        'mcp>=1.0',
     ],
     extras_require={
         'dev': [
             'pytest>=7.0',
+            'pytest-asyncio>=0.21',
+            'httpx>=0.24',
+            'pytest-cov>=4.0',
+            'detect-secrets>=1.4',
         ],
     },
     entry_points={
