@@ -31,9 +31,8 @@ _PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
-import torch
-from runtime.loop import LivingMemoryLoop
-from runtime.config import default_config
+from runtime.loop import LivingMemoryLoop  # noqa: E402
+from runtime.config import default_config  # noqa: E402
 
 # 预训练模型本地路径（modelscope 下载缓存）
 _PRETRAINED_MODEL_PATH = (
@@ -215,15 +214,15 @@ def print_summary(loop: LivingMemoryLoop,
     # precision 演化情况
     final_precision_mean = (precision_history[-1]
                             if precision_history else 0.0)
-    print(f"\nprecision 演化情况:")
+    print("\nprecision 演化情况:")
     print(f"  初始均值: {initial_precision_mean:.6f}")
     print(f"  最终均值: {final_precision_mean:.6f}")
     print(f"  变化量:   {final_precision_mean - initial_precision_mean:+.6f}")
     print(f"  逐轮轨迹: {' -> '.join(f'{p:.4f}' for p in precision_history)}")
 
     # coherence 变化
-    print(f"\ncoherence 变化:")
-    print(f"  初始: 1.0000")
+    print("\ncoherence 变化:")
+    print("  初始: 1.0000")
     if coherence_history:
         print(f"  最终: {coherence_history[-1]:.4f}")
     print(f"  逐轮轨迹: {' -> '.join(f'{c:.4f}' for c in coherence_history)}")
