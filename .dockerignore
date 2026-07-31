@@ -1,0 +1,77 @@
+# ============================================================================
+# 活体记忆系统 - .dockerignore
+# 任务编号: E-P2-2
+# 排除无需进入镜像的文件，减小构建上下文与镜像体积、避免泄露敏感信息
+# ============================================================================
+
+# 版本控制
+.git
+.gitignore
+.github
+.gitattributes
+
+# Python 缓存与字节码
+__pycache__
+**/__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.so
+
+# 测试与覆盖率缓存
+.pytest_cache
+.coverage
+.coverage.*
+htmlcov
+.mypy_cache
+.ruff_cache
+.tox
+
+# 虚拟环境与构建产物
+.venv
+venv
+env
+build
+dist
+*.egg
+*.egg-info
+
+# 运行时数据（生产镜像不需要，运行时由卷挂载持久化）
+snapshots
+*.pt
+*.pth
+*.bin
+*.onnx
+lms_data
+redis_data
+lms_cache
+
+# 敏感信息（绝不打入镜像）
+.env
+.env.local
+.env.*.local
+
+# 文档与测试（生产镜像不需要）
+docs
+tests
+*.md
+
+# 根目录下的测试/实验脚本（非运行时依赖）
+conftest.py
+test_*.py
+*_test.py
+e2e_*.py
+
+# 前端 / 其他
+node_modules
+
+# IDE 与系统文件
+.idea
+.vscode
+.DS_Store
+Thumbs.db
+
+# Docker 自身文件（避免循环复制进镜像）
+Dockerfile
+docker-compose.yml
+.dockerignore
