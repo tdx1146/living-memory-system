@@ -116,7 +116,7 @@ class SessionManager:
         status = loop.get_status()
         # 补充情景记忆缓冲区大小
         try:
-            status['episodic_buffer_size'] = len(loop.memory._episodic_buffer)
+            status['episodic_buffer_size'] = loop.memory.episodic_size()
         except Exception:
             status['episodic_buffer_size'] = 0
         # 标记是否配置了 LLM
