@@ -32,8 +32,9 @@
 """
 
 import torch
+from typing import Union
 
-from core.types import Activation, PurposeState
+from core.types import Activation, PurposeState, resolve_device
 
 
 class PurposeLayer:
@@ -59,7 +60,8 @@ class PurposeLayer:
                  habituation_rate: float = 0.05,
                  activation_threshold: float = 0.3,
                  coherence_direction_weight: float = 0.5,
-                 coherence_magnitude_weight: float = 0.5) -> None:
+                 coherence_magnitude_weight: float = 0.5,
+                 device: Union[str, torch.device] = "auto") -> None:
         """初始化目的层。
 
         参数:
@@ -84,6 +86,9 @@ class PurposeLayer:
                 衡量 precision 幅度的稳定性。默认 0.5。
                 方向权重与幅度权重之和无需为 1，内部会归一化以保证
                 coherence 落在 [0, 1]。
+            device: 计算设备（E-P2-1）。支持 "auto"/"cpu"/"cuda"/"cuda:0"
+                或 torch.device。precision 向量、attention 和 encounter_count
+                将创建在该设备上。
         """
         self.input_dim = input_dim
         self.precision_lr = precision_lr
@@ -99,8 +104,12 @@ class PurposeLayer:
         self.coherence_direction_weight = coherence_direction_weight
         self.coherence_magnitude_weight = coherence_magnitude_weight
 
-        # Layer 1: Sensory Precision —— 初始均匀分布
-        self.sensory_precision: torch.Tensor = torch.ones(input_dim)
+        # E-P2-1: 统一设备管理
+        self.device: torch.device = resolve_device(device)
+
+        # Layer 1: Sensory Precision —— 初始均匀分布（E-P2-1: 创建在 device 上）
+        self.sensory_precision: torch.Tensor = torch.ones(
+            input_dim, device=self.device)
 
         # Layer 2: Attention Allocation —— 从 precision 派生
         self.attention: torch.Tensor = torch.softmax(self.sensory_precision, dim=0)
@@ -111,9 +120,9 @@ class PurposeLayer:
         self.flip_count: int = 0    # 翻转次数
 
         # 习惯化计数器：跟踪每个维度被"遇到"的次数（G2 修复）
-        # 高频激活维度 → encounter_count 高 → habituation 衰减大 → precision 降低
-        # 这是累积计数，不随 history 裁剪而重置
-        self.encounter_count: torch.Tensor = torch.zeros(input_dim)
+        # E-P2-1: 创建在 device 上
+        self.encounter_count: torch.Tensor = torch.zeros(
+            input_dim, device=self.device)
 
         # precision 演化历史
         self.history: list[torch.Tensor] = []
@@ -138,7 +147,8 @@ class PurposeLayer:
             每个感官维度的惊讶度，形状 [input_dim]，值域映射到 precision 范围。
         """
         # 感官节点的激活强度（取绝对值，范围 (0, 1)）
-        sensory_activation = activation.state[:self.input_dim].abs()
+        # E-P2-1: 迁移到正确 device
+        sensory_activation = activation.state[:self.input_dim].abs().to(self.device)
 
         # 缩放到 precision 范围：0 → precision_min，1 → precision_max
         scale = self.precision_max - self.precision_min
@@ -262,7 +272,8 @@ class PurposeLayer:
         self.sensory_precision[target_dim] = self.precision_max
 
         # 轻微衰减其他维度（腾出注意力空间，但不至于归零）
-        mask = torch.ones(self.input_dim)
+        # E-P2-1: mask 创建在 device 上
+        mask = torch.ones(self.input_dim, device=self.device)
         mask[target_dim] = 0.0
         self.sensory_precision = (
             self.sensory_precision * (1.0 - 0.3 * mask)
@@ -306,8 +317,10 @@ class PurposeLayer:
         # 统计每个感官维度被"遇到"（显著激活）的次数
         # encounter_count 是累积计数，不随 history 裁剪而重置
         # N4: 阈值可配置（self.activation_threshold），不再硬编码 0.3
+        # E-P2-1: 迁移激活态到正确 device
         self.encounter_count += (
-            activation.state[:self.input_dim].abs() > self.activation_threshold
+            activation.state[:self.input_dim].abs().to(self.device)
+            > self.activation_threshold
         ).float()
 
         # --- Layer 1: 基于 per-dimension 惊讶度调整 sensory precision ---
@@ -382,18 +395,43 @@ class PurposeLayer:
         封装内部属性恢复逻辑，使 persistence 层通过公开接口操作，
         而非依赖脆弱的属性直写。
 
+        E-P2-1: 恢复的张量自动迁移到目的层当前 device。
+
         参数:
             state: PurposeState，包含 precision、history、coherence 和
                 encounter_count（可选，向后兼容旧版快照）。
         """
-        self.sensory_precision = state.precision.clone()
-        self.history = [p.clone() for p in state.history]
+        self.sensory_precision = state.precision.clone().to(self.device)
+        self.history = [p.clone().to(self.device) for p in state.history]
         self.coherence = state.coherence
         # N3: 恢复 encounter_count（向后兼容：旧版快照无此字段时保持初始零值）
         if state.encounter_count is not None:
-            self.encounter_count = state.encounter_count.clone()
+            self.encounter_count = state.encounter_count.clone().to(self.device)
         # 重算 attention（从恢复的 precision 派生）
         self.attention = torch.softmax(self.sensory_precision, dim=0)
+
+    # ------------------------------------------------------------------ #
+    #  设备迁移（E-P2-1）
+    # ------------------------------------------------------------------ #
+
+    def to(self, device: Union[str, torch.device]) -> 'PurposeLayer':
+        """将目的层所有张量迁移到指定设备（E-P2-1）。
+
+        迁移 sensory_precision、attention、encounter_count 和历史
+        precision 快照到目标设备，并更新 self.device。
+
+        参数:
+            device: 目标设备（str / torch.device）。
+
+        返回:
+            self（支持链式调用）。
+        """
+        self.device = resolve_device(device)
+        self.sensory_precision = self.sensory_precision.to(self.device)
+        self.attention = self.attention.to(self.device)
+        self.encounter_count = self.encounter_count.to(self.device)
+        self.history = [p.to(self.device) for p in self.history]
+        return self
 
     # ------------------------------------------------------------------ #
     #  公开演化接口（供 DreamEngine 等上层模块调用）
