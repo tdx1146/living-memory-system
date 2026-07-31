@@ -278,7 +278,7 @@ class DreamScheduler:
 
             # 检查是否有记忆可回放
             try:
-                buf_size = len(loop.memory._buffer)
+                buf_size = loop.memory.buffer_size()
             except Exception:
                 buf_size = 0
 
