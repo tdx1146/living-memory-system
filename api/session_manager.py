@@ -14,7 +14,6 @@ import threading
 from typing import Dict, List, Optional
 
 from runtime.loop import LivingMemoryLoop
-from runtime.config import default_config
 from api.config import get_api_config
 
 logger = logging.getLogger(__name__)
