@@ -22,6 +22,7 @@ import sys
 import json
 import logging
 import asyncio
+from typing import Any
 
 # ---------------------------------------------------------------------------
 # 路径设置：确保项目根目录在 sys.path 上，使 runtime/core 等包可被导入
@@ -33,15 +34,15 @@ if _SCRIPT_DIR not in sys.path:
 # ---------------------------------------------------------------------------
 # MCP 2.0.0 导入
 # ---------------------------------------------------------------------------
-import mcp.server.stdio as stdio
-from mcp.server import Server
-import mcp.types as types
+import mcp.server.stdio as stdio  # noqa: E402
+from mcp.server import Server  # noqa: E402
+import mcp.types as types  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # 活体记忆系统导入
 # ---------------------------------------------------------------------------
-from runtime.config import default_config
-from runtime.loop import LivingMemoryLoop
+from runtime.config import default_config  # noqa: E402
+from runtime.loop import LivingMemoryLoop  # noqa: E402
 
 logger = logging.getLogger("mcp_memory_server")
 
@@ -201,7 +202,7 @@ def get_loop() -> LivingMemoryLoop:
 # JSON 序列化辅助：处理 torch.Tensor / numpy 标量
 # ---------------------------------------------------------------------------
 
-def _json_default(obj):
+def _json_default(obj: Any) -> Any:
     """JSON 序列化的 default 回调，处理非原生类型。"""
     # torch.Tensor / numpy scalar -> Python 标量
     if hasattr(obj, 'item'):
@@ -212,7 +213,7 @@ def _json_default(obj):
     return str(obj)
 
 
-def _to_json(obj) -> str:
+def _to_json(obj: Any) -> str:
     """安全 JSON 序列化，处理 torch/numpy 类型。"""
     return json.dumps(obj, ensure_ascii=False, indent=2, default=_json_default)
 
