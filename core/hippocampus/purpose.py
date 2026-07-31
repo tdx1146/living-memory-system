@@ -52,12 +52,14 @@ class PurposeLayer:
                  precision_lr: float = 0.1,
                  precision_min: float = 0.1,
                  precision_max: float = 10.0,
-                 coherence_threshold: float = 0.3,
+                 coherence_threshold: float = 0.5,
                  min_history_length: int = 5,
                  meta_window: int = 10,
                  max_history: int = 100,
                  habituation_rate: float = 0.05,
-                 activation_threshold: float = 0.3) -> None:
+                 activation_threshold: float = 0.3,
+                 coherence_direction_weight: float = 0.5,
+                 coherence_magnitude_weight: float = 0.5) -> None:
         """初始化目的层。
 
         参数:
@@ -66,6 +68,8 @@ class PurposeLayer:
             precision_min: precision 下限，防止发散。
             precision_max: precision 上限，防止发散。
             coherence_threshold: coherence 低于此值时考虑触发元目的翻转。
+                默认 0.5（混合 coherence 分布不同于纯余弦相似度，
+                0.3 过低会导致元目的翻转始终不触发）。
             min_history_length: 触发翻转所需的最短历史长度。
             meta_window: 元目的翻转时回看的历史窗口大小。
             max_history: precision 历史上限，防止无界增长（默认 meta_window*10）。
@@ -74,6 +78,12 @@ class PurposeLayer:
                 才被计入 encounter_count（N4 修复）。当 temperature 较低时
                 （如 temperature=0 确定性推断），激活值偏小，应适当降低此阈值
                 以保证习惯化机制生效。
+            coherence_direction_weight: coherence 方向分量权重（余弦相似度），
+                衡量 precision 方向的稳定性。默认 0.5。
+            coherence_magnitude_weight: coherence 幅度分量权重（范数比值），
+                衡量 precision 幅度的稳定性。默认 0.5。
+                方向权重与幅度权重之和无需为 1，内部会归一化以保证
+                coherence 落在 [0, 1]。
         """
         self.input_dim = input_dim
         self.precision_lr = precision_lr
@@ -85,6 +95,9 @@ class PurposeLayer:
         self.max_history = max_history
         self.habituation_rate = habituation_rate
         self.activation_threshold = activation_threshold
+        # coherence 混合权重（方向分量 + 幅度分量）
+        self.coherence_direction_weight = coherence_direction_weight
+        self.coherence_magnitude_weight = coherence_magnitude_weight
 
         # Layer 1: Sensory Precision —— 初始均匀分布
         self.sensory_precision: torch.Tensor = torch.ones(input_dim)
@@ -143,7 +156,32 @@ class PurposeLayer:
           - coherence 高：precision 稳定，目的明确
           - coherence 低：precision 波动，目的不明确
 
-        使用当前 precision 与历史均值的余弦相似度。
+        采用「方向分量 + 幅度分量」的混合度量，以同时反映 precision
+        的方向变化与幅度变化:
+
+          1. 方向分量（direction_component）:
+             当前 precision 与历史均值的余弦相似度，映射到 [0, 1]。
+             衡量 precision **方向**的稳定性——方向越一致，分量越高。
+             局限：余弦相似度只对方向敏感，对幅度不敏感。
+
+          2. 幅度分量（magnitude_component）:
+             当前 precision 范数与历史均值范数的比值:
+                 magnitude_ratio = min(||current||, ||mean||)
+                                   / max(||current||, ||mean||)
+             范围 (0, 1]。衡量 precision **幅度**的稳定性——幅度越接近，
+             分量越高。当习惯化（habituation）导致所有高频维度 precision
+             同步下降时，方向几乎不变（余弦≈1）但幅度显著缩小，此时
+             幅度分量能正确下降，从而拉低整体 coherence。
+
+          3. 混合 coherence:
+                 coherence = w_direction * direction_component
+                           + w_magnitude * magnitude_component
+             权重在构造函数中配置（coherence_direction_weight /
+             coherence_magnitude_weight，默认 0.5/0.5）。内部对权重做
+             归一化，保证 coherence 始终落在 [0, 1]。
+
+        这一修复解决了"习惯化导致 precision 全局下降但方向不变，使余弦
+        相似度恒为 ~1.0、coherence 恒为 ~1.0、元目的翻转永不触发"的缺陷。
 
         返回:
             coherence 标量，范围 [0, 1]。
@@ -159,17 +197,40 @@ class PurposeLayer:
         # 历史均值
         mean_precision = history_tensor.mean(dim=0)  # [input_dim]
 
-        # 余弦相似度
         current = self.sensory_precision
         norm_curr = current.norm()
         norm_mean = mean_precision.norm()
+        # 范数过小（接近零向量）时方向与幅度均不可靠，视为低一致性
         if norm_curr < 1e-8 or norm_mean < 1e-8:
             return 0.0
 
+        # --- 方向分量：余弦相似度映射到 [0, 1] ---
         cosine = torch.dot(current, mean_precision) / (norm_curr * norm_mean)
-        # 余弦相似度范围 [-1, 1]，映射到 [0, 1]
-        coherence = float((cosine + 1.0) / 2.0)
-        return coherence
+        direction_component = float((cosine + 1.0) / 2.0)
+
+        # --- 幅度分量：范数比值，范围 (0, 1] ---
+        # min/max 比值保证对称性：无论当前幅度大于还是小于历史均值，
+        # 偏离越大分量越低。幅度变化大（如习惯化导致全局下降）时下降。
+        norm_curr_val = float(norm_curr)
+        norm_mean_val = float(norm_mean)
+        magnitude_component = (
+            min(norm_curr_val, norm_mean_val)
+            / max(norm_curr_val, norm_mean_val)
+        )
+
+        # --- 混合 coherence（权重归一化以保证落在 [0, 1]）---
+        w_dir = self.coherence_direction_weight
+        w_mag = self.coherence_magnitude_weight
+        total_w = w_dir + w_mag
+        if total_w <= 0.0:
+            # 两个权重都为 0 的退化情形：退化为纯方向分量
+            coherence = direction_component
+        else:
+            coherence = (w_dir * direction_component
+                         + w_mag * magnitude_component) / total_w
+
+        # 数值保护，确保落在 [0, 1]
+        return max(0.0, min(1.0, coherence))
 
     # ------------------------------------------------------------------ #
     #  Layer 3: 元目的翻转
@@ -332,4 +393,39 @@ class PurposeLayer:
         if state.encounter_count is not None:
             self.encounter_count = state.encounter_count.clone()
         # 重算 attention（从恢复的 precision 派生）
+        self.attention = torch.softmax(self.sensory_precision, dim=0)
+
+    # ------------------------------------------------------------------ #
+    #  公开演化接口（供 DreamEngine 等上层模块调用）
+    # ------------------------------------------------------------------ #
+
+    def nudge_low_encounter_dim(self, nudge: float) -> None:
+        """向 encounter_count 最低的维度偏移 precision（好奇心萌芽）。
+
+        找出 ``encounter_count`` 最低的维度（最未被探索），将其
+        ``sensory_precision`` 增加 ``nudge``，鼓励探索尚未被关注的
+        方向。偏移后重新 clamp 防止发散，并重算 attention。
+
+        该方法封装了 DreamEngine ``_purpose_evolve`` 中"向低探索维度
+        偏移 precision"的逻辑，使上层模块通过公开接口操作，而非直接
+        读写 ``sensory_precision`` / ``attention`` 私有属性。
+
+        参数:
+            nudge: precision 偏移幅度（正值增加）。通常为小量
+                （如 0.05），实现温和的好奇心漂移。
+        """
+        encounter = self.encounter_count
+        if encounter.numel() == 0:
+            return
+        target_dim = int(encounter.argmin().item())
+        self.sensory_precision[target_dim] = (
+            self.sensory_precision[target_dim] + nudge
+        )
+        # clamp 防止发散
+        self.sensory_precision = torch.clamp(
+            self.sensory_precision,
+            self.precision_min,
+            self.precision_max,
+        )
+        # 重新计算 attention
         self.attention = torch.softmax(self.sensory_precision, dim=0)
