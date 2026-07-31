@@ -20,8 +20,9 @@
 """
 
 import torch
+from typing import Optional, Union
 
-from core.types import Activation
+from core.types import Activation, resolve_device
 
 
 def langevin(b: torch.Tensor) -> torch.Tensor:
@@ -75,7 +76,8 @@ class AttractorNetwork:
 
     def __init__(self, num_nodes: int, input_dim: int,
                  seed: int = 42,
-                 temperature: float = 0.05) -> None:
+                 temperature: float = 0.05,
+                 device: Union[str, torch.device] = "auto") -> None:
         """初始化吸引子网络。
 
         参数:
@@ -85,6 +87,8 @@ class AttractorNetwork:
             temperature: Langevin 动力学温度（扩散项噪声强度）。
                 T > 0 时相似但不同的输入有机会收敛到不同吸引子，
                 使正交化学习规则能够发挥作用。设为 0 则退化为纯平均场推断。
+            device: 计算设备（E-P2-1）。支持 "auto"/"cpu"/"cuda"/"cuda:0"
+                或 torch.device。所有张量（J、bias、sigma）将创建在该设备上。
         """
         assert input_dim <= num_nodes, (
             f"input_dim({input_dim}) 不能大于 num_nodes({num_nodes})"
@@ -92,25 +96,29 @@ class AttractorNetwork:
         self.num_nodes = num_nodes
         self.input_dim = input_dim
         self.seed = seed
+        # E-P2-1: 统一设备管理
+        self.device: torch.device = resolve_device(device)
 
         generator = torch.Generator()
         generator.manual_seed(seed)
 
         # 耦合矩阵 J：初始为小随机值，对称化，对角线为 0
         # 小初始化保证初始状态接近中性，学习逐步塑造结构
+        # E-P2-1: 在 CPU 上用 CPU 生成器产生随机值（保证种子可复现性跨设备
+        # 一致），再迁移到目标设备
         self.J: torch.Tensor = (
             torch.randn(num_nodes, num_nodes, generator=generator) * 0.01
-        )
+        ).to(self.device)
         # 对称化（非序列模式：J_ij = J_ji）
         self.J = (self.J + self.J.T) / 2
         # 无自连接
         self.J.fill_diagonal_(0)
 
         # 偏置向量：初始为 0
-        self.bias: torch.Tensor = torch.zeros(num_nodes)
+        self.bias: torch.Tensor = torch.zeros(num_nodes, device=self.device)
 
         # 当前状态 sigma：初始为 0（中性状态）
-        self.sigma: torch.Tensor = torch.zeros(num_nodes)
+        self.sigma: torch.Tensor = torch.zeros(num_nodes, device=self.device)
 
         # 复杂性/正交化参数（可外部调整）
         self.complexity_weight: float = 0.01
@@ -127,7 +135,10 @@ class AttractorNetwork:
     # ------------------------------------------------------------------ #
 
     def infer(self, sensory_input: torch.Tensor, precision: torch.Tensor,
-              num_steps: int = 10) -> Activation:
+              num_steps: int = 10,
+              temperature_override: Optional[float] = None,
+              initial_state: Optional[torch.Tensor] = None,
+              update_internal_state: bool = True) -> Activation:
         """FEP 推断：给定感官输入和 precision，跑 K 步收敛到吸引子态。
 
         推断规则（从 FEP 推导）:
@@ -145,14 +156,33 @@ class AttractorNetwork:
         高 precision = 高信任 = 感官证据主导推断。
         低 precision = 低信任 = 内部模型主导推断。
 
+        E-P2-1: 输入张量自动迁移到网络所在 device。
+        E-P2-5: 新增 override 参数，避免调用方通过"保存→修改→恢复实例属性"
+            的方式临时改变推断行为：
+
+            - temperature_override: 临时使用的 Langevin 温度（不修改
+              self.temperature）。为 None 时使用 self.temperature。
+            - initial_state: 推断的起始 sigma（不修改 self.sigma）。为 None
+              时从 self.sigma 出发。常用于做梦引擎的生成式回放种子。
+            - update_internal_state: 是否将收敛后的 sigma 写回 self.sigma。
+              默认 True（在线模式）。设为 False 时推断不污染内部状态
+              （如做梦引擎需保持在线 sigma 不变）。
+
         参数:
             sensory_input: 感官向量，形状 [input_dim]。
             precision: 感官精度向量，形状 [input_dim]。
             num_steps: 推断迭代步数 K。
+            temperature_override: 临时温度覆盖（E-P2-5）。
+            initial_state: 推断起始状态（E-P2-5）。
+            update_internal_state: 是否写回 self.sigma（E-P2-5）。
 
         返回:
             收敛后的 Activation（激活态 + 熵 + 惊讶度）。
         """
+        # E-P2-1: 输入张量自动迁移到正确 device
+        sensory_input = sensory_input.to(self.device)
+        precision = precision.to(self.device)
+
         # B7 修复：输入形状校验，防止晦涩的广播错误
         assert sensory_input.shape == (self.input_dim,), (
             f"sensory_input shape mismatch: {sensory_input.shape} "
@@ -163,7 +193,16 @@ class AttractorNetwork:
             f"!= ({self.input_dim},)"
         )
 
-        sigma = self.sigma.clone()
+        # E-P2-5: 起始状态——提供 initial_state 时从它出发，否则从 self.sigma
+        if initial_state is not None:
+            sigma = initial_state.to(self.device).clone()
+        else:
+            sigma = self.sigma.clone()
+
+        # E-P2-5: 临时温度覆盖（不修改实例属性）
+        temperature = (temperature_override
+                       if temperature_override is not None
+                       else self.temperature)
 
         for _step in range(num_steps):
             # 对数几率：内部模型的预测
@@ -181,14 +220,15 @@ class AttractorNetwork:
             # Langevin 扩散项：小量随机扰动
             # 这不是数值噪声，而是 Langevin 方程的物理组成部分
             # 温度 T 控制噪声强度，T=0 时退化为平均场推断
-            if self.temperature > 0:
-                noise = torch.randn_like(sigma) * self.temperature
+            if temperature > 0:
+                noise = torch.randn_like(sigma) * temperature
                 sigma = sigma + noise
                 # 保持激活值在 (-1, 1) 范围内
                 sigma = torch.clamp(sigma, -0.999, 0.999)
 
-        # 更新内部状态
-        self.sigma = sigma.clone()
+        # E-P2-5: 仅在需要时写回内部状态（避免做梦等场景污染在线 sigma）
+        if update_internal_state:
+            self.sigma = sigma.clone()
 
         # 计算熵与惊讶度
         surprise = self._compute_free_energy(sigma, sensory_input, precision)
@@ -201,7 +241,9 @@ class AttractorNetwork:
     # ------------------------------------------------------------------ #
 
     def learn(self, activation: Activation, sensory_input: torch.Tensor,
-              learning_rate: float = 0.01) -> None:
+              learning_rate: float = 0.01,
+              orth_weight_override: Optional[float] = None,
+              complexity_weight_override: Optional[float] = None) -> None:
         """FEP 学习：更新耦合矩阵 J。
 
         学习规则（从 FEP 推导）:
@@ -233,24 +275,44 @@ class AttractorNetwork:
 
         无反向传播。无全局 loss。规则从第一性原理推导。
 
+        E-P2-1: 输入张量（激活态）自动迁移到网络所在 device。
+        E-P2-5: 新增 orth_weight_override / complexity_weight_override 参数，
+            允许调用方临时覆盖正交化权重与复杂度权重，而无需"保存→修改→
+            恢复"实例属性。覆盖值仅在本次调用内生效，不修改 self.orth_weight
+            / self.complexity_weight。为 None 时使用实例属性（向后兼容）。
+
         参数:
             activation: 推断得到的激活态。
             sensory_input: 产生该激活态的感官输入。
             learning_rate: 学习率 η。
+            orth_weight_override: 临时正交化权重覆盖（E-P2-5）。
+            complexity_weight_override: 临时复杂度权重覆盖（E-P2-5）。
         """
-        sigma = activation.state
+        # E-P2-1: 激活态自动迁移到正确 device
+        sigma = activation.state.to(self.device)
+        # sensory_input 在当前实现中未参与 J 更新计算，但保持接口一致性
+        # 仍迁移到正确 device（向后兼容 + 防御性）
+        sensory_input = sensory_input.to(self.device)
+
+        # E-P2-5: 解析有效权重（override 优先，None 时回退实例属性）
+        effective_orth = (orth_weight_override
+                          if orth_weight_override is not None
+                          else self.orth_weight)
+        effective_cw = (complexity_weight_override
+                        if complexity_weight_override is not None
+                        else self.complexity_weight)
 
         # --- 层 1: sigma 正交化（改变学习方向） ---
         # 从当前模式中减去与已学结构（先验）重叠的部分
         # 只在"新颖"方向上做 Hebbian 学习
-        if self.orth_weight > 0:
+        if effective_orth > 0:
             recall = self.J @ sigma  # 网络对当前模式的回忆（先验）
             recall_energy = torch.dot(recall, recall)
             if recall_energy > 1e-10:
                 # 当前 sigma 在回忆方向上的投影系数
                 proj_coef = torch.dot(recall, sigma) / recall_energy
                 # 减去投影（保留正交分量）
-                sigma = sigma - self.orth_weight * proj_coef * recall
+                sigma = sigma - effective_orth * proj_coef * recall
                 # 保持在 Langevin 激活值的有效范围
                 sigma = torch.clamp(sigma, -0.999, 0.999)
 
@@ -259,7 +321,8 @@ class AttractorNetwork:
         hebbian = torch.outer(sigma, sigma)  # [num_nodes, num_nodes]
 
         # --- 层 2: 复杂性梯度：饱和度压力 + 权重衰减 ---
-        complexity_grad = self._complexity_gradient(sigma)
+        complexity_grad = self._complexity_gradient(
+            sigma, orth_weight=effective_orth, complexity_weight=effective_cw)
 
         # --- 总更新: ΔJ = -∂F/∂J = Hebbian - 复杂性 ---
         # 注意符号: ∂F_accuracy/∂J = -Hebbian（负号因为增强连接降低自由能）
@@ -273,7 +336,10 @@ class AttractorNetwork:
         # 对角线置零（无自连接）
         self.J.fill_diagonal_(0)
 
-    def _complexity_gradient(self, sigma: torch.Tensor) -> torch.Tensor:
+    def _complexity_gradient(self, sigma: torch.Tensor,
+                             orth_weight: Optional[float] = None,
+                             complexity_weight: Optional[float] = None
+                             ) -> torch.Tensor:
         """复杂性梯度：正交化压力 + 权重衰减。
 
         正交化压力（核心创新）:
@@ -297,12 +363,23 @@ class AttractorNetwork:
             complexity_weight * J，防止 J 发散，提供抗灾难性遗忘能力。
             保持 J 有界使得旧模式不会被新模式完全覆盖。
 
+        E-P2-5: orth_weight / complexity_weight 参数允许调用方传入临时
+            覆盖值（来自 learn() 的 override），为 None 时回退实例属性，
+            保证向后兼容。
+
         参数:
             sigma: 当前激活态，形状 [num_nodes]。
+            orth_weight: 正交化权重（覆盖 self.orth_weight）。
+            complexity_weight: 复杂度权重（覆盖 self.complexity_weight）。
 
         返回:
             复杂性梯度矩阵，形状 [num_nodes, num_nodes]。
         """
+        if orth_weight is None:
+            orth_weight = self.orth_weight
+        if complexity_weight is None:
+            complexity_weight = self.complexity_weight
+
         # J 矩阵的饱和度：连接强度的归一化
         J_strength = self.J.abs()
         max_strength = J_strength.max()
@@ -317,10 +394,10 @@ class AttractorNetwork:
         # 正交化压力：在已饱和（已学习）的方向上施加阻力
         # saturation 高 = 这些连接已被之前的模式强化
         # 新模式在这些方向的学习被抑制，被迫寻找新的方向
-        orth_pressure = self.orth_weight * saturation * hebbian.abs()
+        orth_pressure = orth_weight * saturation * hebbian.abs()
 
         # L2 权重衰减（防止 J 发散，抗灾难性遗忘）
-        weight_decay = self.complexity_weight * self.J
+        weight_decay = complexity_weight * self.J
 
         return orth_pressure + weight_decay
 
@@ -417,15 +494,39 @@ class AttractorNetwork:
     def set_landscape(self, landscape: dict) -> None:
         """从快照恢复吸引子景观（重新点燃火种）。
 
+        E-P2-1: 恢复的张量自动迁移到网络当前 device，保证快照跨设备
+        恢复后张量设备一致。
+
         参数:
             landscape: get_landscape() 返回的字典。
         """
-        self.J = landscape["J"].clone()
-        self.bias = landscape["bias"].clone()
-        self.sigma = landscape["sigma"].clone()
+        self.J = landscape["J"].clone().to(self.device)
+        self.bias = landscape["bias"].clone().to(self.device)
+        self.sigma = landscape["sigma"].clone().to(self.device)
         self.num_nodes = landscape["num_nodes"]
         self.input_dim = landscape["input_dim"]
 
     def reset_state(self) -> None:
-        """重置内部状态 sigma 为零（不影响已学习的 J 矩阵）。"""
-        self.sigma = torch.zeros(self.num_nodes)
+        """重置内部状态 sigma 为零（不影响已学习的 J 矩阵）。
+
+        E-P2-1: 零向量创建在网络当前 device 上。
+        """
+        self.sigma = torch.zeros(self.num_nodes, device=self.device)
+
+    def to(self, device: Union[str, torch.device]) -> 'AttractorNetwork':
+        """将网络所有张量迁移到指定设备（E-P2-1）。
+
+        迁移 J、bias、sigma 到目标设备，并更新 self.device。
+        适用于运行时动态切换设备（如先在 CPU 上初始化，再迁移到 GPU）。
+
+        参数:
+            device: 目标设备（str / torch.device）。
+
+        返回:
+            self（支持链式调用）。
+        """
+        self.device = resolve_device(device)
+        self.J = self.J.to(self.device)
+        self.bias = self.bias.to(self.device)
+        self.sigma = self.sigma.to(self.device)
+        return self
