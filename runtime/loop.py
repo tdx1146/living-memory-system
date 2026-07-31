@@ -10,6 +10,7 @@
 """
 
 import os
+import math
 import logging
 from typing import Optional
 
@@ -39,6 +40,7 @@ class LivingMemoryLoop:
     1. 编码输入（用户输入+LLM输出 -> 感官向量）
     2. FEP推断（感官向量 -> 激活态）
     3. FEP学习（更新J矩阵）
+    3.5 在线熵管理（熵过高增强正交化 / 熵过低放松正交化）
     4. 调整目的（更新precision）
     5. 记忆更新与巩固（短时更新 + 定期短时->长时迁移）
     5.5 记忆检索（用激活态检索长时记忆——S1 修复，记忆不再只写不读）
@@ -125,7 +127,11 @@ class LivingMemoryLoop:
             precision_lr=config.get('precision_lr', 0.1),
             precision_min=config.get('precision_min', 0.1),
             precision_max=config.get('precision_max', 10.0),
-            coherence_threshold=config.get('coherence_threshold', 0.3),
+            coherence_threshold=config.get('coherence_threshold', 0.5),
+            coherence_direction_weight=config.get(
+                'coherence_direction_weight', 0.5),
+            coherence_magnitude_weight=config.get(
+                'coherence_magnitude_weight', 0.5),
             min_history_length=config.get('min_history_length', 5),
             meta_window=config.get('meta_window', 10),
             max_history=config.get('max_history', 100),
@@ -166,6 +172,8 @@ class LivingMemoryLoop:
         self.turn_count = 0
         self.last_activation: Optional[Activation] = None
         self.consolidation_interval = consolidation_interval
+        # 在线熵管理：记录最后一轮的 entropy_ratio（entropy / max_entropy）
+        self.last_entropy_ratio = 0.0
 
         # 元可塑性控制器（可选，根据 config 决定是否启用）
         self.meta = None
@@ -200,6 +208,7 @@ class LivingMemoryLoop:
         1. 编码输入（用户输入+LLM输出 -> 感官向量）
         2. FEP推断（感官向量 + precision -> 激活态）
         3. FEP学习（更新J矩阵）
+        3.5 在线熵管理（熵过高增强正交化 / 熵过低放松正交化）
         4. 调整目的（更新precision）
         5. 记忆更新与巩固（短时更新 + 定期短时->长时迁移）
         5.5 记忆检索（用当前激活态作为线索，检索长时记忆）—— S1 修复
@@ -266,6 +275,35 @@ class LivingMemoryLoop:
             self.attractor.orth_weight = _meta_orig['orth_weight']
             self.attractor.complexity_weight = _meta_orig['complexity_weight']
 
+        # 3.5 在线熵管理
+        # FEP学习之后、调整目的之前，根据当前激活熵主动干预：
+        # 熵过高（混沌饱和）则增强正交化压力驱散相似表示；
+        # 熵过低（僵化）则放松正交化压力允许更多激活。
+        entropy = activation.entropy
+        max_entropy = math.log(self.attractor.num_nodes)  # ln(256) ≈ 5.55
+        entropy_ratio = entropy / max_entropy if max_entropy > 0 else 0.0
+        self.last_entropy_ratio = entropy_ratio  # 供 get_status() 读取
+
+        # 从config读取阈值（带默认值）
+        entropy_high_threshold = self.config.get('entropy_high_threshold', 0.9)
+        entropy_low_threshold = self.config.get('entropy_low_threshold', 0.5)
+
+        if entropy_ratio > entropy_high_threshold:
+            # 熵过高：系统混沌，增强正交化压力驱散相似表示
+            original_orth = self.attractor.orth_weight
+            self.attractor.orth_weight = original_orth * 1.5
+            # 额外学习一步，强化结构分化
+            self.attractor.learn(activation, sensory_input.vector, _effective_lr * 0.3)
+            self.attractor.orth_weight = original_orth  # 恢复
+            logger.info(f"在线熵管理: 熵={entropy:.3f}(ratio={entropy_ratio:.2f}) 过高，增强正交化")
+        elif entropy_ratio < entropy_low_threshold:
+            # 熵过低：系统僵化，降低正交化压力允许更多激活
+            original_orth = self.attractor.orth_weight
+            self.attractor.orth_weight = original_orth * 0.7
+            self.attractor.learn(activation, sensory_input.vector, _effective_lr * 0.2)
+            self.attractor.orth_weight = original_orth  # 恢复
+            logger.info(f"在线熵管理: 熵={entropy:.3f}(ratio={entropy_ratio:.2f}) 过低，放松正交化")
+
         # 4. 调整目的
         self.purpose.adjust(activation.surprise, activation)
 
@@ -303,9 +341,11 @@ class LivingMemoryLoop:
                 episodic_texts = [e.text for e in entries]
 
         # 6. 解码context（传入检索到的记忆和情景文本，使长期记忆+语义文本参与输出）
+        # A-P1-2: 传入 purpose.coherence，使解码器能输出"关注方向"解读
         memory_context = self.decoder.decode(
             activation, recalled_memory=recalled,
-            episodic_texts=episodic_texts)
+            episodic_texts=episodic_texts,
+            coherence=self.purpose.coherence)
 
         # 6.5 情景记忆存储（当前轮文本存入缓冲区，供后续检索）
         # 优先存 384 维 raw 向量；无 raw 向量时退化为投影向量（向后兼容）
@@ -375,7 +415,8 @@ class LivingMemoryLoop:
                     episodic_texts = [e.text for e in entries]
             memory_context = self.decoder.decode(
                 self.last_activation, recalled_memory=recalled,
-                episodic_texts=episodic_texts)
+                episodic_texts=episodic_texts,
+                coherence=self.purpose.coherence)
         else:
             memory_context = "[无记忆]"
 
@@ -485,6 +526,11 @@ class LivingMemoryLoop:
         if self.last_activation is not None:
             status['last_entropy'] = self.last_activation.entropy
             status['last_surprise'] = self.last_activation.surprise
+
+        # 在线熵管理状态
+        status['entropy_ratio'] = self.last_entropy_ratio
+        status['entropy_high_threshold'] = self.config.get('entropy_high_threshold', 0.9)
+        status['entropy_low_threshold'] = self.config.get('entropy_low_threshold', 0.5)
 
         purpose = self.purpose.get_purpose()
         status['purpose_coherence'] = purpose.coherence
