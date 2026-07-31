@@ -80,6 +80,53 @@ class LLMBridge:
             )
         return self._client
 
+    def _should_retry(self, exc: Exception) -> bool:
+        """判断异常是否值得重试。
+
+        区分可重试与不可重试异常，避免对必然失败的请求（如 401 鉴权失败）
+        进行无意义的重试与退避，浪费资源并阻塞调用方。
+
+        判定规则：
+            - openai.APIStatusError 且 status_code >= 500 → 可重试（服务端瞬时故障）
+            - openai.APIConnectionError / APITimeoutError / RateLimitError → 可重试
+              （网络抖动、超时、限流均为瞬时问题）
+            - 4xx 客户端错误（如 401/403/404）→ 不可重试，立即失败
+            - 非 openai SDK 异常 → 保守重试（兼容自定义 client / 测试 mock）
+            - openai SDK 未安装 → 保守重试
+
+        参数:
+            exc: 捕获到的异常对象
+
+        返回:
+            True 表示可重试，False 表示应立即失败
+        """
+        try:
+            import openai
+        except ImportError:
+            # openai SDK 未安装，无法精细判定，保守重试
+            return True
+
+        # 连接 / 超时 / 限流：瞬时问题，可重试
+        # 注意：APITimeoutError 是 APIConnectionError 的子类，RateLimitError
+        # 是 APIStatusError 的子类（status_code=429），需在这些 4xx 规则之前判定
+        if isinstance(exc, (openai.APIConnectionError,
+                            openai.APITimeoutError,
+                            openai.RateLimitError)):
+            return True
+
+        # HTTP 状态错误：按状态码判定
+        if isinstance(exc, openai.APIStatusError):
+            status_code = getattr(exc, 'status_code', None)
+            if status_code is not None and status_code >= 500:
+                # 5xx 服务端错误：可重试
+                return True
+            # 4xx 客户端错误（含 400/401/403/404 等）：重试必然失败，不重试
+            return False
+
+        # 非 openai SDK 异常（如自定义 client 抛出的异常、测试 mock 异常）：
+        # 保守重试，保持向后兼容
+        return True
+
     def query(self, user_input: str, memory_context: str) -> str:
         """带记忆context查询主LLM。
 
@@ -94,7 +141,9 @@ class LLMBridge:
             LLM的响应文本
 
         异常:
-            RuntimeError: 当所有重试都失败时抛出
+            RuntimeError: 当所有重试都失败、或遇到不可重试异常（如 4xx
+                鉴权失败）时抛出。不可重试异常会立即抛出（不退避），
+                其原始异常通过 raise ... from 保留在异常链中。
         """
         messages = [
             {
@@ -125,6 +174,12 @@ class LLMBridge:
                     f"LLM API调用失败 "
                     f"(尝试 {attempt + 1}/{self.max_retries}): {e}"
                 )
+                # 区分可重试与不可重试异常：
+                # 4xx 客户端错误（如 401 鉴权失败）重试必然失败，立即抛出不退避
+                if not self._should_retry(e):
+                    raise RuntimeError(
+                        f"LLM API调用失败（不可重试异常，已跳过重试）: {e}"
+                    ) from e
                 if attempt < self.max_retries - 1:
                     # 指数退避
                     delay = self.retry_delay * (2 ** attempt)
@@ -141,3 +196,20 @@ class LLMBridge:
             client: 客户端对象，需实现chat.completions.create接口
         """
         self._client = client
+
+    def close(self) -> None:
+        """释放 OpenAI client（httpx 连接池）。
+
+        关闭底层 httpx 客户端，释放连接池资源，避免句柄/连接泄漏。
+        对未初始化或自定义 client 安全调用（幂等）：若 client 不提供
+        close() 方法则仅置空引用。
+        """
+        if self._client is not None:
+            try:
+                close_method = getattr(self._client, 'close', None)
+                if callable(close_method):
+                    close_method()
+            except Exception as e:
+                logger.warning(f"关闭 LLM client 时发生异常: {e}")
+            finally:
+                self._client = None
