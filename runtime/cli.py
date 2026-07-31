@@ -12,16 +12,15 @@
 
 import argparse
 import sys
-import os
-import json
 import logging
+from typing import List, Optional
 
 from runtime.loop import LivingMemoryLoop
 from runtime.config import default_config, load_config
 from persistence.recovery import Recovery
 
 
-def setup_logging(verbose: bool = False):
+def setup_logging(verbose: bool = False) -> None:
     """配置日志。"""
     level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(
@@ -31,7 +30,7 @@ def setup_logging(verbose: bool = False):
     )
 
 
-def cmd_run(args):
+def cmd_run(args: argparse.Namespace) -> None:
     """执行run命令：启动交互式记忆循环。"""
     # 加载配置
     config = default_config()
@@ -102,7 +101,7 @@ def cmd_run(args):
             print(f"保存失败: {e}")
 
 
-def cmd_save(args):
+def cmd_save(args: argparse.Namespace) -> None:
     """执行save命令：手动快照。"""
     config = default_config()
     loop = LivingMemoryLoop(config)
@@ -121,7 +120,7 @@ def cmd_save(args):
         print(f"保存失败: {e}")
 
 
-def cmd_load(args):
+def cmd_load(args: argparse.Namespace) -> None:
     """执行load命令：验证并恢复快照。"""
     recovery = Recovery()
 
@@ -140,7 +139,7 @@ def cmd_load(args):
         print(f"快照验证失败: {args.path}")
 
 
-def cmd_status(args):
+def cmd_status(args: argparse.Namespace) -> None:
     """执行status命令：查看系统状态。"""
     config = default_config()
     loop = LivingMemoryLoop(config)
@@ -162,7 +161,7 @@ def cmd_status(args):
             print(f"  {k}: {v}")
 
 
-def main(argv=None):
+def main(argv: Optional[List[str]] = None) -> None:
     """CLI主入口。"""
     parser = argparse.ArgumentParser(
         description='活体记忆系统 (Living Memory System) - 命令行工具',
