@@ -49,8 +49,9 @@ class DreamEngine:
     """做梦引擎：空闲态计算核心，让记忆系统在无输入时持续运转。
 
     接收现有组件引用（不创建新实例），在空闲态对记忆系统进行离线运算。
-    所有阶段方法都会保存/恢复它临时修改的组件超参数（如 temperature、
-    orth_weight），避免影响在线模式；而真正属于"做梦成果"的状态变更
+    空闲态参数（如 temperature、orth_weight、complexity_weight）通过
+    AttractorNetwork 的 override 接口传递（E-P2-5），不再"保存→修改→
+    恢复"实例属性，避免影响在线模式；而真正属于"做梦成果"的状态变更
     （J 矩阵巩固、突触下调、景观漂移、目的演化等）则持久保留。
 
     属性:
@@ -118,7 +119,9 @@ class DreamEngine:
         self.idle_temperature = config.get('idle_temperature', 0.1)
         self.idle_num_steps = config.get('idle_num_steps', 20)
         # 零精度向量（存储为属性，便于检查与测试）
-        self.idle_precision = torch.zeros(self.input_dim)
+        # E-P2-1: 创建在 attractor 所在 device 上
+        self.idle_precision = torch.zeros(
+            self.input_dim, device=self.attractor.device)
 
         # --- 平衡与控制参数 ---
         self.consolidation_ratio = config.get('consolidation_ratio', 0.7)
@@ -434,8 +437,12 @@ class DreamEngine:
         为了让回放"重访"特定记忆，将传入的记忆状态作为网络初始 sigma
         的种子，使动力学从该记忆附近出发并放松到吸引子。
 
-        临时切换 temperature 和 orth_weight 到空闲态值，执行后恢复，
-        避免影响在线模式。同时保存/恢复 sigma，避免污染在线起始状态。
+        E-P2-1: 零精度输入向量创建在 attractor 所在 device 上。
+        E-P2-5: 不再"保存→修改→恢复"实例属性，改为通过 infer() 的
+            override 参数传递空闲态值：
+            - temperature_override: 临时使用空闲态温度
+            - initial_state: 用记忆状态作为推断种子（不修改 self.sigma）
+            - update_internal_state=False: 不污染在线 sigma
 
         参数:
             sensory_input: 记忆激活态 [num_nodes]，用作生成式回放的种子。
@@ -444,40 +451,36 @@ class DreamEngine:
         返回:
             生成式回放得到的 Activation。
         """
-        # 保存在线态参数
-        orig_temperature = self.attractor.temperature
-        orig_orth_weight = self.attractor.orth_weight
-        orig_sigma = self.attractor.sigma.clone()
+        # 计算有效温度（若 meta 可用，使用元调整后的温度）
+        effective_temp = self.idle_temperature
+        if self.meta is not None:
+            adjusted = self.meta.get_adjusted_params(
+                base_lr=self.idle_lr,
+                base_orth=self.idle_orth_weight,
+                base_temp=self.idle_temperature,
+                base_cw=self.attractor.complexity_weight,
+            )
+            effective_temp = adjusted['temperature']
 
-        try:
-            # 切换到空闲态参数
-            # 若 meta 可用，使用元调整后的温度（base * temp_multiplier）
-            effective_temp = self.idle_temperature
-            if self.meta is not None:
-                adjusted = self.meta.get_adjusted_params(
-                    base_lr=self.idle_lr,
-                    base_orth=self.idle_orth_weight,
-                    base_temp=self.idle_temperature,
-                    base_cw=self.attractor.complexity_weight,
-                )
-                effective_temp = adjusted['temperature']
-            self.attractor.temperature = effective_temp
-            self.attractor.orth_weight = self.idle_orth_weight  # 会被 _idle_learn 覆盖
+        # E-P2-1: 零精度输入创建在 attractor device 上
+        zero_input = torch.zeros(
+            self.attractor.input_dim, device=self.attractor.device)
 
-            # 用记忆状态作为生成式回放的种子（设为网络初始 sigma）
-            if sensory_input.shape[0] == self.attractor.num_nodes:
-                self.attractor.sigma = sensory_input.clone()
+        # E-P2-5: 通过接口参数传递空闲态值，不修改实例属性
+        # 用记忆状态作为生成式回放的种子（initial_state 不修改 self.sigma）
+        seed = None
+        if sensory_input.shape[0] == self.attractor.num_nodes:
+            seed = sensory_input
 
-            # 零精度推断：precision 全零 → 纯先验采样（无感官 clamping）
-            zero_input = torch.zeros(self.attractor.input_dim)
-            activation = self.attractor.infer(
-                zero_input, self.idle_precision,
-                num_steps=self.idle_num_steps)
-        finally:
-            # 恢复在线态参数（避免影响在线模式）
-            self.attractor.temperature = orig_temperature
-            self.attractor.orth_weight = orig_orth_weight
-            self.attractor.sigma = orig_sigma
+        # 零精度推断：precision 全零 → 纯先验采样（无感官 clamping）
+        # update_internal_state=False: 推断不写回 self.sigma，避免污染在线状态
+        activation = self.attractor.infer(
+            zero_input, self.idle_precision,
+            num_steps=self.idle_num_steps,
+            temperature_override=effective_temp,
+            initial_state=seed,
+            update_internal_state=False,
+        )
 
         return activation
 
@@ -489,40 +492,43 @@ class DreamEngine:
         精细调整 J 矩阵以巩固回放的记忆。低学习率确保巩固是温和的微调，
         而非剧烈重塑。
 
-        临时切换 orth_weight 和 complexity_weight 到空闲态值，执行后恢复。
-        若 meta 可用，使用元调整后的学习率、正交化权重和复杂度权重。
+        E-P2-5: 不再"保存→修改→恢复"实例属性，改为通过 learn() 的
+            override 参数传递空闲态值：
+            - orth_weight_override: 临时使用空闲态正交化权重
+            - complexity_weight_override: 临时使用空闲态复杂度权重
+            覆盖值仅在本次 learn() 调用内生效，不修改 self.orth_weight
+            / self.complexity_weight。若 meta 可用，使用元调整后的
+            学习率、正交化权重和复杂度权重。
 
         参数:
             activation: 生成式回放得到的激活态。
             sensory_input: 产生该激活态的记忆状态（传入 learn 接口，
                 当前实现中 learn 不直接使用此参数，但保留以兼容接口）。
         """
-        orig_orth_weight = self.attractor.orth_weight
-        orig_cw = self.attractor.complexity_weight
-        try:
-            effective_lr = self.idle_lr
-            effective_orth = self.idle_orth_weight
-            effective_cw = orig_cw
+        # 计算有效的学习参数
+        effective_lr = self.idle_lr
+        effective_orth = self.idle_orth_weight
+        effective_cw = self.attractor.complexity_weight
 
-            # 若 meta 可用，使用元调整后的 lr / orth / cw（base * multiplier）
-            if self.meta is not None:
-                adjusted = self.meta.get_adjusted_params(
-                    base_lr=self.idle_lr,
-                    base_orth=self.idle_orth_weight,
-                    base_temp=self.idle_temperature,
-                    base_cw=orig_cw,
-                )
-                effective_lr = adjusted['learning_rate']
-                effective_orth = adjusted['orth_weight']
-                effective_cw = adjusted['complexity_weight']
+        # 若 meta 可用，使用元调整后的 lr / orth / cw（base * multiplier）
+        if self.meta is not None:
+            adjusted = self.meta.get_adjusted_params(
+                base_lr=self.idle_lr,
+                base_orth=self.idle_orth_weight,
+                base_temp=self.idle_temperature,
+                base_cw=self.attractor.complexity_weight,
+            )
+            effective_lr = adjusted['learning_rate']
+            effective_orth = adjusted['orth_weight']
+            effective_cw = adjusted['complexity_weight']
 
-            self.attractor.orth_weight = effective_orth
-            self.attractor.complexity_weight = effective_cw
-            self.attractor.learn(activation, sensory_input,
-                                 learning_rate=effective_lr)
-        finally:
-            self.attractor.orth_weight = orig_orth_weight
-            self.attractor.complexity_weight = orig_cw
+        # E-P2-5: 通过 override 参数传递空闲态权重，不修改实例属性
+        self.attractor.learn(
+            activation, sensory_input,
+            learning_rate=effective_lr,
+            orth_weight_override=effective_orth,
+            complexity_weight_override=effective_cw,
+        )
 
     # ================================================================== #
     #  阶段2: 突触稳态下调（SHY）
