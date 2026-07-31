@@ -9,9 +9,36 @@
 """
 
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 import torch
+
+
+# ------------------------------------------------------------------ #
+#  设备管理辅助函数（E-P2-1）
+# ------------------------------------------------------------------ #
+
+def resolve_device(device: Union[str, torch.device, None] = "auto") -> torch.device:
+    """将设备标识解析为 ``torch.device`` 对象。
+
+    统一各核心组件的设备解析逻辑。支持以下输入：
+
+      - ``"auto"``：自动检测 CUDA 可用性，可用则选 ``cuda``，否则 ``cpu``。
+      - ``"cpu"``、``"cuda"``、``"cuda:0"`` 等字符串：直接构造 ``torch.device``。
+      - 已构造的 ``torch.device`` 对象：原样返回。
+      - ``None``：视为 ``"auto"``。
+
+    参数:
+        device: 设备标识（str / torch.device / None）。
+
+    返回:
+        解析后的 ``torch.device`` 对象。
+    """
+    if device is None or (isinstance(device, str) and device == "auto"):
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if isinstance(device, torch.device):
+        return device
+    return torch.device(device)
 
 
 @dataclass
