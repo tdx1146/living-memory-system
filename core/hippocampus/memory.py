@@ -266,23 +266,35 @@ class MemoryManager:
             fb_norm = None
             fd = None
 
-        # 逐条计算相似度，按维度自动选择查询向量（支持混合维度缓冲区）
-        scored: List[Tuple[float, EpisodicEntry]] = []
+        # 按维度分组（兼容 384 维 + 64 维混合缓冲区）
+        # 将同一维度的条目聚集到一起，以便用一次矩阵乘法算完所有相似度，
+        # 消除逐条 torch.dot + .item() 带来的 Python 循环与 GPU/CPU 同步开销。
+        groups: dict = {}
         for entry in self._episodic_buffer:
             v = entry.semantic_vector.detach().cpu().float()
             if v.dim() > 1:
                 v = v.squeeze()  # 防御性处理，统一为 1-D
             vd = v.shape[-1]
+            groups.setdefault(vd, []).append((entry, v))
+
+        # 每组用 torch.stack 成矩阵，一次 matmul 算完所有相似度
+        scored: List[Tuple[float, EpisodicEntry]] = []
+        for vd, items in groups.items():
+            # 按维度自动选择查询向量（支持混合维度缓冲区）
             if vd == qd:
-                v_norm = torch.nn.functional.normalize(v, dim=0)
-                sim = torch.dot(query_norm.squeeze(0), v_norm).item()
+                q_vec = query_norm.squeeze(0)  # [qd]
             elif fb_norm is not None and vd == fd:
-                v_norm = torch.nn.functional.normalize(v, dim=0)
-                sim = torch.dot(fb_norm.squeeze(0), v_norm).item()
+                q_vec = fb_norm.squeeze(0)  # [fd]
             else:
-                # 维度均不匹配，跳过该条目（优雅降级，不崩溃）
+                # 维度均不匹配，跳过该组（优雅降级，不崩溃）
                 continue
-            scored.append((sim, entry))
+
+            # 堆叠为矩阵 [n, vd]，一次矩阵乘法算完所有相似度
+            mat = torch.stack([v for (_, v) in items])
+            mat_norm = torch.nn.functional.normalize(mat, dim=-1)
+            sims = (mat_norm @ q_vec).tolist()  # 一次同步取回所有相似度
+            for sim, (entry, _) in zip(sims, items):
+                scored.append((sim, entry))
 
         if not scored:
             return []
@@ -291,6 +303,75 @@ class MemoryManager:
         k = min(top_k, len(scored))
         scored.sort(key=lambda x: x[0], reverse=True)
         return [entry for _, entry in scored[:k]]
+
+    # ------------------------------------------------------------------ #
+    #  公开缓冲区访问接口
+    #  ------------------------------------------------------------------ #
+    #  解耦外部对 _buffer / _episodic_buffer 私有属性的直接访问。
+    #  DreamEngine、server、session_manager、dream_scheduler 等上层模块
+    #  应通过这些接口查询缓冲区状态，而非直接读取私有 deque。
+    # ------------------------------------------------------------------ #
+
+    def buffer_size(self) -> int:
+        """返回回放缓冲区当前条目数。
+
+        用于上层模块（如 DreamScheduler、DreamEngine）查询是否有记忆
+        可回放，而无需直接访问 ``self._buffer`` 私有属性。
+        """
+        return len(self._buffer)
+
+    def episodic_size(self) -> int:
+        """返回情景记忆缓冲区当前条目数。
+
+        用于上层模块查询情景记忆条目数量（如状态报告、检索前置检查），
+        而无需直接访问 ``self._episodic_buffer`` 私有属性。
+        """
+        return len(self._episodic_buffer)
+
+    def iter_buffer(self):
+        """返回回放缓冲区的只读迭代器。
+
+        返回 ``iter(self._buffer)``，调用方可用于遍历 ``(state, surprise)``
+        元组进行采样或回放。deque 迭代器是只读的，调用方不应原地修改。
+        """
+        return iter(self._buffer)
+
+    def iter_episodic(self):
+        """返回情景记忆缓冲区的只读迭代器。
+
+        返回 ``iter(self._episodic_buffer)``，调用方可用于遍历
+        ``EpisodicEntry`` 条目进行检索或修剪。deque 迭代器是只读的，
+        调用方不应原地修改。
+        """
+        return iter(self._episodic_buffer)
+
+    def get_episodic_maxlen(self) -> int:
+        """返回情景记忆缓冲区的最大容量。
+
+        返回 ``self._episodic_buffer.maxlen``，若为 None（无界）则回退到
+        默认值 200。用于上层模块在重建缓冲区时获取正确的容量上限。
+        """
+        return self._episodic_buffer.maxlen or 200
+
+    def replace_episodic_buffer(self, entries) -> int:
+        """用 entries 重建情景记忆缓冲区，返回被剔除的条目数。
+
+        在保留原缓冲区容量上限（maxlen）的前提下，用新的条目序列替换
+        当前缓冲区内容。当 entries 长度超过 maxlen 时，deque 会自动
+        保留最新的条目（丢弃头部旧条目）。
+
+        参数:
+            entries: 可迭代的 EpisodicEntry 序列，用于重建缓冲区。
+
+        返回:
+            被剔除的条目数 = 旧缓冲区长度 - 新缓冲区长度。
+            （注意：若 entries 超过 maxlen，deque 内部淘汰的部分也计入
+            新缓冲区长度，因此返回值反映的是净变化量。）
+        """
+        maxlen = self._episodic_buffer.maxlen or 200
+        old_len = len(self._episodic_buffer)
+        self._episodic_buffer = deque(entries, maxlen=maxlen)
+        return old_len - len(self._episodic_buffer)
 
     def get_state(self) -> dict:
         """返回记忆管理器当前状态（用于快照）。
