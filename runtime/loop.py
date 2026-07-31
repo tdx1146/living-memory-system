@@ -205,6 +205,11 @@ class LivingMemoryLoop:
         # 所有自指代码块在 `if self.self_ref is not None:` 守卫内不执行
         self.self_ref = None
         self._prev_activation = None  # 供 autocorr 计算（Phase 0 预留）
+        # 供 L5 外部新颖度计算（Phase 1 预留）。
+        # 保守策略：generate_echo 内部自行管理 prev_ext_sensory 跟踪，
+        # loop 不向 generate_echo 新增参数；此字段保留供未来 loop 层直接
+        # 计算 ext_novelty 时使用。
+        self._prev_ext_sensory = None
         if config.get('self_ref_enabled', False):
             from core.hippocampus.self_referential import SelfReferentialLoop
             self.self_ref = SelfReferentialLoop(
@@ -260,9 +265,16 @@ class LivingMemoryLoop:
             if echo is not None:
                 alpha_t = echo['alpha']
                 mixed_vector = sensory_input.vector + alpha_t * echo['vector']
+                # ★ 自指回注（Phase 1 增强）：用 .get() 安全访问新增字段，
+                # 即使 self_referential.py 的增强尚未完成也不崩溃。
                 sensory_input = SensoryInput(
                     vector=mixed_vector,
-                    metadata={**sensory_input.metadata, 'self_ref_alpha': alpha_t},
+                    metadata={
+                        **sensory_input.metadata,
+                        'self_ref_alpha': alpha_t,
+                        'self_ref_state': echo.get('state', 'normal'),
+                        'self_ref_autocorr': echo.get('autocorr'),
+                    },
                 )
 
         # 1.5 获取语义向量（用于情景记忆存储与检索）
@@ -605,6 +617,12 @@ class LivingMemoryLoop:
         if self.self_ref is not None:
             status['self_ref_enabled'] = True
             status['self_ref_alpha'] = self.config.get('self_ref_alpha_base', 0.15)
+            # ★ Phase 1 增强：暴露更多自指监控字段。
+            # 用 .get() 安全访问，self_referential.py 增强未就绪时为 None。
+            sr_status = self.self_ref.get_status()
+            status['self_ref_autocorr'] = sr_status.get('autocorr')
+            status['self_ref_state'] = sr_status.get('state', 'normal')
+            status['self_ref_ext_novelty'] = sr_status.get('ext_novelty')
         else:
             status['self_ref_enabled'] = False
 
