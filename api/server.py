@@ -149,7 +149,7 @@ def _status_for(loop) -> dict:
     """从 LivingMemoryLoop 提取状态字典（含情景缓冲区与LLM标记）。"""
     status = loop.get_status()
     try:
-        status['episodic_buffer_size'] = len(loop.memory._episodic_buffer)
+        status['episodic_buffer_size'] = loop.memory.episodic_size()
     except Exception:
         status['episodic_buffer_size'] = 0
     status['llm_enabled'] = loop.bridge is not None
