@@ -1,0 +1,95 @@
+# 活体记忆系统 - CI 流水线
+# =============================================================================
+# 在无 GPU、无网络（测试阶段）、无预训练模型、无 API Key 的环境下运行测试。
+#
+# 触发条件:
+#   - push 到 master 分支
+#   - pull request 到 master 分支
+#
+# 设计说明:
+#   - 运行环境为 CPU-only（CI runner 无 GPU），故显式安装 CPU 版 PyTorch。
+#   - 测试不依赖外部 API（LLM 调用全部由 Mock 隔离），不加载预训练模型
+#     （conftest.py 使用 SimpleEmbedder，而非 PretrainedEmbedder）。
+#   - 依赖安装在 CI 阶段进行（此时有网络）；测试执行阶段不发起任何网络请求。
+# =============================================================================
+
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+# 对同一分支的连续 push 取消旧的运行，节省 CI 资源
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 注意: setup.py 中 python_requires='>=3.10'，不支持 Python 3.9。
+        # 故测试矩阵与 setup.py classifiers 对齐，使用 3.10 / 3.11 / 3.12。
+        # （原任务要求 3.9/3.10/3.11，但 3.9 会导致 `pip install -e .` 失败。）
+        python-version: ['3.10', '3.11', '3.12']
+
+    steps:
+      - name: Checkout 代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            setup.py
+
+      - name: 安装 PyTorch (CPU-only)
+        # CI runner 无 GPU，显式从 PyTorch CPU 索引安装，
+        # 避免拉取默认的 CUDA 轮子（体积 >2GB，安装缓慢且无必要）。
+        # 必须先于 requirements.txt 安装，使后续 pip 识别到已满足的 torch 依赖。
+        run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: 安装项目依赖
+        # 1) 安装 requirements.txt（torch 已装，pip 会跳过它）
+        # 2) 以可编辑模式安装本包及 dev 依赖（含 pytest, pytest-cov, pytest-asyncio, httpx）
+        run: |
+          pip install -r requirements.txt
+          pip install -e ".[dev]"
+
+      - name: 安装测试依赖
+        # 显式确保 pytest 与覆盖率工具可用（幂等，已装则跳过）
+        run: pip install pytest pytest-cov
+
+      - name: 运行测试
+        env:
+          # --- 防御性环境变量（确保测试不触达外部资源）---
+          # LMS_EMBEDDER_TYPE=simple: 约束使用轻量嵌入器，避免加载预训练模型。
+          #   说明: 当前代码并未读取该变量（embedder 由 conftest.py 直接实例化为
+          #         SimpleEmbedder），此处设置仅作防御与意图文档化。
+          LMS_EMBEDDER_TYPE: simple
+          # 清空 LLM API Key，确保任何意外路径都不会发起真实 API 调用
+          LMS_LLM_API_KEY: ''
+          # 指向无效地址，作为双重保险（OpenAI client 仅在 query() 时惰性创建，
+          # 测试用 Mock 隔离，正常不会触碰此地址）
+          LMS_LLM_BASE_URL: 'http://localhost:0/v1'
+        run: |
+          pytest tests/ -v --tb=short \
+            --cov=core --cov=runtime --cov=bridge --cov=persistence --cov=api \
+            --cov-report=term-missing \
+            --cov-report=xml
+
+      - name: 上传覆盖率报告
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-py${{ matrix.python-version }}
+          path: coverage.xml
+          if-no-files-found: ignore
