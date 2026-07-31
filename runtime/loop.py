@@ -109,12 +109,17 @@ class LivingMemoryLoop:
         seed = config.get('seed', 42)
         temperature = config.get('temperature', 0.05)
 
+        # E-P2-1: 设备管理——从 config 读取 device 标识，传递给所有核心组件
+        device = config.get('device', 'auto')
+
         # 初始化核心组件（允许外部注入自定义实现）
         # 注入时不覆盖其内部参数；自建时用 config 驱动全部 FEP 参数
+        # E-P2-1: 自建时传入 device，组件构造函数内部解析为 torch.device
         self.attractor = config.get('attractor') or AttractorNetwork(
             num_nodes, input_dim,
             seed=seed,
             temperature=temperature,
+            device=device,
         )
         if not config.get('attractor'):
             # 仅在自建时设置（不覆盖外部注入的实例）
@@ -137,6 +142,7 @@ class LivingMemoryLoop:
             max_history=config.get('max_history', 100),
             habituation_rate=config.get('habituation_rate', 0.05),
             activation_threshold=config.get('activation_threshold', 0.3),
+            device=device,
         )
 
         self.memory = config.get('memory') or MemoryManager(
@@ -148,6 +154,7 @@ class LivingMemoryLoop:
             replay_weight=config.get('replay_weight', 0.01),
             consolidation_decay=config.get('consolidation_decay', 0.5),
             buffer_capacity=config.get('buffer_capacity', 100),
+            device=device,
         )
         self.tokenizer = config.get('tokenizer') or SimpleTokenizer()
         self.embedder = config.get('embedder') or SimpleEmbedder(dim=input_dim)
@@ -239,41 +246,37 @@ class LivingMemoryLoop:
             if hasattr(self.embedder, 'embed_text_raw'):
                 raw_semantic_vector = self.embedder.embed_text_raw(text)
 
-        # --- 元可塑性：临时应用调整后的参数 ---
-        _meta_orig = None
+        # --- 元可塑性：计算调整后的参数（E-P2-5: 不修改实例属性）---
         _effective_lr = self.config.get('learning_rate', 0.01)
+        _meta_temp = None
+        _meta_orth = None
+        _meta_cw = None
         if self.meta is not None:
-            _meta_orig = {
-                'temperature': self.attractor.temperature,
-                'orth_weight': self.attractor.orth_weight,
-                'complexity_weight': self.attractor.complexity_weight,
-            }
             adjusted = self.meta.get_adjusted_params(
                 base_lr=_effective_lr,
-                base_orth=_meta_orig['orth_weight'],
-                base_temp=_meta_orig['temperature'],
-                base_cw=_meta_orig['complexity_weight'],
+                base_orth=self.attractor.orth_weight,
+                base_temp=self.attractor.temperature,
+                base_cw=self.attractor.complexity_weight,
             )
-            self.attractor.temperature = adjusted['temperature']
-            self.attractor.orth_weight = adjusted['orth_weight']
-            self.attractor.complexity_weight = adjusted['complexity_weight']
+            _meta_temp = adjusted['temperature']
+            _meta_orth = adjusted['orth_weight']
+            _meta_cw = adjusted['complexity_weight']
             _effective_lr = adjusted['learning_rate']
 
-        # 2. FEP推断
+        # 2. FEP推断（E-P2-5: 通过 temperature_override 传递元调整后的温度）
         precision = self.purpose.get_precision()
         activation = self.attractor.infer(
             sensory_input.vector, precision,
-            num_steps=self.config.get('num_infer_steps', 10)
+            num_steps=self.config.get('num_infer_steps', 10),
+            temperature_override=_meta_temp,
         )
 
-        # 3. FEP学习
-        self.attractor.learn(activation, sensory_input.vector, _effective_lr)
-
-        # --- 恢复原始参数（元调整仅影响本轮推断与学习）---
-        if _meta_orig is not None:
-            self.attractor.temperature = _meta_orig['temperature']
-            self.attractor.orth_weight = _meta_orig['orth_weight']
-            self.attractor.complexity_weight = _meta_orig['complexity_weight']
+        # 3. FEP学习（E-P2-5: 通过 override 参数传递元调整后的权重）
+        self.attractor.learn(
+            activation, sensory_input.vector, _effective_lr,
+            orth_weight_override=_meta_orth,
+            complexity_weight_override=_meta_cw,
+        )
 
         # 3.5 在线熵管理
         # FEP学习之后、调整目的之前，根据当前激活熵主动干预：
@@ -290,18 +293,19 @@ class LivingMemoryLoop:
 
         if entropy_ratio > entropy_high_threshold:
             # 熵过高：系统混沌，增强正交化压力驱散相似表示
-            original_orth = self.attractor.orth_weight
-            self.attractor.orth_weight = original_orth * 1.5
-            # 额外学习一步，强化结构分化
-            self.attractor.learn(activation, sensory_input.vector, _effective_lr * 0.3)
-            self.attractor.orth_weight = original_orth  # 恢复
+            # E-P2-5: 通过 orth_weight_override 传递临时权重，不修改实例属性
+            self.attractor.learn(
+                activation, sensory_input.vector, _effective_lr * 0.3,
+                orth_weight_override=self.attractor.orth_weight * 1.5,
+            )
             logger.info(f"在线熵管理: 熵={entropy:.3f}(ratio={entropy_ratio:.2f}) 过高，增强正交化")
         elif entropy_ratio < entropy_low_threshold:
             # 熵过低：系统僵化，降低正交化压力允许更多激活
-            original_orth = self.attractor.orth_weight
-            self.attractor.orth_weight = original_orth * 0.7
-            self.attractor.learn(activation, sensory_input.vector, _effective_lr * 0.2)
-            self.attractor.orth_weight = original_orth  # 恢复
+            # E-P2-5: 通过 orth_weight_override 传递临时权重，不修改实例属性
+            self.attractor.learn(
+                activation, sensory_input.vector, _effective_lr * 0.2,
+                orth_weight_override=self.attractor.orth_weight * 0.7,
+            )
             logger.info(f"在线熵管理: 熵={entropy:.3f}(ratio={entropy_ratio:.2f}) 过低，放松正交化")
 
         # 4. 调整目的
