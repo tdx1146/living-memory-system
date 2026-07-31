@@ -58,6 +58,8 @@ class CoreConfig:
         meta_cw_gamma: ||J||→cw 系数。
         meta_lr_delta: surprise 趋势→lr 系数。
         meta_shy_target_norm: SHY 目标范数（元层用）。
+        device: 计算设备标识。支持 "auto"(自动检测 CUDA)、"cpu"、"cuda"、
+            "cuda:0" 等。组件构造时通过 resolve_device() 解析为 torch.device。
     """
 
     # 网络结构
@@ -114,6 +116,9 @@ class CoreConfig:
 
     # 随机种子
     seed: int = 42
+
+    # 设备管理（E-P2-1）：支持 "auto"(自动检测 CUDA)/"cpu"/"cuda"/"cuda:0" 等
+    device: str = "auto"
 
     # ================================================================== #
     #  参数校验
@@ -240,6 +245,30 @@ class CoreConfig:
                 and not isinstance(self.seed, bool)):
             _fail('seed', self.seed, '必须为整数')
 
+        # --- 设备管理 ---
+        if not (isinstance(self.device, str) and self.device):
+            _fail('device', self.device,
+                  '必须为非空字符串（如 "auto"/"cpu"/"cuda"/"cuda:0"）')
+
+    # ================================================================== #
+    #  设备解析（E-P2-1）
+    # ================================================================== #
+
+    def resolve_device(self):
+        """解析 device 配置为 ``torch.device`` 对象。
+
+        ``"auto"`` 时自动检测 CUDA 可用性；``"cpu"``/``"cuda"``/``"cuda:0"``
+        等直接构造 ``torch.device``。延迟导入 torch，保证本模块在未安装
+        torch 的纯 dataclass 场景下仍可被导入。
+
+        返回:
+            torch.device 对象。
+        """
+        import torch
+        if self.device == "auto":
+            return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        return torch.device(self.device)
+
     # ================================================================== #
     #  配置转换
     # ================================================================== #
@@ -305,6 +334,8 @@ class CoreConfig:
             'meta_shy_target_norm': self.meta_shy_target_norm,
             # 随机种子
             'seed': self.seed,
+            # 设备管理（E-P2-1）
+            'device': self.device,
             # 运行时默认值（CoreConfig 不含这些字段，补齐 loop.py 默认值）
             'consolidation_interval': 5,
             'decoder_mode': 'text',
