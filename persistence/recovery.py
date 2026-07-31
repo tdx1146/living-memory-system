@@ -129,14 +129,38 @@ class Recovery:
             快照内部以 dict 形式存储状态（见 Snapshot），本方法不直接操作
             core 对象的业务方法，仅做反序列化与状态回填，实现 persistence
             与 core 的解耦。memory 字段为可选——旧版快照无此字段时优雅降级。
+
+            E-P1-6 改进：
+            - 单次读取优化：validate/load/load_raw 原先对同一文件读取3次，
+              现改为单次 _torch_load 后复用 raw_data。
+            - 异常链保留：失败时用 logger.exception() 记录完整堆栈（含根因），
+              而非仅记录异常字符串（不再吞掉根因堆栈）。
+            - 回滚：恢复前快照当前状态，任一恢复步骤失败时回滚到恢复前状态，
+              避免留下半恢复的不一致状态。
         """
+        rollback_snapshot = None
         try:
-            if not self.validate(path):
+            # 文件存在性检查（避免对不存在的文件触发 noisy 堆栈）
+            if not os.path.exists(path):
+                logger.error(f"快照文件不存在: {path}")
+                return False
+
+            # E-P1-6: 单次读取优化——原先 validate/load/load_raw 对同一文件
+            # 读取3次，现改为单次读取后复用 raw_data
+            raw_data = _torch_load(path)
+
+            # 验证（复用已读取的 raw_data，避免重复读取文件）
+            if not self._validate_data(raw_data):
                 logger.error(f"快照验证失败: {path}")
                 return False
 
-            # 加载快照数据
-            landscape, purpose_state = self.snapshot.load(path)
+            # E-P1-6: 恢复前快照当前状态，任一步骤失败时回滚
+            # 在所有修改操作之前捕获，确保回滚基准正确
+            rollback_snapshot = self._snapshot_current_state(
+                attractor, purpose, memory)
+
+            landscape = raw_data['attractor']
+            purpose_state = raw_data['purpose']
 
             # 恢复吸引子网络
             self._restore_attractor(attractor, landscape)
@@ -146,7 +170,6 @@ class Recovery:
 
             # N1: 恢复记忆潜变量（如果提供了 memory 对象且快照包含 memory 字段）
             if memory is not None:
-                raw_data = self.snapshot.load_raw(path)
                 memory_state = raw_data.get('memory')
                 if memory_state is not None:
                     self._restore_memory(memory, memory_state)
@@ -158,7 +181,12 @@ class Recovery:
             return True
 
         except Exception as e:
-            logger.error(f"恢复失败: {e}")
+            # E-P1-6: 保留异常链——logger.exception 记录完整堆栈（含根因），
+            # 而非仅记录异常字符串，避免吞掉根因堆栈
+            logger.exception(f"恢复失败: {e}")
+            # E-P1-6: 尝试回滚到恢复前状态，避免留下半恢复的不一致状态
+            if rollback_snapshot is not None:
+                self._rollback(rollback_snapshot, attractor, purpose, memory)
             return False
 
     def _restore_attractor(self, attractor: RestorableAttractor,
@@ -252,6 +280,102 @@ class Recovery:
         else:
             logger.warning("memory 对象不支持 set_state，跳过记忆恢复")
 
+    def _snapshot_current_state(self, attractor: RestorableAttractor,
+                                purpose: RestorablePurpose,
+                                memory: Optional[RestorableMemory]) -> dict:
+        """快照当前状态（用于恢复失败时回滚）。
+
+        对各组件的关键状态做深拷贝（张量 clone、列表重建），避免回滚时
+        与已被恢复操作修改的现场共享引用。回滚时直接复用 _restore_attractor
+        / _restore_purpose / _restore_memory 将保存的状态写回。
+
+        参数:
+            attractor: 满足 RestorableAttractor 协议的对象
+            purpose: 满足 RestorablePurpose 协议的对象
+            memory: 满足 RestorableMemory 协议的对象（可为 None）
+
+        返回:
+            状态快照字典，结构对齐 _restore_* 的入参：
+            {'attractor': landscape_dict, 'purpose': purpose_state_dict,
+             'memory': memory_state_dict or None}
+        """
+        snapshot = {}
+
+        # attractor 景观（对齐 set_landscape / get_landscape 的 dict 结构）
+        attr_state = {}
+        for key in ('J', 'bias', 'sigma'):
+            val = getattr(attractor, key, None)
+            attr_state[key] = val.clone() if isinstance(val, torch.Tensor) else val
+        for key in ('num_nodes', 'input_dim'):
+            attr_state[key] = getattr(attractor, key, None)
+        snapshot['attractor'] = attr_state
+
+        # purpose 状态（对齐 _restore_purpose 的 purpose_state 字典结构）
+        precision = getattr(purpose, 'sensory_precision', None)
+        purp_state = {
+            'precision': precision.clone()
+            if isinstance(precision, torch.Tensor) else precision,
+            'history': [h.clone() if isinstance(h, torch.Tensor) else h
+                        for h in getattr(purpose, 'history', [])],
+            'coherence': getattr(purpose, 'coherence', None),
+        }
+        # N3: encounter_count（可选字段）
+        encounter_count = getattr(purpose, 'encounter_count', None)
+        if encounter_count is not None:
+            purp_state['encounter_count'] = (
+                encounter_count.clone()
+                if isinstance(encounter_count, torch.Tensor)
+                else encounter_count)
+        snapshot['purpose'] = purp_state
+
+        # memory 状态（可选）：通过 get_state 获取后深拷贝
+        snapshot['memory'] = None
+        if memory is not None:
+            get_state = getattr(memory, 'get_state', None)
+            if callable(get_state):
+                try:
+                    snapshot['memory'] = _clone_state_dict(get_state())
+                except Exception as e:
+                    logger.warning(
+                        f"快照 memory 状态失败，回滚将不覆盖 memory: {e}")
+                    snapshot['memory'] = None
+
+        return snapshot
+
+    def _rollback(self, snapshot: dict, attractor: RestorableAttractor,
+                  purpose: RestorablePurpose,
+                  memory: Optional[RestorableMemory]) -> None:
+        """回滚到恢复前状态（尽力而为，失败仅记录日志）。
+
+        复用 _restore_attractor / _restore_purpose / _restore_memory 将
+        _snapshot_current_state 保存的状态写回，确保各组件恢复到恢复操作
+        之前的取值。回滚本身的异常不会向上抛出，仅记录日志（避免掩盖
+        原始恢复失败的原因）。
+
+        参数:
+            snapshot: _snapshot_current_state 返回的状态快照字典
+            attractor: 满足 RestorableAttractor 协议的对象
+            purpose: 满足 RestorablePurpose 协议的对象
+            memory: 满足 RestorableMemory 协议的对象（可为 None）
+        """
+        try:
+            attr_state = snapshot.get('attractor')
+            if attr_state:
+                self._restore_attractor(attractor, attr_state)
+
+            purp_state = snapshot.get('purpose')
+            if purp_state:
+                self._restore_purpose(purpose, purp_state)
+
+            mem_state = snapshot.get('memory')
+            if mem_state is not None and memory is not None:
+                self._restore_memory(memory, mem_state)
+
+            logger.info("已回滚到恢复前状态")
+        except Exception as rb_err:
+            # 回滚失败不应掩盖原始恢复失败，仅记录
+            logger.error(f"回滚失败（状态可能不一致）: {rb_err}")
+
     def validate(self, path: str) -> bool:
         """验证快照完整性。
 
@@ -276,43 +400,66 @@ class Recovery:
             # 尝试加载
             data = _torch_load(path)
 
-            # 检查必需字段
-            required_fields = ['version', 'attractor', 'purpose']
-            for field in required_fields:
-                if field not in data:
-                    logger.error(f"快照缺少必需字段: {field}")
-                    return False
-
-            # 版本兼容性检查
-            version = data['version']
-            if not self._is_version_compatible(version):
-                logger.error(f"快照版本不兼容: {version} (当前版本: {SNAPSHOT_VERSION})")
-                return False
-
-            # 检查attractor字段
-            attractor = data['attractor']
-            attractor_required = ['J', 'bias', 'sigma']
-            for field in attractor_required:
-                if field not in attractor:
-                    logger.error(f"attractor缺少必需字段: {field}")
-                    return False
-
-            # 检查purpose字段
-            purpose = data['purpose']
-            if 'precision' not in purpose:
-                logger.error("purpose缺少必需字段: precision")
-                return False
-
-            return True
+            # 复用 _validate_data 完成字段与版本校验（与 recover 共用同一份逻辑）
+            return self._validate_data(data)
 
         except Exception as e:
             logger.error(f"快照验证异常: {e}")
             return False
 
+    def _validate_data(self, data: dict) -> bool:
+        """验证已加载的快照数据完整性（不重复读取文件）。
+
+        将原 validate 中的字段/版本校验逻辑抽取为独立方法，供 validate
+        与 recover 复用，避免 recover 中 validate/load/load_raw 三次读取
+        同一文件（E-P1-6 单次读取优化）。
+
+        检查项：
+        1. 包含必需字段（version, attractor, purpose）
+        2. 版本兼容
+        3. attractor 子字段完整（J, bias, sigma）
+        4. purpose 包含 precision 字段
+
+        参数:
+            data: 已通过 _torch_load 加载的快照数据字典
+
+        返回:
+            True表示数据有效，False表示无效
+        """
+        # 检查必需字段
+        required_fields = ['version', 'attractor', 'purpose']
+        for field in required_fields:
+            if field not in data:
+                logger.error(f"快照缺少必需字段: {field}")
+                return False
+
+        # 版本兼容性检查
+        version = data['version']
+        if not self._is_version_compatible(version):
+            logger.error(f"快照版本不兼容: {version} (当前版本: {SNAPSHOT_VERSION})")
+            return False
+
+        # 检查attractor字段
+        attractor = data['attractor']
+        attractor_required = ['J', 'bias', 'sigma']
+        for field in attractor_required:
+            if field not in attractor:
+                logger.error(f"attractor缺少必需字段: {field}")
+                return False
+
+        # 检查purpose字段
+        purpose = data['purpose']
+        if 'precision' not in purpose:
+            logger.error("purpose缺少必需字段: precision")
+            return False
+
+        return True
+
     def _is_version_compatible(self, version: str) -> bool:
         """检查版本兼容性。
 
-        当前策略：主版本号必须匹配，次版本号向后兼容。
+        当前策略：主版本号必须匹配，次版本号向后/向前兼容
+        （跨次版本新增字段均为可选字段，加载时优雅降级，故双向往返兼容）。
         未来版本可以在这里添加迁移逻辑。
 
         参数:
@@ -331,7 +478,45 @@ class Recovery:
             # 主版本号必须匹配
             if major != current_major:
                 return False
-            # 次版本号向后兼容
+            # E-P1-6: 补 minor 比较——原先 minor 被解析但未参与判定，
+            # 现显式比较 minor 并记录版本关系，便于诊断兼容性。
+            # 策略：minor 差异视为兼容（新增字段均为可选，向后/向前兼容），
+            # 但通过日志区分快照来自旧版还是新版。
+            snap_minor = int(minor)
+            cur_minor = int(current_minor)
+            if snap_minor < cur_minor:
+                logger.info(
+                    f"加载旧版次版本快照(snapshot minor={snap_minor} < "
+                    f"current={cur_minor})，依赖可选字段向后兼容")
+            elif snap_minor > cur_minor:
+                logger.info(
+                    f"加载新版次版本快照(snapshot minor={snap_minor} > "
+                    f"current={cur_minor})，未知可选字段将被忽略（向前兼容）")
             return True
         except (ValueError, AttributeError):
             return False
+
+
+def _clone_state_dict(state):
+    """深拷贝状态字典中的张量与列表，用于安全回滚。
+
+    对 dict / list 递归复制结构，对 torch.Tensor 调用 clone 产生独立副本，
+    其他不可变类型（int/float/str/None 等）原样返回。
+
+    用途：_snapshot_current_state 捕获 memory.get_state() 返回值时，
+    需要与现场解耦——若 set_state 以原地修改方式写入张量，未深拷贝的
+    引用会被同步污染，导致回滚基准失效。
+
+    参数:
+        state: 待深拷贝的状态对象
+
+    返回:
+        深拷贝后的状态对象
+    """
+    if isinstance(state, dict):
+        return {k: _clone_state_dict(v) for k, v in state.items()}
+    if isinstance(state, list):
+        return [_clone_state_dict(v) for v in state]
+    if isinstance(state, torch.Tensor):
+        return state.clone()
+    return state
