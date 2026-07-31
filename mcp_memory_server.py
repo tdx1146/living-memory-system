@@ -17,6 +17,7 @@
 """
 
 import os
+import re
 import sys
 import json
 import logging
@@ -252,7 +253,7 @@ def do_recall_memory(query: str) -> str:
         fallback_query = None
     else:
         # SimpleEmbedder：不支持语义检索
-        buffer_size = len(loop.memory._episodic_buffer)
+        buffer_size = loop.memory.episodic_size()
         status = loop.get_status()
         return (
             f"当前嵌入器不支持语义检索（SimpleEmbedder），"
@@ -266,7 +267,7 @@ def do_recall_memory(query: str) -> str:
         query_vector, top_k=3, fallback_query=fallback_query)
 
     status = loop.get_status()
-    buffer_size = len(loop.memory._episodic_buffer)
+    buffer_size = loop.memory.episodic_size()
 
     if not entries:
         return (
@@ -290,11 +291,57 @@ def do_recall_memory(query: str) -> str:
     return "\n".join(lines)
 
 
+def _parse_conversation(text: str) -> tuple[str, str]:
+    """从对话文本中解析用户输入和助手回复。
+
+    process_turn 的设计意图是分开接收 user_input 和 llm_output，再在内部
+    拼接为 "用户: {user_input}\\n助手: {llm_output}"。若直接把整段对话文本
+    塞进 user_input，会导致 "用户:/助手:" 标记被重复嵌套，记忆编码失真。
+
+    本函数将外部传入的对话文本拆分为 (user_input, llm_output)：
+
+    1. 若文本包含 "用户:" / "助手:" 标记，解析出两部分分别返回。
+    2. 若不含标记（纯文本），原样作为 user_input 返回，llm_output 留空，
+       保持与旧调用方的兼容。
+
+    解析逻辑健壮性：
+    - 支持 "用户:" 前面有换行/空格（先 strip 整体空白再匹配）。
+    - 支持 "助手:" 不存在的情况（llm_output 返回空串）。
+    - 同时兼容半角 ":" 与全角 "：" 冒号。
+
+    参数:
+        text: 原始对话文本。
+
+    返回:
+        (user_input, llm_output) 元组。
+    """
+    if not text:
+        return "", ""
+
+    # 尝试匹配 "用户: xxx\n助手: xxx" 格式
+    # - 前导 \s* 容忍 "用户:" 前的换行/空格
+    # - (.*?) 非贪婪，匹配用户输入直到遇到 "助手:" 行或文本结束
+    # - 助手部分可选，支持半角/全角冒号
+    pattern = r'\s*用户[:：]\s*(.*?)(?:\n\s*助手[:：]\s*(.*))?$'
+    match = re.match(pattern, text, re.DOTALL)
+    if match:
+        user_input = match.group(1).strip()
+        llm_output = match.group(2).strip() if match.group(2) else ""
+        return user_input, llm_output
+
+    # 不含标记的纯文本：整段作为 user_input，llm_output 留空（保持原行为）
+    return text, ""
+
+
 def do_store_memory(text: str) -> str:
     """将对话内容存储到记忆系统。
 
     调用 LivingMemoryLoop.process_turn() 执行完整的记忆循环（编码、推断、
     学习、巩固、存储），将对话文本写入情景记忆缓冲区。
+
+    输入文本会被解析为用户输入与助手回复两部分，分别传入 process_turn 的
+    user_input / llm_output 参数（A-P1-1 修复）。若文本不含 "用户:/助手:"
+    标记，则作为纯文本整段传入 user_input，llm_output 留空。
 
     参数:
         text: 要存储的对话文本（建议格式："用户: xxx\\n助手: xxx"）。
@@ -304,12 +351,14 @@ def do_store_memory(text: str) -> str:
     """
     loop = get_loop()
 
+    # 解析对话文本：分离用户输入与助手回复，避免标记重复嵌套（A-P1-1）
+    user_input, llm_output = _parse_conversation(text)
+
     # process_turn 执行完整记忆循环并返回记忆 context
-    # text 作为 user_input 传入，llm_output 留空（text 已包含完整对话）
-    memory_context = loop.process_turn(text)
+    memory_context = loop.process_turn(user_input, llm_output)
 
     status = loop.get_status()
-    buffer_size = len(loop.memory._episodic_buffer)
+    buffer_size = loop.memory.episodic_size()
 
     # 自动保存快照，确保持久化跨会话记忆
     snapshot_saved = False
@@ -348,7 +397,7 @@ def do_get_memory_status() -> str:
     loop = get_loop()
     status = loop.get_status()
     # 补充情景记忆缓冲区大小
-    status['episodic_buffer_size'] = len(loop.memory._episodic_buffer)
+    status['episodic_buffer_size'] = loop.memory.episodic_size()
     # 补充 embedder 类型信息
     embedder = loop.embedder
     status['embedder_type'] = type(embedder).__name__
