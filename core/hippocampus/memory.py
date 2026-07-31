@@ -15,10 +15,10 @@ consolidation（巩固）机制将短时记忆迁移到长时记忆，
 
 import torch
 from collections import deque
-from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from dataclasses import dataclass
+from typing import List, Optional, Tuple, Union
 
-from core.types import Activation
+from core.types import Activation, resolve_device
 
 
 @dataclass
@@ -64,7 +64,8 @@ class MemoryManager:
                  replay_weight: float = 0.01,
                  consolidation_decay: float = 0.5,
                  buffer_capacity: int = 100,
-                 episodic_capacity: int = 200) -> None:
+                 episodic_capacity: int = 200,
+                 device: Union[str, torch.device] = "auto") -> None:
         """初始化记忆管理器。
 
         参数:
@@ -79,6 +80,9 @@ class MemoryManager:
             consolidation_decay: 巩固后短时记忆的衰减系数。
             buffer_capacity: 经验缓冲区容量（用于回放）。
             episodic_capacity: 情景记忆缓冲区容量（保存原始文本+语义向量）。
+            device: 计算设备（E-P2-1）。支持 "auto"/"cpu"/"cuda"/"cuda:0"
+                或 torch.device。短时/长时潜变量将创建在该设备上。
+                存入缓冲区的激活态和语义向量也会迁移到该设备。
         """
         self.num_nodes = num_nodes
         self.short_term_decay = short_term_decay
@@ -89,9 +93,14 @@ class MemoryManager:
         self.consolidation_decay = consolidation_decay
         self._buffer_capacity = buffer_capacity
 
-        # EMA 潜变量：初始为零
-        self.short_term_latent: torch.Tensor = torch.zeros(num_nodes)
-        self.long_term_latent: torch.Tensor = torch.zeros(num_nodes)
+        # E-P2-1: 统一设备管理
+        self.device: torch.device = resolve_device(device)
+
+        # EMA 潜变量：初始为零（E-P2-1: 创建在 device 上）
+        self.short_term_latent: torch.Tensor = torch.zeros(
+            num_nodes, device=self.device)
+        self.long_term_latent: torch.Tensor = torch.zeros(
+            num_nodes, device=self.device)
 
         # 缓冲区：存储 (state, surprise) 元组，用于 consolidation 重要性加权回放
         # 使用 deque 自动处理容量限制（B4 修复），O(1) 追加与淘汰
@@ -117,6 +126,8 @@ class MemoryManager:
                 的重要性加权回放。从 activation.surprise 获取。
         """
         state = activation.state
+        # E-P2-1: 迁移到正确 device，防止潜变量与输入张量设备不一致
+        state = state.to(self.device)
         alpha_s = 1.0 - self.short_term_decay  # 短时 EMA 权重
         alpha_l = 1.0 - self.long_term_decay   # 长时 EMA 权重
 
@@ -178,6 +189,8 @@ class MemoryManager:
         返回:
             检索到的记忆向量，形状 [num_nodes]。
         """
+        # E-P2-1: 迁移 cue 到正确 device
+        cue = cue.to(self.device)
         # 线索门控：cue 决定哪些记忆维度被激活
         gate = torch.sigmoid(cue)
         recalled = self.long_term_latent * gate
@@ -210,6 +223,8 @@ class MemoryManager:
         # 优先存储原始高维向量；无原始向量时退化为投影向量（向后兼容）
         store_vector = (raw_semantic_vector if raw_semantic_vector is not None
                         else semantic_vector)
+        # E-P2-1: 迁移到正确 device
+        store_vector = store_vector.to(self.device)
         entry = EpisodicEntry(
             text=text,
             semantic_vector=store_vector.detach().clone(),
@@ -390,17 +405,55 @@ class MemoryManager:
     def set_state(self, state: dict) -> None:
         """从快照恢复记忆状态。
 
+        E-P2-1: 恢复的张量自动迁移到记忆管理器当前 device。
+
         参数:
             state: get_state() 返回的字典。
         """
-        self.short_term_latent = state["short_term_latent"].clone()
-        self.long_term_latent = state["long_term_latent"].clone()
+        self.short_term_latent = state["short_term_latent"].clone().to(self.device)
+        self.long_term_latent = state["long_term_latent"].clone().to(self.device)
         self.num_nodes = state["num_nodes"]
         # 回放缓冲区恢复（向后兼容：旧快照无此字段时跳过）
         if "buffer" in state:
             maxlen = self._buffer.maxlen or 100
-            self._buffer = deque(state["buffer"], maxlen=maxlen)
+            # E-P2-1: 缓冲区中的 state 张量迁移到当前 device
+            migrated_buffer = [
+                (s.clone().to(self.device), surp)
+                for s, surp in state["buffer"]
+            ]
+            self._buffer = deque(migrated_buffer, maxlen=maxlen)
         # 情景记忆缓冲区恢复（向后兼容：旧快照无此字段时跳过）
         if "episodic_buffer" in state:
             maxlen = self._episodic_buffer.maxlen or 200
-            self._episodic_buffer = deque(state["episodic_buffer"], maxlen=maxlen)
+            # E-P2-1: episodic 向量迁移到当前 device
+            migrated_episodic = []
+            for entry in state["episodic_buffer"]:
+                entry.semantic_vector = entry.semantic_vector.to(self.device)
+                migrated_episodic.append(entry)
+            self._episodic_buffer = deque(migrated_episodic, maxlen=maxlen)
+
+    def to(self, device: Union[str, torch.device]) -> 'MemoryManager':
+        """将记忆管理器所有张量迁移到指定设备（E-P2-1）。
+
+        迁移 short_term_latent、long_term_latent、回放缓冲区中的状态
+        以及情景缓冲区中的语义向量到目标设备，并更新 self.device。
+
+        参数:
+            device: 目标设备（str / torch.device）。
+
+        返回:
+            self（支持链式调用）。
+        """
+        self.device = resolve_device(device)
+        self.short_term_latent = self.short_term_latent.to(self.device)
+        self.long_term_latent = self.long_term_latent.to(self.device)
+        # 迁移回放缓冲区中的 state 张量
+        if self._buffer:
+            migrated = [(s.to(self.device), surp) for s, surp in self._buffer]
+            maxlen = self._buffer.maxlen or 100
+            self._buffer = deque(migrated, maxlen=maxlen)
+        # 迁移情景缓冲区中的语义向量
+        if self._episodic_buffer:
+            for entry in self._episodic_buffer:
+                entry.semantic_vector = entry.semantic_vector.to(self.device)
+        return self
