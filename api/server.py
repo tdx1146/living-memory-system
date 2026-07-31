@@ -21,7 +21,6 @@ run_in_executor 将阻塞调用交给线程池，避免阻塞事件循环。
 """
 
 import os
-import time
 import asyncio
 import logging
 from datetime import datetime
@@ -413,7 +412,8 @@ async def trigger_dream(session_id: str, req: Optional[DreamRequest] = None):
     """
     sm = get_session_manager()
     scheduler = get_dream_scheduler()
-    loop = sm.get_or_create(session_id)
+    # 确保会话存在（get_or_create 的副作用：不存在时自动创建）
+    sm.get_or_create(session_id)
     scheduler.register_session(session_id)
 
     steps = req.steps if req else 20
@@ -480,7 +480,7 @@ async def on_shutdown():
 
 
 # 模块导入时确保项目根目录在 sys.path 中（支持 `python api/run.py` 启动）
-import sys
+import sys  # noqa: E402
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
