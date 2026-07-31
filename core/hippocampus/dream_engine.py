@@ -12,7 +12,7 @@
   2. FEP/主动推断：precision=0 时为纯先验采样（做梦的数学本质）；无输入时
      自由能=纯复杂性，驱动模型自洽性优化；默认模式网络（DMN）=空闲态先验主导。
   3. 工程：attractor.infer() 已支持零 precision（生成式回放）；
-     memory._buffer 存储 (激活态, 惊讶度) 元组，可直接用于激活态重放。
+     memory 缓冲区存储 (激活态, 惊讶度) 元组，可直接用于激活态重放。
 
 七阶段做梦周期：
   阶段1 NREM巩固(40%): 采样回放 + 零精度推断 + 低学习率学习
@@ -31,7 +31,6 @@ import time
 import random
 import logging
 import tempfile
-from collections import deque
 from typing import Optional, Tuple, List
 
 import torch
@@ -166,7 +165,7 @@ class DreamEngine:
         """MVP 版做梦：采样重放 + 低学习率巩固 + 自动快照。
 
         最简版本，验证核心可行性。流程：
-          1. 从 memory._buffer 按 surprise 加权采样
+          1. 从 memory 缓冲区按 surprise 加权采样
           2. 用零精度推断做生成式回放
           3. 低学习率学习（巩固 J 矩阵）
           4. 更新 memory 潜变量
@@ -181,7 +180,7 @@ class DreamEngine:
             做梦统计字典，包含步数、平均惊讶度、坍缩次数、快照路径等。
             若缓冲区为空，返回 status='no_memories_to_replay'。
         """
-        if len(self.memory._buffer) == 0:
+        if self.memory.buffer_size() == 0:
             logger.warning("记忆缓冲区为空，无记忆可回放")
             return {
                 'status': 'no_memories_to_replay',
@@ -254,7 +253,7 @@ class DreamEngine:
             'collapse_count': collapse_count,
             'j_change': j_change,
             'snapshot_path': snapshot_path,
-            'buffer_size': len(self.memory._buffer),
+            'buffer_size': self.memory.buffer_size(),
         }
 
     def dream_cycle(self, max_steps: int = 100) -> dict:
@@ -278,7 +277,7 @@ class DreamEngine:
             做梦统计字典，包含步数、各阶段执行次数、平均惊讶度、
             坍缩次数、快照路径等。若缓冲区为空，返回相应状态。
         """
-        if len(self.memory._buffer) == 0:
+        if self.memory.buffer_size() == 0:
             logger.warning("记忆缓冲区为空，无记忆可回放")
             return {
                 'status': 'no_memories_to_replay',
@@ -338,7 +337,7 @@ class DreamEngine:
             'avg_surprise': float(avg_surprise),
             'collapse_count': collapse_count,
             'snapshot_path': snapshot_path,
-            'buffer_size': len(self.memory._buffer),
+            'buffer_size': self.memory.buffer_size(),
         }
 
     def get_status(self) -> dict:
@@ -360,8 +359,8 @@ class DreamEngine:
             'idle_num_steps': self.idle_num_steps,
             'consolidation_ratio': self.consolidation_ratio,
             'collapse_threshold': self.collapse_threshold,
-            'buffer_size': len(self.memory._buffer),
-            'episodic_buffer_size': len(self.memory._episodic_buffer),
+            'buffer_size': self.memory.buffer_size(),
+            'episodic_buffer_size': self.memory.episodic_size(),
             'j_norm': j_norm,
             'j_frobenius_norm': j_norm,  # 别名
             'precision_mean': float(purpose_state.precision.mean().item()),
@@ -394,18 +393,20 @@ class DreamEngine:
 
         参数:
             buffer: 可选的自定义缓冲区（deque of (state, surprise)）。
-                默认使用 memory._buffer。
+                默认使用 memory.iter_buffer()。
 
         返回:
             (state, surprise) 元组，state 为 [num_nodes] 激活态副本。
             缓冲区为空时返回 None。
         """
-        buf = buffer if buffer is not None else self.memory._buffer
-        if len(buf) == 0:
+        if buffer is not None:
+            entries = list(buffer)
+        else:
+            entries = list(self.memory.iter_buffer())
+        if len(entries) == 0:
             return None
 
         # 提取 surprise 列表
-        entries = list(buf)
         surprises = torch.tensor([float(s) for (_, s) in entries],
                                  dtype=torch.float32)
 
@@ -578,15 +579,15 @@ class DreamEngine:
         """遗忘修剪：衰减低 surprise 记忆。
 
         遗忘是主动设计，不是 bug。本方法：
-          1. 对 memory._buffer 中 surprise 低于均值的条目，从 long_term_latent
+          1. 对 memory 缓冲区中 surprise 低于均值的条目，从 long_term_latent
              中减去其状态的小比例，弱化"无聊"记忆的痕迹。
-          2. 清理 _episodic_buffer 中 turn 过旧的条目（age > max_age），
+          2. 清理情景记忆缓冲区中 turn 过旧的条目（age > max_age），
              控制情景记忆膨胀。
 
         这模拟了生物睡眠中 δ 波促遗忘的机制——与慢振荡促巩固形成平衡。
         """
         # --- 衰减低 surprise 记忆在 long_term_latent 中的痕迹 ---
-        buf = list(self.memory._buffer)
+        buf = list(self.memory.iter_buffer())
         if len(buf) > 0:
             surprises = [float(s) for (_, s) in buf]
             mean_surprise = sum(surprises) / len(surprises)
@@ -604,18 +605,16 @@ class DreamEngine:
                 f"衰减率={prune_rate}")
 
         # --- 清理过旧的情景记忆条目 ---
-        epi = list(self.memory._episodic_buffer)
+        epi = list(self.memory.iter_episodic())
         if len(epi) > 0:
             max_age = self.forget_max_age
             current_turn = max(e.turn for e in epi)
-            maxlen = self.memory._episodic_buffer.maxlen or 200
-            surviving = deque(
-                (e for e in epi if (current_turn - e.turn) <= max_age),
-                maxlen=maxlen,
-            )
+            surviving = [
+                e for e in epi if (current_turn - e.turn) <= max_age
+            ]
             pruned = len(epi) - len(surviving)
             if pruned > 0:
-                self.memory._episodic_buffer = surviving
+                self.memory.replace_episodic_buffer(surviving)
                 logger.debug(
                     f"遗忘修剪: 清理 {pruned} 条过期情景记忆 "
                     f"(max_age={max_age})")
@@ -666,22 +665,7 @@ class DreamEngine:
         self.purpose.adjust(activation.surprise, activation)
 
         # 向 encounter_count 最低的维度缓慢偏移 precision（好奇心萌芽）
-        encounter = self.purpose.encounter_count
-        if encounter.numel() > 0:
-            target_dim = int(encounter.argmin().item())
-            nudge = self.purpose_evolve_nudge
-            self.purpose.sensory_precision[target_dim] = (
-                self.purpose.sensory_precision[target_dim] + nudge
-            )
-            # clamp 防止发散
-            self.purpose.sensory_precision = torch.clamp(
-                self.purpose.sensory_precision,
-                self.purpose.precision_min,
-                self.purpose.precision_max,
-            )
-            # 重新计算 attention
-            self.purpose.attention = torch.softmax(
-                self.purpose.sensory_precision, dim=0)
+        self.purpose.nudge_low_encounter_dim(self.purpose_evolve_nudge)
 
     # ================================================================== #
     #  坍缩检测与扰动
