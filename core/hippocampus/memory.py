@@ -37,11 +37,15 @@ class EpisodicEntry:
             的低维向量（64 维），保证向后兼容。
         surprise: 该条目的惊讶度（自由能），用于重要性加权。
         turn: 对话轮次编号。
+        source: 条目来源标记。``'external'`` 表示来自外部对话，
+            ``'self_ref'`` 表示来自自指回路。默认 ``'external'``，
+            保证向后兼容（自指回路 Phase 0+ 起用）。
     """
     text: str
     semantic_vector: torch.Tensor
     surprise: float
     turn: int
+    source: str = 'external'  # 'external' | 'self_ref'
 
 
 class MemoryManager:
