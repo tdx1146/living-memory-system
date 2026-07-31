@@ -16,7 +16,7 @@ from typing import Optional
 
 import torch
 
-from core.types import Activation
+from core.types import Activation, SensoryInput
 from core.hippocampus.attractor import AttractorNetwork
 from core.hippocampus.purpose import PurposeLayer
 from core.hippocampus.memory import MemoryManager
@@ -200,6 +200,19 @@ class LivingMemoryLoop:
             }
             self.meta = MetaPlasticityController(meta_config)
 
+        # 自指回路（可选，根据 config 决定是否启用）
+        # Phase 0：默认关闭，self_ref_enabled=False 时 self_ref 保持 None，
+        # 所有自指代码块在 `if self.self_ref is not None:` 守卫内不执行
+        self.self_ref = None
+        self._prev_activation = None  # 供 autocorr 计算（Phase 0 预留）
+        if config.get('self_ref_enabled', False):
+            from core.hippocampus.self_referential import SelfReferentialLoop
+            self.self_ref = SelfReferentialLoop(
+                encoder=self.encoder, tokenizer=self.tokenizer,
+                embedder=self.embedder, config=config,
+                device=self.attractor.device,
+            )
+
         # 做梦引擎（懒加载，首次调用 get_dream_engine() 时创建）
         self.dream_engine = None
 
@@ -233,6 +246,24 @@ class LivingMemoryLoop:
         # 1. 编码输入
         text = f"用户: {user_input}\n助手: {llm_output}" if llm_output else user_input
         sensory_input = self.encoder.encode(text, self.tokenizer, self.embedder)
+
+        # ★ 插入点 A：自指回注
+        # 在编码后、推断前，将上一轮蒸馏的自述以自适应权重回注到感官向量。
+        # 默认关闭（self_ref is None）时此块完全跳过，sensory_input 保持原样。
+        alpha_t = 0.0
+        if self.self_ref is not None:
+            echo = self.self_ref.generate_echo(
+                entropy_ratio=self.last_entropy_ratio if hasattr(self, 'last_entropy_ratio') else 0.5,
+                ext_sensory=sensory_input.vector,
+                activation_prev=self._prev_activation,
+            )
+            if echo is not None:
+                alpha_t = echo['alpha']
+                mixed_vector = sensory_input.vector + alpha_t * echo['vector']
+                sensory_input = SensoryInput(
+                    vector=mixed_vector,
+                    metadata={**sensory_input.metadata, 'self_ref_alpha': alpha_t},
+                )
 
         # 1.5 获取语义向量（用于情景记忆存储与检索）
         # PretrainedEmbedder 提供 embed_text；SimpleEmbedder 无此方法时跳过
@@ -351,6 +382,15 @@ class LivingMemoryLoop:
             episodic_texts=episodic_texts,
             coherence=self.purpose.coherence)
 
+        # ★ 插入点 B：自指观测
+        # 观测自述：将 decoder 输出和当前激活态送入自指回路进行蒸馏缓存，
+        # 供下一轮 generate_echo 使用。默认关闭时此块完全跳过。
+        if self.self_ref is not None:
+            self.self_ref.observe(memory_context, activation)
+
+        # 保存当前 activation 供下轮 autocorr 计算（Phase 0 预留）
+        self._prev_activation = activation
+
         # 6.5 情景记忆存储（当前轮文本存入缓冲区，供后续检索）
         # 优先存 384 维 raw 向量；无 raw 向量时退化为投影向量（向后兼容）
         if semantic_vector is not None:
@@ -468,10 +508,16 @@ class LivingMemoryLoop:
         if self.meta is not None:
             meta_state = self.meta.get_state()
 
+        # 自指回路状态（可选）
+        self_ref_state = None
+        if self.self_ref is not None:
+            self_ref_state = self.self_ref.get_state()
+
         self.snapshot.save(path, landscape, purpose_dict,
                            memory_state=memory_state,
                            tokenizer_state=tokenizer_state,
-                           meta_state=meta_state)
+                           meta_state=meta_state,
+                           self_ref_state=self_ref_state)
         logger.info(f"状态已保存到 {path}")
 
     def load_state(self, path: str) -> None:
@@ -513,6 +559,16 @@ class LivingMemoryLoop:
         else:
             logger.info("快照不含 meta 字段，跳过元状态恢复（向后兼容）")
 
+        # 自指回路状态恢复
+        self_ref_state = raw_data.get('self_ref')
+        if self_ref_state is not None and self.self_ref is not None:
+            self.self_ref.set_state(self_ref_state)
+            logger.info("自指回路状态已恢复")
+        elif self_ref_state is not None and self.self_ref is None:
+            logger.info("快照含 self_ref 字段但自指回路未启用，跳过恢复")
+        else:
+            logger.info("快照不含 self_ref 字段，跳过自指回路恢复（向后兼容）")
+
         logger.info(f"已从 {path} 恢复状态")
 
     def get_status(self) -> dict:
@@ -544,6 +600,13 @@ class LivingMemoryLoop:
         # 元可塑性状态（可选）
         if self.meta is not None:
             status['meta'] = self.meta.get_status()
+
+        # 自指回路状态（可选）
+        if self.self_ref is not None:
+            status['self_ref_enabled'] = True
+            status['self_ref_alpha'] = self.config.get('self_ref_alpha_base', 0.15)
+        else:
+            status['self_ref_enabled'] = False
 
         return status
 
