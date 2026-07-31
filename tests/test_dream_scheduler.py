@@ -41,12 +41,16 @@ from runtime.config import default_config
 # ============================================================
 
 class MockMemory:
-    """模拟记忆管理器，仅暴露 _buffer 供调度器检查长度。"""
+    """模拟记忆管理器，暴露 _buffer 与 buffer_size() 供调度器检查长度。"""
 
     def __init__(self, buffer_size=5):
         self._buffer = [
             (torch.randn(32), float(i) * 0.5) for i in range(buffer_size)
         ]
+
+    def buffer_size(self):
+        """公开接口，与 MemoryManager.buffer_size() 对齐。"""
+        return len(self._buffer)
 
 
 class MockLoop:
