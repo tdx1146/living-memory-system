@@ -1,0 +1,56 @@
+# ============================================================================
+# 活体记忆系统 - Docker Compose 编排
+# 任务编号: E-P2-2
+#
+# 用法:
+#   1. cp .env.docker.example .env  并按需填入 DEEPSEEK_API_KEY 等
+#   2. docker compose up -d --build
+#   3. 访问 http://localhost:8000/docs
+#   4. 查看日志:   docker compose logs -f lms
+#      健康检查:   curl http://localhost:8000/health
+#      停止:       docker compose down
+# ============================================================================
+
+services:
+  lms:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: living-memory-system:latest
+    container_name: lms
+    ports:
+      - "8000:8000"
+    # 从 .env 文件读取环境变量（覆盖 Dockerfile 中的默认值）
+    # 需先从 .env.docker.example 复制并填写
+    env_file:
+      - .env
+    environment:
+      # 显式确保容器内监听所有网卡，端口映射才能生效
+      - LMS_API_HOST=0.0.0.0
+      - LMS_API_PORT=8000
+    volumes:
+      # 快照持久化: 宿主机 ./snapshots <-> 容器 /app/snapshots
+      - ./snapshots:/app/snapshots
+      # 模型缓存(可选): 挂载 huggingface/modelscope 缓存，避免重复下载预训练模型
+      - ./lms_cache:/root/.cache
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 60s
+      retries: 3
+
+  # --------------------------------------------------------------------------
+  # 可选: Redis（当前版本不需要）
+  # 活体记忆系统的会话状态为进程内内存（SessionManager），快照为本地文件，
+  # 暂不依赖任何外部服务。若未来引入分布式会话或记忆索引，可取消下方注释启用。
+  # --------------------------------------------------------------------------
+  # redis:
+  #   image: redis:7-alpine
+  #   container_name: lms-redis
+  #   restart: unless-stopped
+  #   ports:
+  #     - "6379:6379"
+  #   volumes:
+  #     - ./redis_data:/data
