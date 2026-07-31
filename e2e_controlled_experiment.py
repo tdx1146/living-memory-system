@@ -60,19 +60,19 @@ if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
 # 修复 Windows 控制台中文输出
-import io
+import io  # noqa: E402
 try:
     sys.stdout = io.TextIOWrapper(
         sys.stdout.buffer, encoding='utf-8', errors='replace')
     sys.stderr = io.TextIOWrapper(
         sys.stderr.buffer, encoding='utf-8', errors='replace')
 except Exception:
+    # 编码重配置失败时忽略（如 stdout 已被重定向），继续使用默认编码
     pass
 
-import torch
-from runtime.loop import LivingMemoryLoop
-from runtime.config import default_config
-from core.sensory.embedder import PretrainedEmbedder
+from runtime.loop import LivingMemoryLoop  # noqa: E402
+from runtime.config import default_config  # noqa: E402
+from core.sensory.embedder import PretrainedEmbedder  # noqa: E402
 
 
 # ===========================================================================
@@ -194,7 +194,7 @@ def query_llm_safe(loop: LivingMemoryLoop, user_input: str,
 # ===========================================================================
 # 回忆正确性判定
 # ===========================================================================
-def check_recall(turn: int, response: str):
+def check_recall(turn: int, response: str) -> tuple[str, bool, str]:
     """检查 LLM 回答是否包含预期的用户信息。
 
     参数:
@@ -233,7 +233,7 @@ def check_recall(turn: int, response: str):
 # ===========================================================================
 # 运行单组实验
 # ===========================================================================
-def run_experiment(label: str, disable_episodic: bool):
+def run_experiment(label: str, disable_episodic: bool) -> list:
     """运行一组实验，返回每轮的结果记录。
 
     参数:
@@ -331,7 +331,7 @@ def run_experiment(label: str, disable_episodic: bool):
 # ===========================================================================
 # 对比表格输出
 # ===========================================================================
-def print_comparison(results_a, results_b):
+def print_comparison(results_a: list, results_b: list) -> None:
     """输出两组实验的对比表格，重点对比第 4/5/6/8 轮。
 
     参数:
@@ -376,12 +376,12 @@ def print_comparison(results_a, results_b):
         print()
         print(f"  第 {turn} 轮: {ra['user']}")
         print(f"  预期回忆: {expected}")
-        print(f"  --- 实验A（无记忆 / 禁用 episodic buffer）---")
+        print("  --- 实验A（无记忆 / 禁用 episodic buffer）---")
         print(f"      判定: [{label_a}]")
         resp_a = ra['response'].replace('\n', ' ')
         resp_a = resp_a if len(resp_a) <= 120 else resp_a[:120] + "..."
         print(f"      回答: {resp_a}")
-        print(f"  --- 实验B（有记忆 / 启用 episodic buffer）---")
+        print("  --- 实验B（有记忆 / 启用 episodic buffer）---")
         print(f"      判定: [{label_b}]")
         resp_b = rb['response'].replace('\n', ' ')
         resp_b = resp_b if len(resp_b) <= 120 else resp_b[:120] + "..."
@@ -415,7 +415,7 @@ def print_comparison(results_a, results_b):
 # ===========================================================================
 # 结论输出
 # ===========================================================================
-def print_conclusion(results_a, results_b):
+def print_conclusion(results_a: list, results_b: list) -> None:
     """根据实验结果输出结论。
 
     参数:
@@ -490,10 +490,10 @@ def main() -> None:
     print('=' * _SEP)
     print(f"  LLM 模型:     {DEEPSEEK_MODEL}")
     print(f"  API 地址:     {DEEPSEEK_BASE_URL}")
-    print(f"  Embedder:     PretrainedEmbedder (paraphrase-multilingual-MiniLM)")
+    print("  Embedder:     PretrainedEmbedder (paraphrase-multilingual-MiniLM)")
     print(f"  对话轮数:     {len(CONVERSATIONS)}")
     print(f"  重点对比轮次: {FOCUS_TURNS}")
-    print(f"  LLM消息机制:  每次只发 system+user，不发对话历史")
+    print("  LLM消息机制:  每次只发 system+user，不发对话历史")
     print('=' * _SEP)
 
     # --- 运行实验A（对照组：禁用 episodic buffer）---
