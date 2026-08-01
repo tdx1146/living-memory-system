@@ -189,6 +189,45 @@ class LLMBridge:
             f"LLM API调用失败，已重试{self.max_retries}次。最后错误: {last_error}"
         )
 
+    def query_simple(self, prompt: str, max_tokens: int = 100,
+                     timeout: float = 5.0) -> str:
+        """轻量 LLM 查询（不注入 memory_context，用于自述蒸馏等内部用途）。
+
+        与 query() 的区别：
+        - 不注入记忆 context（避免循环依赖）
+        - 不更新记忆系统（纯查询）
+        - 更短的超时和 token 限制
+        - 无重试（失败时返回空字符串，由调用方处理降级）
+
+        参数:
+            prompt: 查询文本（直接作为 user 消息发送，不注入系统提示）。
+            max_tokens: 最大生成 token 数（默认 100）。
+            timeout: 请求超时秒数（默认 5.0）。覆盖 client 初始化时的超时。
+
+        返回:
+            LLM 的响应文本。失败时返回空字符串（由调用方处理降级）。
+        """
+        messages = [
+            {
+                "role": "user",
+                "content": prompt,
+            },
+        ]
+
+        try:
+            client = self._get_client()
+            response = client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=self.temperature,
+                timeout=timeout,
+            )
+            return response.choices[0].message.content
+        except Exception as e:
+            logger.warning(f"query_simple 调用失败: {e}")
+            return ""
+
     def set_client(self, client) -> None:
         """设置自定义客户端（用于测试或使用非OpenAI SDK）。
 

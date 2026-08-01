@@ -30,6 +30,7 @@ Phase 1 稳定性保护层:
 """
 
 import logging
+import math
 from typing import List, Optional, Union
 
 import torch
@@ -164,6 +165,121 @@ class SelfVoiceDistiller:
             # 兜底：返回该段原文
             return seg
         return ""
+
+
+class LLMSelfVoiceDistiller:
+    """LLM 增强自述蒸馏器：在规则蒸馏基础上可选调用 LLM 生成更丰富自述。
+
+    降级策略：
+      1. LLM 不可用（无 bridge / API 错误）→ 回退规则蒸馏
+      2. LLM 可用但距上次调用不足 interval 轮 → 使用上次缓存的 LLM 摘要
+      3. LLM 可用且到达 interval → 调用 LLM 生成新摘要
+
+    成本控制：
+      - interval 参数控制调用频率（如每 5 轮调用一次）
+      - 非调用轮次使用缓存结果 + 规则蒸馏补充
+    """
+
+    def __init__(self, llm_bridge=None, interval: int = 5,
+                 max_tokens: int = 100, timeout: float = 5.0):
+        """初始化 LLM 增强自述蒸馏器。
+
+        参数:
+            llm_bridge: LLMBridge 实例（可选）。为 None 时完全降级为规则蒸馏。
+            interval: LLM 调用间隔轮数（默认 5）。每 interval 轮调用一次 LLM，
+                其余轮次使用缓存结果。
+            max_tokens: LLM 生成的最大 token 数（默认 100）。
+            timeout: LLM 请求超时秒数（默认 5.0）。
+        """
+        self.llm_bridge = llm_bridge
+        self.interval = interval
+        self.max_tokens = max_tokens
+        self.timeout = timeout
+        # 缓存的 LLM 摘要文本
+        self._cached_summary: Optional[str] = None
+        # 上次成功调用 LLM 的轮次
+        self._cache_turn: int = -1
+        # 内部轮次计数器（每次 distill 递增）
+        self._turn_counter: int = 0
+
+    def distill(self, memory_context: str,
+                activation: Optional[Activation] = None) -> str:
+        """蒸馏自述，可选调用 LLM。
+
+        始终先执行规则蒸馏作为基线和降级方案，然后根据 interval 和 LLM 可用性
+        决定是否调用 LLM 生成增强摘要。
+
+        参数:
+            memory_context: decoder 输出的完整 context 文本。
+            activation: 当轮激活态（可选，提供时将熵/惊讶度指标传入 LLM prompt）。
+
+        返回:
+            蒸馏后的自述字符串。LLM 可用时返回 LLM 摘要，否则返回规则蒸馏结果。
+        """
+        # 1. 始终先做规则蒸馏（作为基线和降级方案）
+        rule_distilled = SelfVoiceDistiller.distill(memory_context)
+
+        # 2. LLM 不可用：直接返回规则蒸馏
+        if self.llm_bridge is None:
+            return rule_distilled
+
+        # 3. 到达 interval：调用 LLM
+        self._turn_counter += 1
+        if (self._turn_counter - self._cache_turn >= self.interval
+                or self._cached_summary is None):
+            try:
+                llm_summary = self._call_llm(
+                    rule_distilled, memory_context, activation)
+                if llm_summary:
+                    # 长度限制：截断到 100 字符
+                    if len(llm_summary) > 100:
+                        llm_summary = llm_summary[:100]
+                    self._cached_summary = llm_summary
+                    self._cache_turn = self._turn_counter
+            except Exception:
+                logger.warning(
+                    "LLM distill failed, falling back to rule distillation",
+                    exc_info=True)
+                return rule_distilled
+
+        # 4. 返回 LLM 摘要（如有缓存），否则规则蒸馏
+        return self._cached_summary or rule_distilled
+
+    def _call_llm(self, rule_distilled: str, memory_context: str,
+                  activation: Optional[Activation]) -> Optional[str]:
+        """调用 LLM 生成自述摘要。
+
+        构造包含规则蒸馏结果和状态指标的 prompt，通过 llm_bridge.query_simple
+        发送轻量查询。
+
+        参数:
+            rule_distilled: 规则蒸馏得到的自述文本。
+            memory_context: 原始 memory_context（当前未直接使用，保留供未来扩展）。
+            activation: 当轮激活态（可选，用于提取熵/惊讶度指标）。
+
+        返回:
+            LLM 生成的自述文本，或 None（LLM 无响应时）。
+        """
+        if self.llm_bridge is None:
+            return None
+
+        metrics = ""
+        if activation is not None:
+            metrics = (f"熵={activation.entropy:.3f}, "
+                       f"惊讶度={activation.surprise:.3f}")
+
+        prompt = (
+            f"以下是一个记忆系统的自监测数据。\n"
+            f"规则蒸馏: {rule_distilled}\n"
+            f"状态指标: {metrics}\n"
+            f"请用一句话（不超过30字）描述系统当前的记忆状态，"
+            f"以第一人称'我'开头。只输出自述，不要解释。"
+        )
+
+        response = self.llm_bridge.query_simple(
+            prompt, max_tokens=self.max_tokens,
+            timeout=self.timeout)
+        return response.strip() if response else None
 
 
 class AutocorrController:
@@ -798,9 +914,153 @@ class SelfReferentialLoop:
         self.last_ext_novelty: Optional[float] = None
         self.last_arbiter_state: str = 'normal'
 
+        # Phase 2: 做梦钩子状态
+        # dream_stale: 做梦后标记当前缓冲区为陈旧（审视报告 R7）
+        # dream_age: 陈旧条目年龄（on_dream_end 中按指数衰减权重）
+        self.dream_stale: bool = False
+        self.dream_age: int = 0
+        # Phase 2: 学习隔离标志（loop 中设置，generate_echo 中读取）
+        self.last_is_self_ref_dominant: bool = False
+
+        # Phase 3.1: 状态级递归
+        # 将上一轮 activation.state 作为下一轮 infer() 的 initial_state 种子偏置。
+        # 默认关闭，开启后通过自适应门控（autocorr 越高偏置越弱）防止锁定加剧。
+        self.state_recursion_enabled: bool = bool(
+            cfg.get("self_ref_state_recursion_enabled", False))
+        self.state_recursion_strength: float = float(
+            cfg.get("self_ref_state_recursion_strength", 0.3))
+        # 上一轮激活态 [num_nodes] 维（observe 中缓存，generate_state_seed 中读取）
+        self.prev_activation_state: Optional[torch.Tensor] = None
+        # 最近一次实际偏置强度（generate_state_seed 中设置，默认 0）
+        self.state_recursion_alpha: float = 0.0
+        # Phase 3.5.1: 冷却剩余轮数（连续高 autocorr 触发后逐轮递减）
+        self._state_recursion_cooldown: int = 0
+        # 连续高 autocorr（>0.8）计数，达到 5 轮触发 10 轮冷却期
+        self._high_autocorr_streak: int = 0
+
+        # Phase 3.2: 多轮 echo 衰减
+        # 从 1 轮延迟扩展到多轮，越早的自述权重越低（指数衰减）。
+        # 默认 echo_max_rounds=1（向后兼容，等同 Phase 2 单轮模式）。
+        self.sensory_self_history: List[torch.Tensor] = []
+        self.echo_decay_rate: float = float(
+            cfg.get("self_ref_echo_decay_rate", 0.5))
+        self.echo_max_rounds: int = int(
+            cfg.get("self_ref_echo_max_rounds", 1))
+
+        # Phase 3.3: LLM 增强自述蒸馏（默认关闭，由 loop.py 注入 distiller 实例）
+        self.llm_distill_enabled: bool = bool(
+            cfg.get("self_ref_llm_distill_enabled", False))
+        self.llm_distill_interval: int = int(
+            cfg.get("self_ref_llm_distill_interval", 5))
+        self.llm_distiller: Optional[LLMSelfVoiceDistiller] = None
+
     # ------------------------------------------------------------------ #
     #  回注生成
     # ------------------------------------------------------------------ #
+
+    def generate_state_seed(self,
+                            current_sigma: torch.Tensor
+                            ) -> Optional[torch.Tensor]:
+        """Phase 3.1: 生成状态级递归种子偏置。
+
+        将上一轮 activation.state 作为下一轮 infer() 的 initial_state 种子，
+        使推断从"上一轮收敛态"附近出发，形成状态级递归。通过自适应门控
+        （autocorr 越高偏置越弱）和紧急制动（连续高 autocorr 触发冷却期）
+        防止锁定加剧。
+
+        逻辑：
+          1. 功能关闭或无上一轮激活态 → 返回 None
+          2. 当前处于 locked/oscillating 状态 → 返回 None（alpha=0）
+          3. 冷却期内 → 递减 cooldown，返回 None
+          4. autocorr > 0.8 连续 5 轮 → 触发 10 轮冷却期，返回 None
+          5. 自适应门控：gate = 1 - |autocorr|（autocorr 越高偏置越弱）
+          6. 做梦后衰减：dream_stale=True 时 effective_strength *= 0.3
+          7. 过弱偏置 → 返回 None
+          8. seed = (1-strength)*sigma + strength*prev_state
+
+        参数:
+            current_sigma: 当前吸引子网络的 sigma（推断起始状态）。
+
+        返回:
+            偏置后的种子张量，或 None（不启用状态递归时）。
+        """
+        # 1. 功能关闭或无上一轮激活态：不偏置
+        if (not self.state_recursion_enabled
+                or self.prev_activation_state is None):
+            self.state_recursion_alpha = 0.0
+            return None
+
+        # 2. 读取 AutocorrController 最近一次结果
+        autocorr_result = self.autocorr_controller._last_result
+        autocorr = autocorr_result.get('autocorr')
+        state = autocorr_result.get('state', 'normal')
+
+        # locked/oscillating 状态：状态递归会加剧锁定/振荡，直接关闭
+        if state in ('locked', 'oscillating'):
+            self.state_recursion_alpha = 0.0
+            # 处于异常状态时重置高 autocorr 连续计数
+            self._high_autocorr_streak = 0
+            return None
+
+        # 3. 冷却期内：递减 cooldown，不偏置
+        if self._state_recursion_cooldown > 0:
+            self._state_recursion_cooldown -= 1
+            self.state_recursion_alpha = 0.0
+            logger.debug(
+                "Phase 3.1 状态递归冷却中, 剩余 %d 轮",
+                self._state_recursion_cooldown)
+            return None
+
+        # 4. 连续高 autocorr 紧急制动（Phase 3.5.1）
+        if autocorr is not None and autocorr > 0.8:
+            self._high_autocorr_streak += 1
+            if self._high_autocorr_streak >= 5:
+                # 触发 10 轮冷却期
+                self._state_recursion_cooldown = 10
+                self._high_autocorr_streak = 0
+                self.state_recursion_alpha = 0.0
+                logger.warning(
+                    "Phase 3.5.1 状态递归紧急制动: 连续 %d 轮 "
+                    "autocorr>0.8, 触发 10 轮冷却期",
+                    5)
+                return None
+        else:
+            # autocorr 回落或不可用：重置连续计数
+            self._high_autocorr_streak = 0
+
+        # 5. 自适应门控：autocorr 越高偏置越弱
+        if autocorr is not None:
+            gate = 1.0 - max(0.0, min(1.0, abs(autocorr)))
+        else:
+            # 无 autocorr（历史不足）：全强度门控
+            gate = 1.0
+
+        # 6. 计算有效偏置强度
+        effective_strength = self.state_recursion_strength * gate
+
+        # 7. 做梦后衰减（Phase 3.5.3）
+        if self.dream_stale:
+            effective_strength *= 0.3
+            logger.debug(
+                "Phase 3.5.3 状态递归做梦衰减: "
+                "effective_strength *= 0.3 → %.6f",
+                effective_strength)
+
+        # 8. 过弱偏置：不偏置
+        if effective_strength < 1e-6:
+            self.state_recursion_alpha = 0.0
+            return None
+
+        # 9. 线性插值生成种子
+        prev_state = self.prev_activation_state.to(current_sigma.device)
+        seed = ((1.0 - effective_strength) * current_sigma
+                + effective_strength * prev_state)
+
+        self.state_recursion_alpha = effective_strength
+        logger.debug(
+            "Phase 3.1 状态递归种子: strength=%.4f gate=%.4f "
+            "autocorr=%s", effective_strength, gate, autocorr)
+        return seed
 
     def generate_echo(self,
                       entropy_ratio: float = 0.0,
@@ -861,11 +1121,19 @@ class SelfReferentialLoop:
 
         # 设备对齐：提供 ext_sensory 时回注向量与之同设备，保证后续混合
         # 运算不出错；未提供时（如单元测试）保持在缓存设备上
-        if ext_sensory is not None:
-            sensory_self = self.sensory_self_prev.to(
-                ext_sensory.device).detach()
+        # Phase 3.2: 多轮 echo 衰减——越早的自述权重越低（指数衰减）
+        if self.echo_max_rounds > 1 and len(self.sensory_self_history) > 1:
+            sensory_self = self._compute_decayed_echo(
+                ext_sensory if ext_sensory is not None else None)
+            if ext_sensory is not None:
+                sensory_self = sensory_self.to(ext_sensory.device)
         else:
-            sensory_self = self.sensory_self_prev.detach()
+            # 向后兼容：单轮模式（echo_max_rounds=1 或历史不足）
+            if ext_sensory is not None:
+                sensory_self = self.sensory_self_prev.to(
+                    ext_sensory.device).detach()
+            else:
+                sensory_self = self.sensory_self_prev.detach()
 
         # --- Phase 1: Tier 1 激活自相关 ---
         # 控制器在 observe() 中已更新（使用当前轮 activation），
@@ -889,6 +1157,15 @@ class SelfReferentialLoop:
         }
         arbiter_result = self.arbiter.arbitrate(signals)
         alpha = arbiter_result['alpha']
+
+        # --- Phase 2: 做梦后陈旧衰减 ---
+        # 做梦修改了 J/precision/memory，sensory_self_prev 基于旧网络状态。
+        # 标记为 stale 时临时压低自指权重，避免陈旧自述引起大 surprise。
+        if self.dream_stale:
+            alpha = alpha * 0.3
+            logger.info(
+                "self_ref generate_echo: dream_stale=True, "
+                "alpha reduced to %.4f (stale decay)", alpha)
 
         # --- Phase 1: L3 新颖性正交化 ---
         # 仅当回声相似度超过衰减起点时执行（检测到回声才需要正交化）。
@@ -975,7 +1252,12 @@ class SelfReferentialLoop:
                 计算激活自相关（autocorr），用于锁定/振荡检测。
         """
         # 1. 蒸馏自述
-        self_voice_text = SelfVoiceDistiller.distill(memory_context)
+        # Phase 3.3: 若 LLM 蒸馏器已注入，使用 LLM 增强蒸馏；否则回退规则蒸馏
+        if self.llm_distiller is not None:
+            self_voice_text = self.llm_distiller.distill(
+                memory_context, activation)
+        else:
+            self_voice_text = SelfVoiceDistiller.distill(memory_context)
 
         # 2. 编码为向量（空自述退化为零向量，由 encoder 处理）
         sensory_input = self.encoder.encode(
@@ -996,6 +1278,14 @@ class SelfReferentialLoop:
         self._sensory_self_source_prev = self.sensory_self_prev
         self.sensory_self_prev = current_emb
 
+        # Phase 3.2: 多轮自述嵌入历史（供 _compute_decayed_echo 使用）
+        # 越早的条目权重越低（指数衰减），保留 echo_max_rounds+2 个条目
+        self.sensory_self_history.append(current_emb.clone())
+        max_hist = max(self.echo_max_rounds + 2, 3)
+        if len(self.sensory_self_history) > max_hist:
+            del self.sensory_self_history[
+                :len(self.sensory_self_history) - max_hist]
+
         # 5. 自述文本历史
         self.self_voice_history.append(self_voice_text)
         self._trim(self.self_voice_history)
@@ -1015,12 +1305,66 @@ class SelfReferentialLoop:
             activation, prev_hist)
         self.last_autocorr = autocorr_result.get('autocorr')
 
+        # Phase 3: 缓存当前 activation.state 供下轮状态递归
+        self.prev_activation_state = (
+            activation.state.detach().clone().to(self.device))
+
         # 6. 递增轮次
         self.turn_count += 1
 
         logger.debug(
             "self_ref observe: turn=%d echo_sim=%s voice_len=%d",
             self.turn_count, echo_sim, len(self_voice_text))
+
+    # ------------------------------------------------------------------ #
+    #  做梦钩子（Phase 2: Tier 3）
+    # ------------------------------------------------------------------ #
+
+    def on_dream_start(self) -> None:
+        """做梦开始前钩子：标记当前自述状态为陈旧。
+
+        做梦会修改 J 矩阵、precision、memory 潜变量等，使当前缓存的
+        ``sensory_self_prev``（基于做梦前的网络状态蒸馏）变得陈旧。
+        标记为 stale 后，``generate_echo`` 会临时降低自指权重，
+        避免陈旧自述注入做梦后已变化的网络引起大 surprise（审视报告 R7）。
+
+        此方法应在做梦流程开始前由 ``LivingMemoryLoop.dream()`` 调用。
+        """
+        self.dream_stale = True
+        self.dream_age = 0
+        logger.info(
+            "self_ref on_dream_start: marking sensory_self_prev as stale "
+            "(turn=%d)", self.turn_count)
+
+    def on_dream_end(self) -> None:
+        """做梦结束后钩子：按指数衰减陈旧自述，清除 stale 标记。
+
+        做梦后 ``sensory_self_prev`` 基于旧网络状态，直接回注可能触发
+        大 surprise 和学习风暴。此方法对 ``sensory_self_prev`` 施加
+        指数衰减（``weight = exp(-1/tau)``，``tau=5``），使陈旧自述
+        逐步淡出而非突然注入。
+
+        衰减后清除 ``dream_stale`` 标志，恢复正常自指权重计算。
+        ``dream_age`` 保留为 1 供诊断查询（表示经历过一次做梦衰减）。
+
+        此方法应在做梦流程结束后由 ``LivingMemoryLoop.dream()`` 调用。
+        """
+        tau = 5.0
+        decay_factor = math.exp(-1.0 / tau)
+
+        if self.sensory_self_prev is not None:
+            self.sensory_self_prev = self.sensory_self_prev * decay_factor
+            logger.info(
+                "self_ref on_dream_end: decayed sensory_self_prev by "
+                "factor=%.4f (tau=%.1f), stale cleared",
+                decay_factor, tau)
+        else:
+            logger.info(
+                "self_ref on_dream_end: no sensory_self_prev to decay "
+                "(turn=%d), stale cleared", self.turn_count)
+
+        self.dream_stale = False
+        self.dream_age = 1
 
     # ------------------------------------------------------------------ #
     #  序列化
@@ -1068,9 +1412,33 @@ class SelfReferentialLoop:
             "last_autocorr": self.last_autocorr,
             "last_ext_novelty": self.last_ext_novelty,
             "last_arbiter_state": self.last_arbiter_state,
+            # Phase 1: L3 正交化源嵌入（observe 中更新，generate_echo 中读取）
+            "_sensory_self_source_prev": (
+                self._sensory_self_source_prev.clone()
+                if self._sensory_self_source_prev is not None
+                else None),
             # Phase 1 顶层别名（供测试断言与序列化往返）
             "lock_count": self.autocorr_controller.lock_count,
             "osc_count": self.autocorr_controller.oscillation_count,
+            # Phase 2: 做梦钩子状态
+            "dream_stale": self.dream_stale,
+            "dream_age": self.dream_age,
+            "last_is_self_ref_dominant": self.last_is_self_ref_dominant,
+            # Phase 3.1: 状态级递归
+            "prev_activation_state": (
+                self.prev_activation_state.clone()
+                if self.prev_activation_state is not None
+                else None),
+            "state_recursion_enabled": self.state_recursion_enabled,
+            "state_recursion_strength": self.state_recursion_strength,
+            "state_recursion_alpha": self.state_recursion_alpha,
+            "_state_recursion_cooldown": self._state_recursion_cooldown,
+            "_high_autocorr_streak": self._high_autocorr_streak,
+            # Phase 3.2: 多轮 echo 衰减
+            "sensory_self_history": [
+                t.clone() for t in self.sensory_self_history],
+            "echo_decay_rate": self.echo_decay_rate,
+            "echo_max_rounds": self.echo_max_rounds,
         }
 
     def set_state(self, state: dict) -> None:
@@ -1124,6 +1492,12 @@ class SelfReferentialLoop:
         self.prev_ext_sensory = (prev_ext.clone().to(self.device)
                                  if prev_ext is not None else None)
 
+        # Phase 1: L3 正交化源嵌入恢复（向后兼容：旧快照无此字段时为 None）
+        source_prev = state.get("_sensory_self_source_prev")
+        self._sensory_self_source_prev = (
+            source_prev.clone().to(self.device)
+            if source_prev is not None else None)
+
         # Phase 1: 监控指标恢复
         la = state.get("last_autocorr")
         self.last_autocorr = float(la) if la is not None else None
@@ -1133,6 +1507,36 @@ class SelfReferentialLoop:
 
         # Phase 1: arbiter 的 alpha_base 与当前 self.alpha_base 保持同步
         self.arbiter.alpha_base = self.alpha_base
+
+        # Phase 2: 做梦钩子状态恢复（向后兼容：旧快照无此字段时回退默认值）
+        self.dream_stale = bool(state.get("dream_stale", False))
+        self.dream_age = int(state.get("dream_age", 0))
+        self.last_is_self_ref_dominant = bool(
+            state.get("last_is_self_ref_dominant", False))
+
+        # Phase 3.1: 状态级递归恢复（向后兼容：旧快照无此字段时回退默认值）
+        pas = state.get("prev_activation_state")
+        self.prev_activation_state = (
+            pas.clone().to(self.device) if pas is not None else None)
+        self.state_recursion_enabled = bool(
+            state.get("state_recursion_enabled", False))
+        self.state_recursion_strength = float(
+            state.get("state_recursion_strength", 0.3))
+        self.state_recursion_alpha = float(
+            state.get("state_recursion_alpha", 0.0))
+        self._state_recursion_cooldown = int(
+            state.get("_state_recursion_cooldown", 0))
+        self._high_autocorr_streak = int(
+            state.get("_high_autocorr_streak", 0))
+
+        # Phase 3.2: 多轮 echo 衰减恢复（向后兼容：旧快照无此字段时空列表）
+        self.sensory_self_history = [
+            t.clone().to(self.device)
+            for t in state.get("sensory_self_history", [])]
+        self.echo_decay_rate = float(
+            state.get("echo_decay_rate", 0.5))
+        self.echo_max_rounds = int(
+            state.get("echo_max_rounds", 1))
 
     # ------------------------------------------------------------------ #
     #  监控
@@ -1172,6 +1576,20 @@ class SelfReferentialLoop:
             "autocorr_lag": self.autocorr_controller.lag,
             "activation_history_size": len(self.activation_history),
             "has_prev_ext_sensory": self.prev_ext_sensory is not None,
+            # Phase 2 新增
+            "dream_stale": self.dream_stale,
+            "dream_age": self.dream_age,
+            "is_self_ref_dominant": self.last_is_self_ref_dominant,
+            # Phase 3.1 新增：状态级递归
+            "state_recursion_enabled": self.state_recursion_enabled,
+            "state_recursion_strength": self.state_recursion_strength,
+            "state_recursion_alpha": self.state_recursion_alpha,
+            # Phase 3.2 新增：多轮 echo 衰减
+            "echo_max_rounds": self.echo_max_rounds,
+            "echo_decay_rate": self.echo_decay_rate,
+            "sensory_self_history_size": len(self.sensory_self_history),
+            # Phase 3.3 新增：LLM 增强自述蒸馏
+            "llm_distill_enabled": self.llm_distill_enabled,
         }
 
     # ------------------------------------------------------------------ #
@@ -1234,3 +1652,72 @@ class SelfReferentialLoop:
         novelty = 1.0 - cos_sim
         # 限制到非负（cos_sim > 1 时理论上不应发生，但防御性处理）
         return max(0.0, novelty)
+
+    def _compute_decayed_echo(self,
+                              ext_sensory: Optional[torch.Tensor]
+                              ) -> torch.Tensor:
+        """Phase 3.2: 计算多轮指数衰减的感官自述嵌入。
+
+        将 sensory_self_history 中最近 K 轮的自述嵌入按指数衰减加权平均，
+        越早的自述权重越低（decay^i），使回注信号融合近期多轮自述而非
+        仅依赖上一轮。
+
+        加权公式::
+
+            weighted_sum = Σ_{i=0}^{K-1} decay^i * history[-(i+1)]
+            sensory_self = weighted_sum / Σ_{i=0}^{K-1} decay^i
+
+        其中 i=0 对应最近一轮（权重 1.0），i=K-1 对应最早一轮
+        （权重 decay^{K-1}）。
+
+        Phase 3.5.2 范数守卫：多轮叠加后范数不应膨胀超过单轮的 1.5 倍，
+        否则回退单轮模式，防止数值不稳定。
+
+        参数:
+            ext_sensory: 当前轮外部感官向量（仅用于设备对齐，可为 None）。
+
+        返回:
+            衰减加权后的感官自述嵌入（已 detach）。
+        """
+        K = min(self.echo_max_rounds, len(self.sensory_self_history))
+
+        # 历史不足或配置为单轮：回退单轮模式
+        if K <= 1 or self.echo_max_rounds <= 1:
+            if ext_sensory is not None:
+                return self.sensory_self_prev.to(
+                    ext_sensory.device).detach()
+            return self.sensory_self_prev.detach()
+
+        # 设备对齐
+        device = (ext_sensory.device if ext_sensory is not None
+                  else self.sensory_self_prev.device)
+
+        decay = self.echo_decay_rate
+        weighted_sum = None
+        total_weight = 0.0
+        for i in range(K):
+            # i=0 → history[-1]（最近一轮），i=K-1 → history[-K]（最早一轮）
+            hist_vec = self.sensory_self_history[-(i + 1)].to(device).float()
+            w = decay ** i
+            if weighted_sum is None:
+                weighted_sum = w * hist_vec
+            else:
+                weighted_sum = weighted_sum + w * hist_vec
+            total_weight += w
+
+        # 归一化
+        if total_weight > 1e-8:
+            sensory_self = weighted_sum / total_weight
+        else:
+            sensory_self = weighted_sum
+
+        # Phase 3.5.2: 范数守卫——多轮叠加后范数不应膨胀超过单轮的 1.5 倍
+        single_norm = float(self.sensory_self_prev.norm())
+        multi_norm = float(sensory_self.norm())
+        if single_norm > 1e-8 and multi_norm > single_norm * 1.5:
+            logger.warning(
+                "Phase 3.5 范数守卫: 多轮echo范数 %.4f 超过单轮 %.4f × 1.5, "
+                "回退单轮模式", multi_norm, single_norm)
+            sensory_self = self.sensory_self_prev.to(device).detach()
+
+        return sensory_self.detach()

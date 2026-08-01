@@ -73,18 +73,15 @@ except Exception:
 from runtime.loop import LivingMemoryLoop  # noqa: E402
 from runtime.config import default_config  # noqa: E402
 from core.sensory.embedder import PretrainedEmbedder  # noqa: E402
+from core.paths import resolve_pretrained_model_path  # noqa: E402
 
 
 # ===========================================================================
 # 常量配置
 # ===========================================================================
 
-# 预训练模型本地路径（modelscope 下载缓存）
-_PRETRAINED_MODEL_PATH = (
-    r"C:\Users\dandan\.cache\modelscope\models"
-    r"\sentence-transformers--paraphrase-multilingual-MiniLM-L12-v2"
-    r"\snapshots\master"
-)
+# 预训练模型路径：优先环境变量，自动探测跨平台缓存目录
+_PRETRAINED_MODEL_PATH = resolve_pretrained_model_path()
 
 # DeepSeek API 配置（从环境变量读取，避免硬编码泄露）
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")

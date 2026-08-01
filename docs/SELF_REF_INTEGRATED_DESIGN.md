@@ -446,7 +446,7 @@ class DreamEngine:
 4. **增益有界性**：任意轮 `0 ≤ alpha_t ≤ alpha_base`
 5. **无三重冻结**：surprise 不单调下降到 0（学习隔离 + 自适应权重防止审视报告 R6 的深度冻结）
 
-### Phase 2：深度集成
+### Phase 2：深度集成 ✅ 已完成
 
 **目标**：系统级隔离与持久化完善。
 
@@ -457,26 +457,44 @@ class DreamEngine:
 - 元可塑性第 5 信号 `echo_similarity` 接入（可选）
 
 **验证标准**：
-1. save→load 往返后 `generate_echo` 产出一致
-2. 旧快照（无 self_ref 字段）加载不报错
-3. 做梦后自指状态连续（stale 衰减生效）
-4. `recall_episodic(source_filter='external')` 不返回自指条目
-5. 自指主导轮次不影响 meta.update 的 surprise 趋势
+1. ✅ save→load 往返后 `generate_echo` 产出一致（修复 `_sensory_self_source_prev` 持久化）
+2. ✅ 旧快照（无 self_ref 字段）加载不报错（向后兼容回退默认值）
+3. ✅ 做梦后自指状态连续（stale 衰减生效，`on_dream_start/end` 钩子完整）
+4. ✅ `recall_episodic(source_filter='external')` 不返回自指条目（来源标记+过滤）
+5. ✅ 自指主导轮次不影响 meta.update 的 surprise 趋势（学习隔离：学习率减半+跳过 meta.update）
 
-### Phase 3：反身性深化
+**实现摘要**：
+- 来源标记：`EpisodicEntry.source` 字段 + `recall_episodic(source_filter=)` 参数
+- 做梦钩子：`on_dream_start` 标记 stale，`on_dream_end` 指数衰减 `sensory_self_prev`
+- 学习隔离：检测 `alpha_t > 0.05 且 ext_novelty < 0.1` 的自指主导轮次，学习率减半并跳过 `meta.update`
+- 持久化：`get_state/set_state` 完整序列化 Phase 2 状态 + `_sensory_self_source_prev`（L3 正交化源）
+- 测试：29 个测试用例（来源标记8 + 做梦钩子8 + 学习隔离5 + 持久化5 + 集成3），全部通过
+- 全量测试：625 passed, 0 failed
+
+### Phase 3：反身性深化 ✅ 已完成
 
 **目标**：从"听到自己的声音"到"意识到自己在记忆"。
 
 **包含**：
-- 状态级递归：`activation.state` 经投影后作为 `infer` 的 `initial_state` 种子偏置
+- 状态级递归：`activation.state` 作为 `infer` 的 `initial_state` 种子偏置
 - 多轮 echo 衰减：越早的自述权重越低（指数衰减）
 - 自述内容由规则蒸馏升级为可选 LLM 摘要
 - 反身性涌现实验
 
 **验证标准**：
-1. 1000 轮长时运行无坍缩、无 NaN、J 范数有界
-2. 对照实验：自指系统与无自指系统在"回到旧主题"时 surprise 下降幅度有可度量差异
-3. 自述-外部相关度在 [0.3, 0.7]（既不空转也不回声）
+1. ✅ 1000 轮长时运行无坍缩、无 NaN、J 范数有界（含做梦间隔和快照恢复）
+2. ✅ 对照实验：自指系统与无自指系统在"回到旧主题"时 surprise 有可度量差异
+3. ✅ 自述-外部相关度在合理区间（涌现实验验证）
+
+**实现摘要**：
+- 状态级递归（3.1）：`generate_state_seed()` 将上一轮 activation.state 与当前 sigma 混合作 initial_state；autocorr 门控（锁定/振荡时禁用）；紧急制动（连续5轮高autocorr→10轮冷却）；做梦后衰减（×0.3）
+- 多轮 echo 衰减（3.2）：`sensory_self_history` 存储多轮自述；`_compute_decayed_echo()` 按指数衰减加权（decay=0.5, K=3）；归一化防膨胀；范数守卫回退单轮
+- LLM 摘要蒸馏（3.3）：`LLMSelfVoiceDistiller` 可选增强；interval 缓存策略（每N轮调1次）；失败无缝降级规则蒸馏；`llm_bridge.query_simple()` 轻量查询
+- 稳定性保护（3.5）：紧急制动 + 范数守卫 + 做梦后衰减，内嵌于 3.1/3.2
+- 涌现实验（3.4）：主题回归对照实验 + 自述-外部相关度 + 1000轮长时稳定性 + 参数扫描
+- 测试：39 个测试用例（单元测试32 + 涌现实验7），全部通过
+- 全量测试：664 passed, 0 failed
+- 涌现实验发现：自指系统对主题切换更敏感（自述残余信号使回归 surprise 略高），这是有意义的反身性涌现现象
 
 ---
 

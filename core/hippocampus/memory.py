@@ -202,7 +202,8 @@ class MemoryManager:
 
     def store_episodic(self, text: str, semantic_vector: torch.Tensor,
                        surprise: float, turn: int,
-                       raw_semantic_vector: Optional[torch.Tensor] = None
+                       raw_semantic_vector: Optional[torch.Tensor] = None,
+                       source: str = 'external'
                        ) -> None:
         """存入情景记忆条目（原始文本 + 语义向量）。
 
@@ -215,6 +216,10 @@ class MemoryManager:
           - 否则退化为存储 semantic_vector（投影后低维向量），兼容
             SimpleEmbedder 等无原始向量的嵌入器。
 
+        Phase 2 来源标记（Tier 3）:
+          - source='external'：来自外部对话（默认，向后兼容）
+          - source='self_ref'：来自自指回路（防止污染 LLM 可见 context）
+
         参数:
             text: 原始对话文本。
             semantic_vector: 投影后的语义向量（低维，用于吸引子网络路径，
@@ -223,6 +228,8 @@ class MemoryManager:
             turn: 对话轮次编号。
             raw_semantic_vector: 可选，预训练模型原始高维语义向量（投影前、
                 L2 归一化）。提供时优先存入 episodic 缓冲区用于高精度检索。
+            source: 条目来源标记。``'external'`` 表示来自外部对话，
+                ``'self_ref'`` 表示来自自指回路。默认 ``'external'``。
         """
         # 优先存储原始高维向量；无原始向量时退化为投影向量（向后兼容）
         store_vector = (raw_semantic_vector if raw_semantic_vector is not None
@@ -234,12 +241,14 @@ class MemoryManager:
             semantic_vector=store_vector.detach().clone(),
             surprise=surprise,
             turn=turn,
+            source=source,
         )
         self._episodic_buffer.append(entry)
 
     def recall_episodic(self, query_vector: torch.Tensor,
                         top_k: int = 3,
-                        fallback_query: Optional[torch.Tensor] = None
+                        fallback_query: Optional[torch.Tensor] = None,
+                        source_filter: Optional[str] = 'external'
                         ) -> List[EpisodicEntry]:
         """基于语义相似度检索情景记忆，返回最相关的文本条目。
 
@@ -254,11 +263,19 @@ class MemoryManager:
           - 维度均不匹配的条目被跳过。这保证旧快照恢复后检索不崩溃，
             也支持"旧 64 维 + 新 384 维"混合缓冲区。
 
+        Phase 2 来源过滤（Tier 3）:
+          - source_filter='external'（默认）：只检索外部对话条目，
+            防止自指文本污染 LLM 可见的 context（审视报告 R3）
+          - source_filter=None：不过滤，检索所有来源的条目
+          - source_filter='self_ref'：只检索自指条目（用于内部诊断）
+
         参数:
             query_vector: 查询的原始语义向量（384 维，投影前）。
             top_k: 返回的最大条目数。
             fallback_query: 可选，投影后的查询向量（64 维）。用于与旧快照
                 中 64 维条目的兼容检索。
+            source_filter: 来源过滤。``'external'`` 只检索外部条目（默认），
+                ``'self_ref'`` 只检索自指条目，``None`` 不过滤。
 
         返回:
             最相关的 EpisodicEntry 列表（按相似度降序）。
@@ -290,6 +307,9 @@ class MemoryManager:
         # 消除逐条 torch.dot + .item() 带来的 Python 循环与 GPU/CPU 同步开销。
         groups: dict = {}
         for entry in self._episodic_buffer:
+            # Phase 2: 来源过滤
+            if source_filter is not None and entry.source != source_filter:
+                continue
             v = entry.semantic_vector.detach().cpu().float()
             if v.dim() > 1:
                 v = v.squeeze()  # 防御性处理，统一为 1-D

@@ -33,13 +33,10 @@ if _PROJECT_ROOT not in sys.path:
 
 from runtime.loop import LivingMemoryLoop  # noqa: E402
 from runtime.config import default_config  # noqa: E402
+from core.paths import resolve_pretrained_model_path  # noqa: E402
 
-# 预训练模型本地路径（modelscope 下载缓存）
-_PRETRAINED_MODEL_PATH = (
-    r"C:\Users\dandan\.cache\modelscope\models"
-    r"\sentence-transformers--paraphrase-multilingual-MiniLM-L12-v2"
-    r"\snapshots\master"
-)
+# 预训练模型路径：优先环境变量，自动探测跨平台缓存目录
+_PRETRAINED_MODEL_PATH = resolve_pretrained_model_path()
 
 
 # ===========================================================================
@@ -85,7 +82,7 @@ def build_config(api_key: str, embedder_type: str = 'pretrained') -> dict:
     config['activation_threshold'] = 0.05
     config['auto_snapshot'] = True
     config['auto_snapshot_interval'] = 10
-    config['snapshot_dir'] = './snapshots'
+    config['snapshot_dir'] = str(_PROJECT_ROOT / 'snapshots')
 
     # --- Embedder 选择 ---
     if embedder_type == 'pretrained':

@@ -6,17 +6,19 @@
 其中"检索记忆"步骤（S1 修复）是关键：长时记忆通过 recall() 进入解码路径，
 不再"只写不读"。
 
-遵循架构文档第四节的数据流定义。
+遵循架构文档第四节数据流定义。
 """
 
 import os
 import math
 import logging
+from pathlib import Path
 from typing import Optional
 
 import torch
 
 from core.types import Activation, SensoryInput
+from core.paths import get_snapshot_dir
 from core.hippocampus.attractor import AttractorNetwork
 from core.hippocampus.purpose import PurposeLayer
 from core.hippocampus.memory import MemoryManager
@@ -218,6 +220,18 @@ class LivingMemoryLoop:
                 device=self.attractor.device,
             )
 
+        # Phase 3.3: 可选 LLM 增强自述蒸馏
+        # 当 self_ref_llm_distill_enabled=True 且 bridge 可用时，向 SelfReferentialLoop
+        # 注入 LLMSelfVoiceDistiller 实例。LLM 不可用/失败时自动降级为规则蒸馏。
+        if (config.get('self_ref_llm_distill_enabled', False)
+                and self.self_ref is not None
+                and self.bridge is not None):
+            from core.hippocampus.self_referential import LLMSelfVoiceDistiller
+            self.self_ref.llm_distiller = LLMSelfVoiceDistiller(
+                llm_bridge=self.bridge,
+                interval=config.get('self_ref_llm_distill_interval', 5),
+            )
+
         # 做梦引擎（懒加载，首次调用 get_dream_engine() 时创建）
         self.dream_engine = None
 
@@ -252,30 +266,11 @@ class LivingMemoryLoop:
         text = f"用户: {user_input}\n助手: {llm_output}" if llm_output else user_input
         sensory_input = self.encoder.encode(text, self.tokenizer, self.embedder)
 
-        # ★ 插入点 A：自指回注
+        # ★ 插入点 A：自指回注（提取为 _inject_self_ref）
         # 在编码后、推断前，将上一轮蒸馏的自述以自适应权重回注到感官向量。
         # 默认关闭（self_ref is None）时此块完全跳过，sensory_input 保持原样。
-        alpha_t = 0.0
-        if self.self_ref is not None:
-            echo = self.self_ref.generate_echo(
-                entropy_ratio=self.last_entropy_ratio if hasattr(self, 'last_entropy_ratio') else 0.5,
-                ext_sensory=sensory_input.vector,
-                activation_prev=self._prev_activation,
-            )
-            if echo is not None:
-                alpha_t = echo['alpha']
-                mixed_vector = sensory_input.vector + alpha_t * echo['vector']
-                # ★ 自指回注（Phase 1 增强）：用 .get() 安全访问新增字段，
-                # 即使 self_referential.py 的增强尚未完成也不崩溃。
-                sensory_input = SensoryInput(
-                    vector=mixed_vector,
-                    metadata={
-                        **sensory_input.metadata,
-                        'self_ref_alpha': alpha_t,
-                        'self_ref_state': echo.get('state', 'normal'),
-                        'self_ref_autocorr': echo.get('autocorr'),
-                    },
-                )
+        sensory_input, alpha_t, is_self_ref_dominant = self._inject_self_ref(
+            sensory_input)
 
         # 1.5 获取语义向量（用于情景记忆存储与检索）
         # PretrainedEmbedder 提供 embed_text；SimpleEmbedder 无此方法时跳过
@@ -290,28 +285,29 @@ class LivingMemoryLoop:
                 raw_semantic_vector = self.embedder.embed_text_raw(text)
 
         # --- 元可塑性：计算调整后的参数（E-P2-5: 不修改实例属性）---
-        _effective_lr = self.config.get('learning_rate', 0.01)
-        _meta_temp = None
-        _meta_orth = None
-        _meta_cw = None
-        if self.meta is not None:
-            adjusted = self.meta.get_adjusted_params(
-                base_lr=_effective_lr,
-                base_orth=self.attractor.orth_weight,
-                base_temp=self.attractor.temperature,
-                base_cw=self.attractor.complexity_weight,
-            )
-            _meta_temp = adjusted['temperature']
-            _meta_orth = adjusted['orth_weight']
-            _meta_cw = adjusted['complexity_weight']
-            _effective_lr = adjusted['learning_rate']
+        _effective_lr, _meta_temp, _meta_orth, _meta_cw = \
+            self._get_meta_adjusted_params()
+
+        # ★ Phase 2: 学习隔离——自指主导轮次学习率减半
+        # 防止自指回路的 Hebbian 相关过度强化 J 矩阵中的自指方向
+        if is_self_ref_dominant:
+            _effective_lr = _effective_lr * 0.5
+            logger.info(
+                "Phase 2 学习隔离: 自指主导轮次, "
+                "学习率减半 → %.6f", _effective_lr)
 
         # 2. FEP推断（E-P2-5: 通过 temperature_override 传递元调整后的温度）
         precision = self.purpose.get_precision()
+        # Phase 3.1: 状态级递归——将上一轮 activation.state 作为 infer 种子偏置
+        initial_state = None
+        if self.self_ref is not None:
+            initial_state = self.self_ref.generate_state_seed(
+                self.attractor.sigma)
         activation = self.attractor.infer(
             sensory_input.vector, precision,
             num_steps=self.config.get('num_infer_steps', 10),
             temperature_override=_meta_temp,
+            initial_state=initial_state,
         )
 
         # 3. FEP学习（E-P2-5: 通过 override 参数传递元调整后的权重）
@@ -321,45 +317,28 @@ class LivingMemoryLoop:
             complexity_weight_override=_meta_cw,
         )
 
-        # 3.5 在线熵管理
+        # 3.5 在线熵管理（提取为 _manage_entropy）
         # FEP学习之后、调整目的之前，根据当前激活熵主动干预：
         # 熵过高（混沌饱和）则增强正交化压力驱散相似表示；
         # 熵过低（僵化）则放松正交化压力允许更多激活。
-        entropy = activation.entropy
-        max_entropy = math.log(self.attractor.num_nodes)  # ln(256) ≈ 5.55
-        entropy_ratio = entropy / max_entropy if max_entropy > 0 else 0.0
-        self.last_entropy_ratio = entropy_ratio  # 供 get_status() 读取
-
-        # 从config读取阈值（带默认值）
-        entropy_high_threshold = self.config.get('entropy_high_threshold', 0.9)
-        entropy_low_threshold = self.config.get('entropy_low_threshold', 0.5)
-
-        if entropy_ratio > entropy_high_threshold:
-            # 熵过高：系统混沌，增强正交化压力驱散相似表示
-            # E-P2-5: 通过 orth_weight_override 传递临时权重，不修改实例属性
-            self.attractor.learn(
-                activation, sensory_input.vector, _effective_lr * 0.3,
-                orth_weight_override=self.attractor.orth_weight * 1.5,
-            )
-            logger.info(f"在线熵管理: 熵={entropy:.3f}(ratio={entropy_ratio:.2f}) 过高，增强正交化")
-        elif entropy_ratio < entropy_low_threshold:
-            # 熵过低：系统僵化，降低正交化压力允许更多激活
-            # E-P2-5: 通过 orth_weight_override 传递临时权重，不修改实例属性
-            self.attractor.learn(
-                activation, sensory_input.vector, _effective_lr * 0.2,
-                orth_weight_override=self.attractor.orth_weight * 0.7,
-            )
-            logger.info(f"在线熵管理: 熵={entropy:.3f}(ratio={entropy_ratio:.2f}) 过低，放松正交化")
+        self._manage_entropy(activation, sensory_input, _effective_lr)
 
         # 4. 调整目的
         self.purpose.adjust(activation.surprise, activation)
 
         # --- 元可塑性：收集信号并更新 ---
-        if self.meta is not None:
+        # ★ Phase 2: 学习隔离——跳过自指主导轮次的 meta.update
+        # 自指锁定导致 surprise 持续下降，若馈入 meta 会将 lr_multiplier
+        # 压向 0.5，间接抑制系统对外部真实输入的学习能力（审视报告 9.5）
+        if self.meta is not None and not is_self_ref_dominant:
             j_norm = float(torch.norm(self.attractor.J, p='fro').item())
             collapse_occurred = self.purpose.flipped  # 元目的翻转视为坍缩信号
             coherence = self.purpose.coherence
             self.meta.update(activation.surprise, coherence, collapse_occurred, j_norm)
+        elif self.meta is not None and is_self_ref_dominant:
+            logger.debug(
+                "Phase 2 学习隔离: 跳过 meta.update "
+                "(自指主导轮次, surprise=%.4f)", activation.surprise)
 
         # 5. 记忆更新与巩固
         self.memory.update(activation, activation.surprise)
@@ -375,17 +354,7 @@ class LivingMemoryLoop:
 
         # 5.6 情景记忆检索（用语义向量找最相关的历史文本）
         # 先检索后存储：避免当前轮文本出现在检索结果中
-        # 优先用 384 维 raw 向量查询（高精度）；fallback 用 64 维投影向量
-        # （向后兼容旧快照中 64 维条目）；无 raw 向量时退化为投影向量查询
-        episodic_texts = None
-        if semantic_vector is not None:
-            episodic_query = (raw_semantic_vector
-                              if raw_semantic_vector is not None
-                              else semantic_vector)
-            entries = self.memory.recall_episodic(
-                episodic_query, top_k=3, fallback_query=semantic_vector)
-            if entries:
-                episodic_texts = [e.text for e in entries]
+        episodic_texts = self._retrieve_episodic(text)
 
         # 6. 解码context（传入检索到的记忆和情景文本，使长期记忆+语义文本参与输出）
         # A-P1-2: 传入 purpose.coherence，使解码器能输出"关注方向"解读
@@ -408,7 +377,8 @@ class LivingMemoryLoop:
         if semantic_vector is not None:
             self.memory.store_episodic(
                 text, semantic_vector, activation.surprise, self.turn_count,
-                raw_semantic_vector=raw_semantic_vector)
+                raw_semantic_vector=raw_semantic_vector,
+                source='external')  # Phase 2: 显式来源标记
 
         # 更新状态
         self.last_activation = activation
@@ -420,24 +390,188 @@ class LivingMemoryLoop:
             f"惊讶度={activation.surprise:.3f}"
         )
 
+        # 7. 自动快照（G4 修复：按间隔自动保存状态）—— 提取为 _auto_snapshot
+        self._auto_snapshot()
+
+        # 8. 返回context
+        return memory_context
+
+    # ================================================================== #
+    #  私有辅助方法（由 process_turn / query_llm 拆分而来，保持行为不变）
+    # ================================================================== #
+
+    def _inject_self_ref(
+        self, sensory_input: SensoryInput
+    ) -> tuple[SensoryInput, float, bool]:
+        """自指回注（插入点 A）。
+
+        在编码后、推断前，将上一轮蒸馏的自述以自适应权重回注到感官向量。
+        默认关闭（self_ref is None）时此块完全跳过，sensory_input 保持原样。
+
+        参数:
+            sensory_input: 原始感官输入
+        返回:
+            (修改后的 sensory_input, alpha_t, is_self_ref_dominant)
+        """
+        # ★ 插入点 A：自指回注
+        alpha_t = 0.0
+        echo = None
+        if self.self_ref is not None:
+            echo = self.self_ref.generate_echo(
+                entropy_ratio=self.last_entropy_ratio if hasattr(self, 'last_entropy_ratio') else 0.5,
+                ext_sensory=sensory_input.vector,
+                activation_prev=self._prev_activation,
+            )
+            if echo is not None:
+                alpha_t = echo['alpha']
+                mixed_vector = sensory_input.vector + alpha_t * echo['vector']
+                # ★ 自指回注（Phase 1 增强）：用 .get() 安全访问新增字段，
+                # 即使 self_referential.py 的增强尚未完成也不崩溃。
+                sensory_input = SensoryInput(
+                    vector=mixed_vector,
+                    metadata={
+                        **sensory_input.metadata,
+                        'self_ref_alpha': alpha_t,
+                        'self_ref_state': echo.get('state', 'normal'),
+                        'self_ref_autocorr': echo.get('autocorr'),
+                    },
+                )
+
+        # ★ Phase 2: 学习隔离——检测自指主导轮次
+        # 自指主导 = 自指权重较高且外部输入新颖度极低（系统在"自说自话"）
+        # 此类轮次使用减半学习率，且跳过 meta.update，防止自指 surprise
+        # 污染元参数趋势（审视报告 9.5）
+        _self_ref_ext_novelty = None
+        if self.self_ref is not None and echo is not None:
+            _self_ref_ext_novelty = echo.get('ext_novelty')
+        is_self_ref_dominant = (
+            alpha_t > 0.05
+            and _self_ref_ext_novelty is not None
+            and _self_ref_ext_novelty < 0.1
+        )
+        if self.self_ref is not None:
+            self.self_ref.last_is_self_ref_dominant = is_self_ref_dominant
+
+        return sensory_input, alpha_t, is_self_ref_dominant
+
+    def _get_meta_adjusted_params(
+        self
+    ) -> tuple[float, float | None, float | None, float | None]:
+        """元可塑性：计算调整后的参数（E-P2-5: 不修改实例属性）。
+
+        返回:
+            (effective_lr, meta_temp, meta_orth, meta_cw)
+            其中 meta_* 为 None 表示未启用元可塑性（无调整）。
+        """
+        # --- 元可塑性：计算调整后的参数（E-P2-5: 不修改实例属性）---
+        effective_lr = self.config.get('learning_rate', 0.01)
+        meta_temp = None
+        meta_orth = None
+        meta_cw = None
+        if self.meta is not None:
+            adjusted = self.meta.get_adjusted_params(
+                base_lr=effective_lr,
+                base_orth=self.attractor.orth_weight,
+                base_temp=self.attractor.temperature,
+                base_cw=self.attractor.complexity_weight,
+            )
+            meta_temp = adjusted['temperature']
+            meta_orth = adjusted['orth_weight']
+            meta_cw = adjusted['complexity_weight']
+            effective_lr = adjusted['learning_rate']
+        return effective_lr, meta_temp, meta_orth, meta_cw
+
+    def _manage_entropy(
+        self, activation, sensory_input, effective_lr
+    ) -> float:
+        """在线熵管理（3.5）。
+
+        FEP学习之后、调整目的之前，根据当前激活熵主动干预：
+        熵过高（混沌饱和）则增强正交化压力驱散相似表示；
+        熵过低（僵化）则放松正交化压力允许更多激活。
+
+        参数:
+            activation: 当前激活态
+            sensory_input: 感官输入
+            effective_lr: 有效学习率
+        返回:
+            entropy_ratio（熵 / 最大熵）
+        """
+        # 3.5 在线熵管理
+        entropy = activation.entropy
+        max_entropy = math.log(self.attractor.num_nodes)  # ln(256) ≈ 5.55
+        entropy_ratio = entropy / max_entropy if max_entropy > 0 else 0.0
+        self.last_entropy_ratio = entropy_ratio  # 供 get_status() 读取
+
+        # 从config读取阈值（带默认值）
+        entropy_high_threshold = self.config.get('entropy_high_threshold', 0.9)
+        entropy_low_threshold = self.config.get('entropy_low_threshold', 0.5)
+
+        if entropy_ratio > entropy_high_threshold:
+            # 熵过高：系统混沌，增强正交化压力驱散相似表示
+            # E-P2-5: 通过 orth_weight_override 传递临时权重，不修改实例属性
+            self.attractor.learn(
+                activation, sensory_input.vector, effective_lr * 0.3,
+                orth_weight_override=self.attractor.orth_weight * 1.5,
+            )
+            logger.info(f"在线熵管理: 熵={entropy:.3f}(ratio={entropy_ratio:.2f}) 过高，增强正交化")
+        elif entropy_ratio < entropy_low_threshold:
+            # 熵过低：系统僵化，降低正交化压力允许更多激活
+            # E-P2-5: 通过 orth_weight_override 传递临时权重，不修改实例属性
+            self.attractor.learn(
+                activation, sensory_input.vector, effective_lr * 0.2,
+                orth_weight_override=self.attractor.orth_weight * 0.7,
+            )
+            logger.info(f"在线熵管理: 熵={entropy:.3f}(ratio={entropy_ratio:.2f}) 过低，放松正交化")
+
+        return entropy_ratio
+
+    def _retrieve_episodic(self, text: str) -> list[str] | None:
+        """情景记忆检索：用语义向量找最相关的历史文本。
+
+        优先用 384 维 raw 向量查询（高精度）；fallback 用 64 维投影向量
+        （向后兼容旧快照中 64 维条目）；无 raw 向量时退化为投影向量查询。
+
+        参数:
+            text: 查询文本
+        返回:
+            检索到的情景文本列表，或 None（embedder 无 embed_text 方法时）
+        """
+        episodic_texts = None
+        if hasattr(self.embedder, 'embed_text'):
+            sem_vec = self.embedder.embed_text(text)
+            raw_vec = None
+            if hasattr(self.embedder, 'embed_text_raw'):
+                raw_vec = self.embedder.embed_text_raw(text)
+            episodic_query = raw_vec if raw_vec is not None else sem_vec
+            entries = self.memory.recall_episodic(
+                episodic_query, top_k=3, fallback_query=sem_vec)
+            if entries:
+                episodic_texts = [e.text for e in entries]
+        return episodic_texts
+
+    def _auto_snapshot(self) -> None:
+        """自动快照（G4 修复：按间隔自动保存状态）。
+
+        根据配置的间隔，在特定轮次自动保存状态快照。
+        快照目录优先取 config['snapshot_dir']，否则使用
+        core.paths.get_snapshot_dir()（支持 LMS_SNAPSHOT_DIR 环境变量覆盖）。
+        """
         # 7. 自动快照（G4 修复：按间隔自动保存状态）
         if self.config.get('auto_snapshot', False):
             interval = self.config.get('auto_snapshot_interval', 50)
             if self.turn_count > 0 and self.turn_count % interval == 0:
-                snapshot_dir = self.config.get(
-                    'snapshot_dir', '~/.lms/snapshots')
-                snapshot_path = os.path.join(
-                    os.path.expanduser(snapshot_dir),
-                    f'snapshot_{self.turn_count}.pt'
-                )
+                snapshot_dir_cfg = self.config.get('snapshot_dir')
+                if snapshot_dir_cfg:
+                    snapshot_dir_path = Path(snapshot_dir_cfg).expanduser()
+                else:
+                    snapshot_dir_path = get_snapshot_dir()
+                snapshot_path = snapshot_dir_path / f'snapshot_{self.turn_count}.pt'
                 try:
-                    self.save_state(snapshot_path)
+                    self.save_state(str(snapshot_path))
                     logger.info(f"自动快照已保存: {snapshot_path}")
                 except Exception as e:
                     logger.warning(f"自动快照失败: {e}")
-
-        # 8. 返回context
-        return memory_context
 
     def query_llm(self, user_input: str) -> str:
         """使用记忆context查询主LLM。
@@ -458,17 +592,7 @@ class LivingMemoryLoop:
         if self.last_activation is not None:
             recalled = self.memory.recall(self.last_activation.state)
             # 情景记忆检索：优先用 384 维 raw 向量，fallback 用投影向量
-            episodic_texts = None
-            if hasattr(self.embedder, 'embed_text'):
-                sem_vec = self.embedder.embed_text(user_input)
-                raw_vec = None
-                if hasattr(self.embedder, 'embed_text_raw'):
-                    raw_vec = self.embedder.embed_text_raw(user_input)
-                episodic_query = raw_vec if raw_vec is not None else sem_vec
-                entries = self.memory.recall_episodic(
-                    episodic_query, top_k=3, fallback_query=sem_vec)
-                if entries:
-                    episodic_texts = [e.text for e in entries]
+            episodic_texts = self._retrieve_episodic(user_input)
             memory_context = self.decoder.decode(
                 self.last_activation, recalled_memory=recalled,
                 episodic_texts=episodic_texts,
@@ -623,6 +747,11 @@ class LivingMemoryLoop:
             status['self_ref_autocorr'] = sr_status.get('autocorr')
             status['self_ref_state'] = sr_status.get('state', 'normal')
             status['self_ref_ext_novelty'] = sr_status.get('ext_novelty')
+            # Phase 2 新增
+            status['self_ref_dream_stale'] = sr_status.get('dream_stale', False)
+            status['self_ref_dream_age'] = sr_status.get('dream_age', 0)
+            status['self_ref_is_dominant'] = sr_status.get(
+                'is_self_ref_dominant', False)
         else:
             status['self_ref_enabled'] = False
 
@@ -677,21 +806,32 @@ class LivingMemoryLoop:
         """
         dream_engine = self.get_dream_engine()
 
+        # ★ Phase 2: 做梦前钩子——标记自述状态为陈旧
+        if self.self_ref is not None:
+            self.self_ref.on_dream_start()
+
         if full_cycle:
             result = dream_engine.dream_cycle(max_steps=n_steps)
         else:
             result = dream_engine.dream_mvp(n_steps=n_steps)
 
+        # ★ Phase 2: 做梦后钩子——衰减陈旧自述，清除 stale 标记
+        if self.self_ref is not None:
+            self.self_ref.on_dream_end()
+
         # 做梦后自动保存快照（完整状态，含 tokenizer）
+        # 快照目录优先取 config['snapshot_dir']，否则使用
+        # core.paths.get_snapshot_dir()（pathlib.Path 跨平台处理）
         snapshot_saved = False
         try:
-            snapshot_dir = self.config.get(
-                'snapshot_dir', os.path.join(
-                    os.path.dirname(os.path.abspath(__file__)),
-                    '..', 'snapshots'))
-            os.makedirs(snapshot_dir, exist_ok=True)
-            snapshot_path = os.path.join(snapshot_dir, 'latest.pt')
-            self.save_state(snapshot_path)
+            snapshot_dir_cfg = self.config.get('snapshot_dir')
+            if snapshot_dir_cfg:
+                snapshot_dir_path = Path(snapshot_dir_cfg)
+            else:
+                snapshot_dir_path = get_snapshot_dir()
+            snapshot_dir_path.mkdir(parents=True, exist_ok=True)
+            snapshot_path = snapshot_dir_path / 'latest.pt'
+            self.save_state(str(snapshot_path))
             snapshot_saved = True
             logger.info(f"做梦后快照已保存: {snapshot_path}")
         except Exception as e:

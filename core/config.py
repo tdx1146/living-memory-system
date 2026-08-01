@@ -9,6 +9,7 @@
 """
 
 import os
+from pathlib import Path
 from dataclasses import dataclass, fields
 
 
@@ -84,7 +85,7 @@ class CoreConfig:
     precision_min: float = 0.1
     precision_max: float = 10.0
     precision_lr: float = 0.1
-    coherence_threshold: float = 0.5
+    coherence_threshold: float = 0.3
     coherence_direction_weight: float = 0.5
     coherence_magnitude_weight: float = 0.5
     min_history_length: int = 5
@@ -341,7 +342,7 @@ class CoreConfig:
             'decoder_mode': 'text',
             'auto_snapshot': False,
             'auto_snapshot_interval': 50,
-            'snapshot_dir': os.path.expanduser('~/.lms/snapshots'),
+            'snapshot_dir': str(Path.home() / '.lms' / 'snapshots'),
         }
 
     # ================================================================== #

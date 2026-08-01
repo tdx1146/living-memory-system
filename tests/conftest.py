@@ -14,6 +14,12 @@ _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
+
+def pytest_configure(config):
+    """注册自定义 pytest marker。"""
+    config.addinivalue_line(
+        "markers", "slow: 反身性涌现长时实验（运行较慢）")
+
 from core.types import SensoryInput, Activation, PurposeState
 from core.sensory.tokenizer import SimpleTokenizer
 from core.sensory.embedder import SimpleEmbedder

@@ -43,23 +43,16 @@ import mcp.types as types  # noqa: E402
 # ---------------------------------------------------------------------------
 from runtime.config import default_config  # noqa: E402
 from runtime.loop import LivingMemoryLoop  # noqa: E402
-
-logger = logging.getLogger("mcp_memory_server")
-
-# ---------------------------------------------------------------------------
-# 常量
-# ---------------------------------------------------------------------------
-
-# 预训练 sentence-transformers 模型本地缓存路径（modelscope 下载）
-PRETRAINED_MODEL_PATH = (
-    r"C:\Users\dandan\.cache\modelscope\models"
-    r"\sentence-transformers--paraphrase-multilingual-MiniLM-L12-v2"
-    r"\snapshots\master"
+# 共享配置构建逻辑：embedder / LLM API 配置 / 默认 LLM 常量均来自 api.config，
+# 消除与 api/config.py 的重复代码。
+from api.config import (  # noqa: E402
+    build_embedder,
+    build_llm_api_config,
+    DEFAULT_LLM_BASE_URL,
+    DEFAULT_LLM_MODEL,
 )
 
-# 默认 LLM 配置（DeepSeek API）
-DEFAULT_LLM_BASE_URL = "https://api.deepseek.com/v1"
-DEFAULT_LLM_MODEL = "deepseek-chat"
+logger = logging.getLogger("mcp_memory_server")
 
 # ---------------------------------------------------------------------------
 # 全局 LivingMemoryLoop 实例（懒加载）
@@ -71,52 +64,30 @@ _init_error: str | None = None
 def _build_config() -> dict:
     """构建 LivingMemoryLoop 配置字典。
 
-    合并 runtime.default_config()，注入 PretrainedEmbedder（失败时降级为
-    SimpleEmbedder），并按环境变量配置 LLM API 与快照。
+    合并 runtime.default_config()，通过 api.config 共享的 build_embedder()
+    注入 PretrainedEmbedder（失败时降级为 SimpleEmbedder），并通过
+    build_llm_api_config() 按环境变量配置 LLM API 与快照。
     """
     config = default_config()
 
-    # --- Embedder：优先使用预训练语义嵌入器 ---
-    try:
-        from core.sensory.embedder import PretrainedEmbedder
-        model_path = os.environ.get(
-            "LMS_PRETRAINED_MODEL", PRETRAINED_MODEL_PATH)
-        embedder = PretrainedEmbedder(
-            dim=config['input_dim'], model_name=model_path)
-        config['embedder'] = embedder
-        # 预训练 embedder 输出幅度较小，习惯化阈值适配
+    # --- Embedder：从环境变量读取类型，支持 cloud / pretrained / simple ---
+    # 共享构建逻辑见 api.config.build_embedder（支持 cloud/pretrained/simple，
+    # 依赖缺失或加载失败时自动降级）。
+    embedder_type = os.environ.get("LMS_EMBEDDER", "pretrained").strip()
+    embedder = build_embedder(embedder_type, config['input_dim'])
+    config['embedder'] = embedder
+    # 预训练/云端 embedder 输出幅度较小，习惯化阈值适配
+    # （仅当 embedder 提供 embed_text 方法时设置；SimpleEmbedder 不需要）
+    if hasattr(embedder, 'embed_text'):
         config['activation_threshold'] = 0.02
-        logger.info(f"PretrainedEmbedder 已加载，模型路径: {model_path}")
-    except Exception as e:
-        logger.warning(
-            f"PretrainedEmbedder 加载失败（{e}），降级为 SimpleEmbedder")
-        # default_config() 已含 SimpleEmbedder，此处不覆盖
 
     # --- LLM API 配置（可选，工具本身不需要 LLM，但保持系统完整） ---
-    api_key = os.environ.get("DEEPSEEK_API_KEY", "").strip() or \
-        os.environ.get("LMS_LLM_API_KEY", "").strip()
-    if api_key:
-        config['llm_api'] = {
-            'base_url': os.environ.get(
-                "LMS_LLM_BASE_URL", DEFAULT_LLM_BASE_URL),
-            'api_key': api_key,
-            'model': os.environ.get("LMS_LLM_MODEL", DEFAULT_LLM_MODEL),
-            'temperature': 0.7,
-            'max_tokens': 1000,
-            'timeout': 30,
-            'max_retries': 3,
-            'system_prompt': (
-                '你是一个有记忆能力的AI助手。系统会为你提供海马体的记忆context，'
-                '其中包含激活节点信息和长时记忆检索结果，'
-                '这代表了你对此前对话的记忆状态。'
-                '请结合记忆context和当前用户输入来回答问题。'
-                '如果记忆context中有相关信息，请尝试利用它来回答；'
-                '同时保持自然流畅的对话。'
-            ),
-        }
+    # 共享构建逻辑见 api.config.build_llm_api_config()
+    config['llm_api'] = build_llm_api_config(
+        DEFAULT_LLM_BASE_URL, DEFAULT_LLM_MODEL)
+    if config['llm_api']:
         logger.info("LLM API 已配置 (DeepSeek)")
     else:
-        config['llm_api'] = None
         logger.info("未配置 LLM API key，LLM 功能已禁用（工具仍可正常使用）")
 
     # --- 快照配置 ---
