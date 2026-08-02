@@ -83,7 +83,7 @@ def build_embedder(embedder_type: str, input_dim: int):
             from core.sensory.cloud_embedder import CloudEmbedder
             api_url = _get_env(
                 "LMS_CLOUD_EMBED_URL",
-                "http://192.168.0.103:11435/v1/embeddings")
+                "https://11435.tdx1146.cc/v1/embeddings")
             model = _get_env("LMS_CLOUD_EMBED_MODEL", "bge-m3")
             remote_dim = int(_get_env("LMS_CLOUD_EMBED_DIM", "1024"))
             logger.info(
