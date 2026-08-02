@@ -110,6 +110,15 @@ cp .env.example .env
 DEEPSEEK_API_KEY=sk-your-deepseek-api-key-here
 # LMS_LLM_BASE_URL=https://api.deepseek.com/v1
 # LMS_LLM_MODEL=deepseek-chat
+
+# 嵌入器配置（三选一）
+LMS_EMBEDDER=cloud
+# cloud 模式（推荐，需远程 embed 服务）
+LMS_CLOUD_EMBED_URL=https://11435.tdx1146.cc/v1/embeddings
+LMS_CLOUD_EMBED_MODEL=bge-m3
+LMS_CLOUD_EMBED_DIM=1024
+# pretrained 模式（本地加载，无需远程服务）
+# LMS_EMBEDDER=pretrained
 ```
 
 ### 3a. 启动 HTTP API 服务
@@ -220,7 +229,10 @@ loop_config = cfg.to_loop_config()         # 转 loop 配置
 | `LMS_LLM_API_KEY` | （空） | LLM API 密钥（与 `DEEPSEEK_API_KEY` 等效回退） |
 | `LMS_LLM_BASE_URL` | `https://api.deepseek.com/v1` | LLM API 基础 URL |
 | `LMS_LLM_MODEL` | `deepseek-chat` | LLM 模型名 |
-| `LMS_EMBEDDER` | `pretrained` | 嵌入器类型：`pretrained` / `simple` |
+| `LMS_EMBEDDER` | `pretrained` | 嵌入器类型：`cloud` / `pretrained` / `simple` |
+| `LMS_CLOUD_EMBED_URL` | `https://11435.tdx1146.cc/v1/embeddings` | 云端 embed 服务 URL（`cloud` 模式生效） |
+| `LMS_CLOUD_EMBED_MODEL` | `bge-m3` | 云端 embed 模型名（`cloud` 模式生效） |
+| `LMS_CLOUD_EMBED_DIM` | `1024` | 云端 embed 输出维度（`cloud` 模式生效） |
 | `LMS_INPUT_DIM` | 64 | 输入维度 |
 | `LMS_NUM_NODES` | 256 | 节点数 |
 | `LMS_PRETRAINED_MODEL` | 本地缓存路径 | 预训练模型本地路径（覆盖默认缓存） |
@@ -232,8 +244,14 @@ loop_config = cfg.to_loop_config()         # 转 loop 配置
 | `DREAM_CHECK_INTERVAL` | `5` | 调度器检查间隔（秒） |
 | `LMS_*`（其余） | — | 任意 CoreConfig 字段大写加 `LMS_` 前缀，如 `LMS_TEMPERATURE` |
 
-> 预训练 embedder 默认使用 `paraphrase-multilingual-MiniLM-L12-v2`，输出幅度较小，
-> 系统会自动将 `activation_threshold` 适配为 0.02。加载失败时自动降级为 `SimpleEmbedder`。
+> **嵌入器三模式**：
+> - `cloud`（推荐）：通过 HTTP API 调用远程 embedding 服务（如 bge-m3，1024维），语义质量最高。
+>   默认指向 `https://11435.tdx1146.cc/v1/embeddings`，可通过 `LMS_CLOUD_EMBED_*` 环境变量配置。
+> - `pretrained`：本地加载 `paraphrase-multilingual-MiniLM-L12-v2`（384维），无需远程服务，加载失败降级为 `simple`。
+> - `simple`：随机冻结 embedding，无语义先验，仅用于测试。
+>
+> 三种模式均自动将 `activation_threshold` 适配为 0.02（`simple` 除外）。
+> `cloud` 和 `pretrained` 模式均支持 `embed_text_raw()` 原始维度检索，提升语义召回精度。
 
 ## API 端点文档
 
@@ -256,7 +274,7 @@ API 服务由 `api/server.py` 提供，共 10 个端点。简要列表如下，�
 ## MCP 工具说明
 
 MCP 服务器（`mcp_memory_server.py`）通过 stdio 协议向 TRAE IDE 暴露核心能力，
-使 AI 助手能够检索记忆、存储对话、查询状态。详细文档见
+使 AI 助手能够检索记忆、存储对话、查询状态并触发做梦。详细文档见
 [docs/MCP_TOOLS.md](docs/MCP_TOOLS.md)。
 
 | 工具 | 用途 |
@@ -264,6 +282,7 @@ MCP 服务器（`mcp_memory_server.py`）通过 stdio 协议向 TRAE IDE 暴露�
 | `recall_memory` | 语义检索与查询相关的历史对话记忆（top 3） |
 | `store_memory` | 将当前对话存储到记忆系统（执行完整记忆循环并保存快照） |
 | `get_memory_status` | 获取记忆系统运行状态（轮次、熵、惊讶度、precision 等） |
+| `dream_memory` | 触发记忆系统"做梦"（空闲态记忆巩固与整合，可选完整七阶段周期） |
 
 ## 测试
 
@@ -307,6 +326,7 @@ CI 配置位于 `.github/workflows/`：`ci.yml`（Python 3.10/3.11/3.12 矩阵 +
 ├── core/                       # 核心层（海马体模型，纯张量计算）
 │   ├── __init__.py
 │   ├── config.py               # CoreConfig 统一配置（含 validate/from_env）
+│   ├── paths.py                # 跨平台路径管理（pathlib，缓存目录探测）
 │   ├── types.py                # 核心数据类型（SensoryInput/Activation/PurposeState）
 │   ├── hippocampus/            # 海马体子模块
 │   │   ├── __init__.py
@@ -320,6 +340,7 @@ CI 配置位于 `.github/workflows/`：`ci.yml`（Python 3.10/3.11/3.12 矩阵 +
 │   └── sensory/                # 感官层
 │       ├── __init__.py
 │       ├── embedder.py         # 嵌入器（Pretrained / Simple）
+│       ├── cloud_embedder.py   # 云端嵌入器（CloudEmbedder，HTTP API 调用远程 embed 服务）
 │       └── tokenizer.py        # 分词器
 ├── docs/                       # 文档
 │   ├── API.md                  # HTTP API 详细文档
@@ -358,7 +379,8 @@ CI 配置位于 `.github/workflows/`：`ci.yml`（Python 3.10/3.11/3.12 矩阵 +
 | 深度学习 | PyTorch 2.0+ | 吸引子网络张量计算、FEP 推断与学习 |
 | 数值计算 | NumPy | 辅助数值运算 |
 | Web 框架 | FastAPI + Uvicorn | HTTP API 服务层 |
-| 语义嵌入 | sentence-transformers | 感官层多语言语义嵌入（`paraphrase-multilingual-MiniLM-L12-v2`） |
+| 语义嵌入 | sentence-transformers | 感官层多语言语义嵌入（`paraphrase-multilingual-MiniLM-L12-v2`，384维） |
+| 语义嵌入（云端） | bge-m3 via HTTP API | 远程 embedding 服务（1024维，通过 `CloudEmbedder` 调用） |
 | LLM 接口 | OpenAI SDK | LLM 调用（OpenAI 兼容格式，默认 DeepSeek） |
 | 协议层 | MCP (Model Context Protocol) 2.0 | 向 TRAE IDE 暴露记忆能力（stdio 传输） |
 | 测试 | pytest | 单元测试与集成测试 |
