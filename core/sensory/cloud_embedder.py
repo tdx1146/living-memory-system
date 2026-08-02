@@ -123,6 +123,30 @@ class CloudEmbedder(Embedder):
             f"Embed API 调用失败（已重试{self._retries}次）：{last_exc}"
         )
 
+    def embed_text_raw(self, text: str) -> torch.Tensor:
+        """原始文本 -> 远程 API 的原始向量（L2归一化后，不投影）。
+
+        与 PretrainedEmbedder.embed_text_raw 对应，返回 remote_dim 维向量，
+        供 recall_episodic 做高精度原始维度检索。缓存与 embed_text 共享。
+
+        参数:
+            text: 原始文本字符串。
+
+        返回:
+            形状 [remote_dim] 的归一化向量。空文本返回零向量。
+        """
+        if not text or not text.strip():
+            return torch.zeros(self._remote_dim, dtype=torch.float32)
+
+        # 先查缓存（embed_text 已缓存投影向量，这里需要重新获取原始向量）
+        # 由于缓存存的是投影后的向量，raw 需要单独调用 API
+        raw = self._call_api(text.strip())
+        raw_vector = torch.tensor(raw, dtype=torch.float32)
+        raw_norm = raw_vector.norm()
+        if raw_norm > 0:
+            raw_vector = raw_vector / raw_norm
+        return raw_vector
+
     def embed_text(self, text: str) -> torch.Tensor:
         """原始文本 -> 感官向量（通过远程 API 编码 + 随机投影）。
 
@@ -147,7 +171,13 @@ class CloudEmbedder(Embedder):
         raw = self._call_api(text.strip())
         raw_vector = torch.tensor(raw, dtype=torch.float32)
 
+        # L2 归一化原始向量（消除不同模型幅度差异）
+        raw_norm = raw_vector.norm()
+        if raw_norm > 0:
+            raw_vector = raw_vector / raw_norm
+
         # 随机投影：[remote_dim] @ [remote_dim, dim] -> [dim]
+        # Johnson-Lindenstrauss 缩放使投影后幅度与 MiniLM 相当（~0.4）
         vector = raw_vector @ self._projection
 
         # 填充 LRU 缓存
@@ -175,3 +205,8 @@ class CloudEmbedder(Embedder):
     def dim(self) -> int:
         """embedding 维度。"""
         return self._dim
+
+    @property
+    def raw_dim(self) -> int:
+        """远程 API 原始输出维度（投影前）。"""
+        return self._remote_dim
