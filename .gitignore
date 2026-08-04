@@ -31,3 +31,4 @@ Thumbs.db
 # Snapshots (runtime data, not source)
 *.pt
 snapshots/
+*.bak
