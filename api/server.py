@@ -23,6 +23,7 @@ run_in_executor 将阻塞调用交给线程池，避免阻塞事件循环。
 import os
 import asyncio
 import logging
+import time
 from datetime import datetime
 from typing import Optional
 
@@ -121,6 +122,42 @@ class RestoreRequest(BaseModel):
 class DreamRequest(BaseModel):
     steps: int = Field(20, description="做梦步数")
     full_cycle: bool = Field(False, description="是否启用完整七阶段周期")
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 / D0：总线事件喂入（只喂不指挥）
+# ---------------------------------------------------------------------------
+class FeedRequest(BaseModel):
+    text: str = Field(..., description="总线事件文本摘要（喂入塑形输入侧）")
+    session_id: str = Field("bus", description="会话标识（默认 bus，与总线隔离）")
+    source: str = Field("event_bus", description="事件来源标记")
+
+
+class FeedResponse(BaseModel):
+    status: str = Field("ok", description="处理状态")
+    entropy: float = Field(0.0, description="本轮回塑形后的激活熵")
+    surprise: float = Field(0.0, description="本轮回塑形后的惊讶度")
+    turn_count: int = Field(0, description="该会话累计轮次")
+    session_id: str = Field(..., description="会话标识")
+
+
+# /feed 限流状态（默认 ≤10 次/分钟，防总线风暴；LMS_FEED_RATE_LIMIT 可覆盖）
+_feed_rate = {"window_start": 0.0, "count": 0}
+_feed_rate_lock = asyncio.Lock()
+_FEED_RATE_LIMIT = int(os.environ.get("LMS_FEED_RATE_LIMIT", "10"))
+_FEED_RATE_WINDOW = 60.0
+
+
+async def _feed_rate_limited() -> bool:
+    """滑动窗口限流：窗口内超过上限返回 True（429）。"""
+    global _feed_rate
+    now = time.time()
+    async with _feed_rate_lock:
+        if now - _feed_rate["window_start"] >= _FEED_RATE_WINDOW:
+            _feed_rate["window_start"] = now
+            _feed_rate["count"] = 0
+        _feed_rate["count"] += 1
+        return _feed_rate["count"] > _FEED_RATE_LIMIT
 
 
 # ---------------------------------------------------------------------------
@@ -274,6 +311,58 @@ async def chat_simple(req: SimpleChatRequest):
     return SimpleChatResponse(
         response=response_text,
         memory_status=memory_status,
+    )
+
+
+@app.post("/feed", response_model=FeedResponse)
+async def feed(req: FeedRequest):
+    """总线事件喂入端点（Phase 4 / D0 方向 1：只喂不指挥）。
+
+    把总线事件文本摘要送入 LMS 塑形输入侧（process_turn），
+    塑形但不产 LLM 回复（process_turn 返回的记忆 context 直接丢弃）。
+    LMS 内部如何塑形（权重/吸引子演化）是它自己的事，总线不指挥。
+
+    - 限流：默认 ≤10 次/分钟（LMS_FEED_RATE_LIMIT 可覆盖），超限 429
+    - 与 /chat 等现有端点完全独立，互不影响
+    - 做梦协调：与对话请求同等对待（等待做梦完成），防止并发写记忆状态
+    """
+    if not req.text or not req.text.strip():
+        raise HTTPException(status_code=400, detail="text 不能为空")
+
+    if await _feed_rate_limited():
+        raise HTTPException(
+            status_code=429,
+            detail=f"feed 限流：超过 {_FEED_RATE_LIMIT} 次/分钟，请稍后重试",
+        )
+
+    sm = get_session_manager()
+    scheduler = get_dream_scheduler()
+    loop = sm.get_or_create(req.session_id)
+    scheduler.register_session(req.session_id)
+
+    acquired = scheduler.acquire_conversation(req.session_id)
+    scheduler.touch(req.session_id)
+    if not acquired:
+        raise HTTPException(
+            status_code=503,
+            detail="系统正在做梦（记忆巩固中），请稍后重试。")
+    try:
+        # 塑形但不产 LLM 回复：返回值是记忆 context，直接丢弃
+        await asyncio.get_event_loop().run_in_executor(
+            None, lambda: loop.process_turn(req.text, llm_output=""))
+        status = loop.get_status()
+        logger.info(
+            f"[{req.session_id}] /feed 塑形完成 "
+            f"(source={req.source}, text_len={len(req.text)})")
+    finally:
+        scheduler.release_conversation(req.session_id)
+
+    return FeedResponse(
+        status="ok",
+        entropy=float(status.get("last_entropy", 0.0) or 0.0),
+        surprise=float(status.get("last_surprise", 0.0) or 0.0),
+        turn_count=int(status.get("turn_count", 0) or 0),
+        session_id=req.session_id,
     )
 
 

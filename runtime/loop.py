@@ -11,6 +11,7 @@
 
 import os
 import math
+import time
 import logging
 from pathlib import Path
 from typing import Optional
@@ -393,6 +394,9 @@ class LivingMemoryLoop:
         # 7. 自动快照（G4 修复：按间隔自动保存状态）—— 提取为 _auto_snapshot
         self._auto_snapshot()
 
+        # ★ Phase 4 钩子：塑形状态反哺总线（外围、静默降级，绝不影响主循环）
+        self._maybe_publish_plastified(activation)
+
         # 8. 返回context
         return memory_context
 
@@ -451,6 +455,12 @@ class LivingMemoryLoop:
         )
         if self.self_ref is not None:
             self.self_ref.last_is_self_ref_dominant = is_self_ref_dominant
+
+        # ★ Phase 4 钩子：self_ref 蒸馏摘要发布（默认关闭，受开关+限频控制）
+        # 看护人式：只观察+有限回应，不内部改写自指回路本体；
+        # 发布内容为"蒸馏后的可发布摘要"（≤200字）+ 护栏状态，软参考信号。
+        if self.self_ref is not None and echo is not None:
+            self._maybe_publish_self_ref(echo)
 
         return sensory_input, alpha_t, is_self_ref_dominant
 
@@ -525,6 +535,89 @@ class LivingMemoryLoop:
             logger.info(f"在线熵管理: 熵={entropy:.3f}(ratio={entropy_ratio:.2f}) 过低，放松正交化")
 
         return entropy_ratio
+
+    def _maybe_publish_plastified(self, activation) -> None:
+        """Phase 4 钩子：按间隔发布 lms.plastified（只发数值摘要，不发原始激活态）。
+
+        用实例计数（turn_count % interval）控制，不加线程；
+        间隔默认 10 轮，可用环境变量 LMS_PLASTIFIED_INTERVAL 覆盖。
+        任何异常静默降级，绝不影响主循环（熔断由 bus_events 内部管理）。
+        """
+        try:
+            interval = int(os.environ.get(
+                "LMS_PLASTIFIED_INTERVAL",
+                str(self.config.get("lms_plastified_interval", 10))))
+        except (TypeError, ValueError):
+            interval = 10
+        if interval <= 0 or self.turn_count % interval != 0:
+            return
+        try:
+            from runtime.bus_events import publish_plastified
+            precision = self.purpose.get_purpose().precision
+            active_nodes = 0
+            if hasattr(activation, "state") and activation.state is not None:
+                try:
+                    active_nodes = int((activation.state > 0.0).sum().item())
+                except Exception:
+                    active_nodes = 0
+            state = {
+                "turn_count": self.turn_count,
+                "entropy": float(getattr(activation, "entropy", 0.0) or 0.0),
+                "surprise": float(getattr(activation, "surprise", 0.0) or 0.0),
+                "entropy_ratio": float(
+                    getattr(self, "last_entropy_ratio", 0.0) or 0.0),
+                "active_nodes": active_nodes,
+                "precision_mean": float(precision.mean()),
+                "precision_std": float(precision.std()),
+                "coherence": float(self.purpose.coherence),
+            }
+            publish_plastified(state)
+        except Exception as e:
+            # 外围钩子最后一道防线：绝不影响主循环
+            logger.debug("Phase 4 plastified 发布跳过（静默降级）: %s", e)
+
+    def _maybe_publish_self_ref(self, echo: dict) -> None:
+        """Phase 4 钩子：self_ref 蒸馏摘要发布（最敏感，默认关闭）。
+
+        只发"蒸馏后的可发布摘要"：取自自指回路已蒸馏的 self_voice 文本
+        （≤200 字，由 bus_events 裁剪）+ 护栏状态数值摘要。
+        开关 LMS_SELF_REF_PUBLISH 默认 off；开启后限频 ≥30 分钟一条。
+        任何异常静默降级，绝不影响自指回路本体。
+        """
+        try:
+            from runtime.bus_events import publish_self_ref
+            summary = ""
+            history = getattr(self.self_ref, "self_voice_history", None)
+            if history:
+                summary = history[-1]
+            guard = {
+                "state": echo.get("state", "normal"),
+                "alpha": echo.get("alpha", 0.0),
+                "autocorr": echo.get("autocorr"),
+                "ext_novelty": echo.get("ext_novelty"),
+                "echo_similarity": echo.get("echo_similarity"),
+                "coherence": float(self.purpose.coherence),
+                "entropy_ratio": float(
+                    getattr(self, "last_entropy_ratio", 0.0) or 0.0),
+            }
+            publish_self_ref(summary, guard)
+        except Exception as e:
+            logger.debug("Phase 4 self_ref 发布跳过（静默降级）: %s", e)
+
+    def _maybe_publish_dream_complete(self, result: dict, duration: float) -> None:
+        """Phase 4 钩子：发布 lms.dream_complete（步数/耗时/结果，可观测性信号）。
+
+        任何异常静默降级，绝不影响做梦结果返回（熔断由 bus_events 内部管理）。
+        """
+        try:
+            from runtime.bus_events import publish_dream_complete
+            publish_dream_complete({
+                "steps": int(result.get("steps", 0) or 0),
+                "duration_seconds": round(float(duration), 3),
+                "snapshot_saved": bool(result.get("snapshot_saved", False)),
+            })
+        except Exception as e:
+            logger.debug("Phase 4 dream_complete 发布跳过（静默降级）: %s", e)
 
     def _retrieve_episodic(self, text: str) -> list[str] | None:
         """情景记忆检索：用语义向量找最相关的历史文本。
@@ -806,6 +899,9 @@ class LivingMemoryLoop:
         """
         dream_engine = self.get_dream_engine()
 
+        # ★ Phase 4: 记录做梦开始时间（仅用于外围发布钩子，不影响算法）
+        _dream_t0 = time.time()
+
         # ★ Phase 2: 做梦前钩子——标记自述状态为陈旧
         if self.self_ref is not None:
             self.self_ref.on_dream_start()
@@ -814,6 +910,7 @@ class LivingMemoryLoop:
             result = dream_engine.dream_cycle(max_steps=n_steps)
         else:
             result = dream_engine.dream_mvp(n_steps=n_steps)
+        _dream_duration = time.time() - _dream_t0
 
         # ★ Phase 2: 做梦后钩子——衰减陈旧自述，清除 stale 标记
         if self.self_ref is not None:
@@ -838,4 +935,8 @@ class LivingMemoryLoop:
             logger.warning(f"做梦后快照保存失败（不影响做梦结果）: {e}")
 
         result['snapshot_saved'] = snapshot_saved
+
+        # ★ Phase 4 钩子：做梦完成反哺总线（外围、静默降级，绝不影响主循环）
+        self._maybe_publish_dream_complete(result, _dream_duration)
+
         return result
