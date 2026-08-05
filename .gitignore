@@ -31,4 +31,7 @@ Thumbs.db
 # Snapshots (runtime data, not source)
 *.pt
 snapshots/
-*.bak
+*.bak*
+
+# 运行时日志
+logs/

@@ -212,6 +212,12 @@ def get_api_config() -> dict:
     config['self_ref_enabled'] = (
         _get_env("LMS_SELF_REF_ENABLED", "false").lower() == "true")
 
+    # --- 自指回路 LLM 增强蒸馏（Phase 3.3；默认关闭，开启后每 interval 轮调一次 LLM）---
+    config['self_ref_llm_distill_enabled'] = (
+        _get_env("LMS_SELF_REF_LLM_DISTILL_ENABLED", "false").lower() == "true")
+    config['self_ref_llm_distill_interval'] = int(
+        _get_env("LMS_SELF_REF_LLM_DISTILL_INTERVAL", "5"))
+
     # --- 快照配置 ---
     config['auto_snapshot'] = True
     config['auto_snapshot_interval'] = 50

@@ -471,6 +471,37 @@ async def list_sessions():
     }
 
 
+@app.get("/self-ref/voice")
+async def self_ref_voice(session_id: str = "main", limit: int = 5):
+    """返回指定 session 的自指回路最近自述（反思产物，供上层注入上下文）。
+
+    设计（反思回流，2026-08-05）：
+      - 数据源：SelfReferentialLoop.self_voice_history（内存，最近优先）；
+      - 未启用/无历史 → 返回空列表，绝不报错（fail-open）；
+      - limit 钳制到 [1, 20]。
+    """
+    sm = get_session_manager()
+    loop = sm.get(session_id)
+    if loop is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"会话 '{session_id}' 不存在",
+        )
+    self_ref = getattr(loop, "self_ref", None)
+    if self_ref is None:
+        return {"session_id": session_id, "enabled": False, "count": 0, "voices": []}
+    history = list(getattr(self_ref, "self_voice_history", None) or [])
+    limit = max(1, min(int(limit), 20))
+    voices = history[-limit:][::-1]  # 最近在前
+    return {
+        "session_id": session_id,
+        "enabled": True,
+        "count": len(voices),
+        "voices": voices,
+        "last_echo_similarity": getattr(self_ref, "last_echo_similarity", None),
+    }
+
+
 @app.delete("/sessions/{session_id}")
 async def delete_session(session_id: str):
     """删除指定 session。"""

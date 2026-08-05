@@ -279,6 +279,9 @@ class LLMSelfVoiceDistiller:
         response = self.llm_bridge.query_simple(
             prompt, max_tokens=self.max_tokens,
             timeout=self.timeout)
+        if response and response.strip():
+            logger.info(
+                f"LLM distill OK: {response.strip()[:60]}")
         return response.strip() if response else None
 
 
