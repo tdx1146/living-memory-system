@@ -45,7 +45,8 @@ class CloudEmbedder(Embedder):
                  model: Optional[str] = None,
                  cache_size: int = 512,
                  timeout: float = 30.0,
-                 retries: int = 3) -> None:
+                 retries: int = 3,
+                 fallback_url: Optional[str] = None) -> None:
         """初始化云端嵌入器。
 
         参数:
@@ -56,10 +57,13 @@ class CloudEmbedder(Embedder):
             cache_size: 文本嵌入结果 LRU 缓存大小，0 表示不缓存。
             timeout: HTTP 请求超时秒数。
             retries: 失败重试次数。
+            fallback_url: 备用 Embed API URL（主 URL 重试耗尽后自动切换，
+                仅本机部署通过环境变量注入；默认 None=不启用）。
         """
         self._dim = dim
         self._remote_dim = remote_dim
         self._api_url = api_url
+        self._fallback_url = fallback_url
         self._model = model
         self._timeout = timeout
         self._retries = retries
@@ -123,6 +127,20 @@ class CloudEmbedder(Embedder):
             f"Embed API 调用失败（已重试{self._retries}次）：{last_exc}"
         )
 
+    def _call_api_with_fallback(self, text: str) -> list[float]:
+        """主 URL 优先，失败自动切 fallback（LAN 直连 → 隧道兜底）。"""
+        try:
+            return self._call_api(text)
+        except RuntimeError:
+            if self._fallback_url and self._fallback_url != self._api_url:
+                orig = self._api_url
+                self._api_url, self._fallback_url = self._fallback_url, None
+                try:
+                    return self._call_api(text)
+                finally:
+                    self._api_url = orig
+            raise
+
     def embed_text_raw(self, text: str) -> torch.Tensor:
         """原始文本 -> 远程 API 的原始向量（L2归一化后，不投影）。
 
@@ -140,7 +158,7 @@ class CloudEmbedder(Embedder):
 
         # 先查缓存（embed_text 已缓存投影向量，这里需要重新获取原始向量）
         # 由于缓存存的是投影后的向量，raw 需要单独调用 API
-        raw = self._call_api(text.strip())
+        raw = self._call_api_with_fallback(text.strip())
         raw_vector = torch.tensor(raw, dtype=torch.float32)
         raw_norm = raw_vector.norm()
         if raw_norm > 0:
@@ -168,7 +186,7 @@ class CloudEmbedder(Embedder):
                 return self._cache[text]
 
         # 调用 API
-        raw = self._call_api(text.strip())
+        raw = self._call_api_with_fallback(text.strip())
         raw_vector = torch.tensor(raw, dtype=torch.float32)
 
         # L2 归一化原始向量（消除不同模型幅度差异）

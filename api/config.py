@@ -18,6 +18,8 @@
     LMS_CLOUD_EMBED_URL   -- 云端 embed 服务 URL（LMS_EMBEDDER=cloud 时生效）
     LMS_CLOUD_EMBED_MODEL -- 云端 embed 模型名（如 bge-m3）
     LMS_CLOUD_EMBED_DIM   -- 云端 embed 输出维度（如 1024）
+    LMS_CLOUD_EMBED_FALLBACK_URL -- 备用 embed URL（主 URL 失败自动切换；本机 LAN→隧道）
+    LMS_SELF_REF_ENABLED  -- 自指回路开关（默认 false；测试期开启，每日复核是否关闭）
     LMS_INPUT_DIM         -- 输入维度（默认 64）
     LMS_NUM_NODES         -- 节点数（默认 256）
     LMS_PRETRAINED_MODEL  -- 预训练模型本地路径（覆盖默认缓存路径）
@@ -89,6 +91,7 @@ def build_embedder(embedder_type: str, input_dim: int):
             logger.info(
                 f"使用 CloudEmbedder，API: {api_url}, "
                 f"模型: {model}, 维度: {remote_dim}")
+            fallback_url = _get_env("LMS_CLOUD_EMBED_FALLBACK_URL", "") or None
             return CloudEmbedder(
                 api_url=api_url,
                 dim=input_dim,
@@ -97,6 +100,7 @@ def build_embedder(embedder_type: str, input_dim: int):
                 timeout=5.0,      # 内网低延迟
                 retries=1,         # 内网稳定
                 cache_size=1024,   # 手机稳定，增大缓存
+                fallback_url=fallback_url,  # LAN 直连失败自动切隧道（仅本机注入）
             )
         except Exception as e:
             logger.warning(f"CloudEmbedder 失败（{e}），尝试 pretrained")
@@ -203,6 +207,10 @@ def get_api_config() -> dict:
         logger.warning(
             "未检测到 DEEPSEEK_API_KEY / LMS_LLM_API_KEY，"
             "LLM 功能已禁用（/chat 仅返回记忆 context）")
+
+    # --- 自指回路（默认关闭；dandan 看护人式决策：仅测试期开启，每日复核）---
+    config['self_ref_enabled'] = (
+        _get_env("LMS_SELF_REF_ENABLED", "false").lower() == "true")
 
     # --- 快照配置 ---
     config['auto_snapshot'] = True

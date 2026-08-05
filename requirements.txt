@@ -10,6 +10,9 @@ numpy>=1.21
 # LLM API客户端（OpenAI兼容格式）
 openai>=1.0
 
+# HTTP 客户端（core/sensory/cloud_embedder.py 依赖；Phase 7 Docker 化修复）
+requests>=2.31
+
 # 预训练语义嵌入（感官层，可选但推荐）
 sentence-transformers>=2.2
 
