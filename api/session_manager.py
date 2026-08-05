@@ -67,6 +67,9 @@ class SessionManager:
             if session_id not in self._sessions:
                 # 新建 session
                 cfg = dict(config) if config else self._default_config_factory()
+                # 注入 session_id：供 per-session 持久化使用
+                # （如 self_voice 自述文件按会话隔离），对记忆环本体无副作用
+                cfg['session_id'] = session_id
                 logger.info(f"创建新会话: {session_id}")
                 loop = LivingMemoryLoop(cfg)
                 self._sessions[session_id] = loop

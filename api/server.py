@@ -477,19 +477,24 @@ async def self_ref_voice(session_id: str = "main", limit: int = 5):
 
     设计（反思回流，2026-08-05）：
       - 数据源：SelfReferentialLoop.self_voice_history（内存，最近优先）；
+      - 会话不存在时惰性创建（与 /chat 一致）：重启后首次读取也能工作；
+      - 内存优先：读取前先 backfill_voice_history() 从持久层合并缺失条目
+        （纯文本回填，绝不回注嵌入 → 无循环）；
       - 未启用/无历史 → 返回空列表，绝不报错（fail-open）；
       - limit 钳制到 [1, 20]。
     """
     sm = get_session_manager()
-    loop = sm.get(session_id)
-    if loop is None:
-        raise HTTPException(
-            status_code=404,
-            detail=f"会话 '{session_id}' 不存在",
-        )
+    loop = sm.get_or_create(session_id)
     self_ref = getattr(loop, "self_ref", None)
     if self_ref is None:
-        return {"session_id": session_id, "enabled": False, "count": 0, "voices": []}
+        return {"session_id": session_id, "enabled": False, "count": 0,
+                "voices": []}
+    # 持久层回填（内存优先：仅合并内存中缺失的条目；
+    # 重启后内存为空时自动恢复历史）
+    try:
+        self_ref.backfill_voice_history()
+    except Exception as e:  # pylint: disable=broad-except
+        logger.warning(f"[{session_id}] self_voice 回填失败（忽略）: {e}")
     history = list(getattr(self_ref, "self_voice_history", None) or [])
     limit = max(1, min(int(limit), 20))
     voices = history[-limit:][::-1]  # 最近在前
@@ -498,6 +503,8 @@ async def self_ref_voice(session_id: str = "main", limit: int = 5):
         "enabled": True,
         "count": len(voices),
         "voices": voices,
+        "persisted_count": int(getattr(
+            self_ref, "persisted_voice_count", lambda: 0)()),
         "last_echo_similarity": getattr(self_ref, "last_echo_similarity", None),
     }
 

@@ -20,6 +20,19 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers", "slow: 反身性涌现长时实验（运行较慢）")
 
+
+@pytest.fixture(scope="session", autouse=True)
+def _self_voice_persist_dir(tmp_path_factory):
+    """把 self_voice 持久化目录重定向到临时目录。
+
+    自指回路默认将自述持久化到仓库 data/self_voice/；测试环境统一
+    重定向到 pytest 临时目录，避免测试运行写脏仓库（行为零影响：
+    显式传入 cfg 路径的测试优先于环境变量）。
+    """
+    tmp = tmp_path_factory.mktemp("self_voice")
+    os.environ["LMS_SELF_VOICE_DIR"] = str(tmp)
+    yield tmp
+
 from core.types import SensoryInput, Activation, PurposeState
 from core.sensory.tokenizer import SimpleTokenizer
 from core.sensory.embedder import SimpleEmbedder

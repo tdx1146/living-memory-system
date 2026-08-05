@@ -29,8 +29,11 @@ Phase 1 稳定性保护层:
 参考：docs/SELF_REF_INTEGRATED_DESIGN.md
 """
 
+import json
 import logging
 import math
+import os
+import time
 from typing import List, Optional, Union
 
 import torch
@@ -833,6 +836,12 @@ class SelfReferentialLoop:
                 - ``self_ref_noise_strength``（默认 0.1，正交噪声强度）
                 - ``self_ref_ext_priority_threshold``（默认 0.5，L5 触发阈值）
                 - ``self_ref_ext_priority_factor``（默认 0.3，L5 衰减因子）
+                - ``session_id``（默认 "main"，自述持久化按会话隔离）
+                - ``self_ref_voice_persist_path``（自述 JSONL 持久化文件路径；
+                  显式 ``False``/空串 可禁用；缺省回退环境变量
+                  ``LMS_SELF_VOICE_PATH`` / ``LMS_SELF_VOICE_DIR``，
+                  再回退仓库默认 ``data/self_voice/``，见
+                  :meth:`_resolve_voice_persist_path`）
 
             device: 计算设备（E-P2-1）。支持 ``"auto"``/``"cpu"``/``"cuda"``
                 /``"cuda:0"`` 或 ``torch.device``。缓存的自述向量将创建在
@@ -859,6 +868,14 @@ class SelfReferentialLoop:
         self.history_capacity: int = int(
             history_cap if history_cap is not None
             else cfg.get("self_ref_history_cap", 20))
+
+        # 自述持久化（Phase 3.4 反思回流收尾，2026-08-05）
+        # 自述文本跨重启持久到 JSONL（只写不读回 → 无循环）；
+        # 路径解析优先级：cfg 显式 > 环境变量 > 仓库默认（详见
+        # _resolve_voice_persist_path）。None 表示禁用持久化。
+        self._session_id: str = str(cfg.get("session_id", "main") or "main")
+        self.voice_persist_path: Optional[str] = (
+            self._resolve_voice_persist_path(cfg))
 
         # Phase 1 配置参数
         self_ref_autocorr_lag = int(
@@ -1234,6 +1251,129 @@ class SelfReferentialLoop:
         }
 
     # ------------------------------------------------------------------ #
+    #  自述持久化（Phase 3.4 反思回流收尾，2026-08-05）
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _resolve_voice_persist_path(cfg: dict) -> Optional[str]:
+        """解析自述持久化文件路径（JSONL）。
+
+        优先级（显式 > 环境变量 > 仓库默认）：
+          1. ``cfg['self_ref_voice_persist_path']``（显式文件路径；
+             显式 ``False`` / 空串 可禁用持久化）
+          2. 环境变量 ``LMS_SELF_VOICE_PATH``（显式文件路径）
+          3. 环境变量 ``LMS_SELF_VOICE_DIR``（目录，文件名为
+             ``self_voice_{session_id}.jsonl``）
+          4. 默认 ``<仓库根>/data/self_voice/self_voice_{session_id}.jsonl``
+
+        返回:
+            文件路径字符串；解析失败/显式禁用时返回 None（不持久化）。
+        """
+        explicit = cfg.get("self_ref_voice_persist_path")
+        if explicit is False or explicit == "":
+            return None
+        if isinstance(explicit, str) and explicit.strip():
+            return explicit.strip()
+
+        env_path = os.environ.get("LMS_SELF_VOICE_PATH", "").strip()
+        if env_path:
+            return env_path
+
+        session_id = str(cfg.get("session_id", "main") or "main")
+        env_dir = os.environ.get("LMS_SELF_VOICE_DIR", "").strip()
+        if env_dir:
+            return os.path.join(env_dir, f"self_voice_{session_id}.jsonl")
+
+        repo_root = os.path.dirname(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        return os.path.join(
+            repo_root, "data", "self_voice",
+            f"self_voice_{session_id}.jsonl")
+
+    def _persist_voice(self, text: str) -> None:
+        """把一条自述追加到持久化 JSONL（只写不读回 → 无循环）。
+
+        记录结构: ``{"ts": 秒, "session_id": ..., "text": ...}``。
+        任何异常静默降级（fail-open），绝不影响 observe 主流程。
+        """
+        if not self.voice_persist_path or not text or not text.strip():
+            return
+        try:
+            os.makedirs(os.path.dirname(self.voice_persist_path),
+                        exist_ok=True)
+            record = {
+                "ts": time.time(),
+                "session_id": self._session_id,
+                "text": text,
+            }
+            with open(self.voice_persist_path, "a",
+                      encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+                f.flush()
+        except Exception as e:  # pylint: disable=broad-except
+            logger.warning("self_voice 持久化失败（静默降级）: %s", e)
+
+    def persisted_voice_count(self) -> int:
+        """返回持久化文件中的自述条目数（fail-open 返回 0）。"""
+        if not self.voice_persist_path or not os.path.exists(
+                self.voice_persist_path):
+            return 0
+        try:
+            with open(self.voice_persist_path, "r",
+                      encoding="utf-8") as f:
+                return sum(1 for line in f if line.strip())
+        except Exception as e:  # pylint: disable=broad-except
+            logger.warning("self_voice 计数失败（静默降级）: %s", e)
+            return 0
+
+    def backfill_voice_history(self) -> int:
+        """从持久化文件回填自述历史（纯文本，不回注嵌入 → 无循环）。
+
+        语义:
+          - 只读文件中的 ``text`` 字段；
+          - 内存优先：与内存现有历史按文本去重，缺失条目按文件顺序追加；
+          - 追加后裁剪到 ``history_capacity``；
+          - 绝不触碰 ``sensory_self_prev`` / 嵌入缓存 / 编码器——
+            回填只恢复"读"侧历史，不会触发新一轮反思或回注。
+
+        返回:
+            本次回填的条目数（fail-open 返回 0）。
+        """
+        if not self.voice_persist_path or not os.path.exists(
+                self.voice_persist_path):
+            return 0
+        try:
+            memory_seen = set(self.self_voice_history)
+            added: List[str] = []
+            with open(self.voice_persist_path, "r",
+                      encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        record = json.loads(line)
+                    except Exception:  # pylint: disable=broad-except
+                        continue  # 跳过损坏行，不阻塞回填
+                    text = (record.get("text")
+                            if isinstance(record, dict) else None)
+                    if not isinstance(text, str) or not text.strip():
+                        continue
+                    if text in memory_seen:
+                        continue  # 内存已有（内存优先）
+                    added.append(text)
+            if added:
+                before = len(self.self_voice_history)
+                self.self_voice_history.extend(added)
+                self._trim(self.self_voice_history)
+                # 返回实际留在内存中的新增条数（裁剪后可能少于 added）
+                return max(0, len(self.self_voice_history) - before)
+            return 0
+        except Exception as e:  # pylint: disable=broad-except
+            logger.warning("self_voice 回填失败（静默降级）: %s", e)
+            return 0
+
+    # ------------------------------------------------------------------ #
     #  观测与状态更新
     # ------------------------------------------------------------------ #
 
@@ -1292,6 +1432,11 @@ class SelfReferentialLoop:
         # 5. 自述文本历史
         self.self_voice_history.append(self_voice_text)
         self._trim(self.self_voice_history)
+
+        # 5.1 自述持久化（Phase 3.4：只写不读回，防循环；
+        # 空自述不落盘；失败静默降级，绝不影响主流程）
+        if self_voice_text and self_voice_text.strip():
+            self._persist_voice(self_voice_text)
 
         # Phase 1: 更新 activation_history 并馈入 Tier 1 控制器
         # activation 是当前轮的激活态。先追加到历史，再用不含当前元素
