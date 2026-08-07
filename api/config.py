@@ -97,8 +97,8 @@ def build_embedder(embedder_type: str, input_dim: int):
                 dim=input_dim,
                 remote_dim=remote_dim,
                 model=model,
-                timeout=5.0,      # 内网低延迟
-                retries=1,         # 内网稳定
+                timeout=30.0,     # 公网环境（11435.tdx1146.cc 延迟波动 0.4-2.5s）
+                retries=3,         # 公网环境（11435 间歇 reset，需重试）
                 cache_size=1024,   # 手机稳定，增大缓存
                 fallback_url=fallback_url,  # LAN 直连失败自动切隧道（仅本机注入）
             )

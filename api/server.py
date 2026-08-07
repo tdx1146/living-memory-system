@@ -480,7 +480,6 @@ async def self_ref_voice(session_id: str = "main", limit: int = 5):
       - 会话不存在时惰性创建（与 /chat 一致）：重启后首次读取也能工作；
       - 内存优先：读取前先 backfill_voice_history() 从持久层合并缺失条目
         （纯文本回填，绝不回注嵌入 → 无循环）；
- (feat: 反思回流 — /self-ref/voice 端点(自述读取) + LLM蒸馏环境变量映射 + 成功日志)
       - 未启用/无历史 → 返回空列表，绝不报错（fail-open）；
       - limit 钳制到 [1, 20]。
     """
@@ -496,7 +495,6 @@ async def self_ref_voice(session_id: str = "main", limit: int = 5):
         self_ref.backfill_voice_history()
     except Exception as e:  # pylint: disable=broad-except
         logger.warning(f"[{session_id}] self_voice 回填失败（忽略）: {e}")
- (feat: 反思回流 — /self-ref/voice 端点(自述读取) + LLM蒸馏环境变量映射 + 成功日志)
     history = list(getattr(self_ref, "self_voice_history", None) or [])
     limit = max(1, min(int(limit), 20))
     voices = history[-limit:][::-1]  # 最近在前
@@ -507,7 +505,6 @@ async def self_ref_voice(session_id: str = "main", limit: int = 5):
         "voices": voices,
         "persisted_count": int(getattr(
             self_ref, "persisted_voice_count", lambda: 0)()),
- (feat: 反思回流 — /self-ref/voice 端点(自述读取) + LLM蒸馏环境变量映射 + 成功日志)
         "last_echo_similarity": getattr(self_ref, "last_echo_similarity", None),
     }
 
