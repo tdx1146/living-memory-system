@@ -19,13 +19,52 @@
   - _busy_lock: 做梦期间锁定，对话请求通过 acquire_conversation() 等待
 """
 
+import os
 import time
 import logging
 import threading
-from typing import Dict, Optional, Callable
+from typing import Dict, Optional, Callable, Set
 from dataclasses import dataclass, field
 
 logger = logging.getLogger("dream_scheduler")
+
+
+# ------------------------------------------------------------------ #
+#  会话过滤（P1-4 / T1.7：bus 等系统会话不参与做梦）
+# ------------------------------------------------------------------ #
+# bus 脑（1212+ 轮全是 "任务 bus_heartbeat 完成 (exit=0)" 垃圾）不参与自动做梦，
+# 否则会持续写 latest_bus.pt 并挤占快照/做梦资源。
+# 默认排除 bus 相关会话（bus / bus_ / bus- / bus. 前缀）；
+# 逃生门：DREAM_SESSION_ALLOW=main,bus 可显式指定允许做梦的会话白名单
+# （逗号分隔，精确匹配；设置后白名单模式生效，非白名单一律不梦）。
+_DREAM_ALLOW_CACHE: Optional[Set[str]] = None
+_DREAM_ALLOW_CACHE_TS: float = 0.0
+
+
+def _dream_allowed(session_id: str) -> bool:
+    """判断会话是否允许做梦（P1-4：bus 禁做梦）。
+
+    白名单模式（DREAM_SESSION_ALLOW 非空）：仅白名单内的会话可做梦；
+    默认模式：排除 bus 相关系统会话，其余照常。
+    """
+    global _DREAM_ALLOW_CACHE, _DREAM_ALLOW_CACHE_TS
+    now = time.time()
+    # 环境变量极少变化，300s 缓存重读一次即可（避免每次调用读 env）
+    if _DREAM_ALLOW_CACHE is None or now - _DREAM_ALLOW_CACHE_TS > 300:
+        raw = os.environ.get("DREAM_SESSION_ALLOW", "").strip()
+        _DREAM_ALLOW_CACHE = (
+            {s.strip() for s in raw.split(",") if s.strip()} if raw else None)
+        _DREAM_ALLOW_CACHE_TS = now
+    allow = _DREAM_ALLOW_CACHE
+    if allow is not None:
+        return session_id in allow  # 显式白名单模式
+    # 默认模式：排除 bus 相关系统会话
+    if session_id == "bus":
+        return False
+    for prefix in ("bus_", "bus-", "bus."):
+        if session_id.startswith(prefix):
+            return False
+    return True
 
 
 @dataclass
@@ -261,6 +300,10 @@ class DreamScheduler:
             if not self._running:
                 break
 
+            # P1-4/T1.7：bus 等系统会话不参与自动做梦（跳过，不触发）
+            if not _dream_allowed(activity.session_id):
+                continue
+
             idle_time = now - activity.last_active_ts
             if idle_time < self.idle_threshold:
                 continue  # 仍在活跃，跳过
@@ -355,6 +398,12 @@ class DreamScheduler:
         loop = self._get_loop_fn(session_id)
         if loop is None:
             return {'status': 'error', 'error': f'会话 {session_id} 不存在'}
+
+        # P1-4/T1.7：bus 等系统会话禁止做梦（可用 DREAM_SESSION_ALLOW 显式放行）
+        if not _dream_allowed(session_id):
+            return {'status': 'error', 'error': (
+                f'会话 {session_id} 为系统会话，禁止做梦（P1-4；'
+                '如需放行请设置 DREAM_SESSION_ALLOW 白名单）')}
 
         acquired = self._busy_lock.acquire(timeout=timeout)
         if not acquired:
