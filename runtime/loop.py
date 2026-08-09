@@ -15,6 +15,7 @@ import time
 import logging
 from pathlib import Path
 from typing import Optional
+from concurrent.futures import ThreadPoolExecutor
 
 import torch
 
@@ -36,6 +37,24 @@ from persistence.snapshot import (
 from persistence.recovery import Recovery
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------- #
+#  T2.3 检索扩容：归档检索线程池（单 worker，只读路径）
+# ---------------------------------------------------------------------- #
+# /recall 的归档补充检索放进独立线程，由 future.result(timeout=...) 控制超时：
+# 超时即跳过归档只回内存（fail-open），绝不拖垮响应。单 worker 串行化归档
+# 扫描，避免多请求并发读放大；懒创建避免 fork/导入副作用。
+_ARCHIVE_EXECUTOR: Optional[ThreadPoolExecutor] = None
+
+
+def _get_archive_executor() -> ThreadPoolExecutor:
+    """懒创建归档检索线程池（线程名 lms-archive）。"""
+    global _ARCHIVE_EXECUTOR
+    if _ARCHIVE_EXECUTOR is None:
+        _ARCHIVE_EXECUTOR = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix='lms-archive')
+    return _ARCHIVE_EXECUTOR
 
 
 class LivingMemoryLoop:
@@ -129,6 +148,8 @@ class LivingMemoryLoop:
             seed=seed,
             temperature=temperature,
             device=device,
+            # T2.8/P2-1：惊讶度归一化开关（None → 读 LMS_NORM_SURPRISE）
+            norm_surprise=config.get('norm_surprise'),
         )
         if not config.get('attractor'):
             # 仅在自建时设置（不覆盖外部注入的实例）
@@ -164,6 +185,9 @@ class LivingMemoryLoop:
             consolidation_decay=config.get('consolidation_decay', 0.5),
             buffer_capacity=config.get('buffer_capacity', 100),
             device=device,
+            # T2.8/P2-1：回放权重钳制 + 潜变量归一化（None → 读环境变量）
+            replay_surprise_cap=config.get('replay_surprise_cap'),
+            norm_latent=config.get('norm_latent'),
         )
         self.tokenizer = config.get('tokenizer') or SimpleTokenizer()
         self.embedder = config.get('embedder') or SimpleEmbedder(dim=input_dim)
@@ -206,6 +230,8 @@ class LivingMemoryLoop:
                 'cw_gamma': config.get('meta_cw_gamma', 1.0),
                 'lr_delta': config.get('meta_lr_delta', 2.0),
                 'shy_target_norm': config.get('meta_shy_target_norm', 10.0),
+                # T2.8/P2-2：惰性规则开关（None → 读 LMS_META_LAZY）
+                'lazy': config.get('meta_lazy'),
             }
             self.meta = MetaPlasticityController(meta_config)
 
@@ -241,6 +267,13 @@ class LivingMemoryLoop:
 
         # 做梦引擎（懒加载，首次调用 get_dream_engine() 时创建）
         self.dream_engine = None
+
+        # T2.8/P2-6：embed 熔断器（LMS_EMBED_CIRCUIT=1 启用，默认 0）。
+        # 保护 _encode_query_vector（/recall 只读检索路径）：embed 服务
+        # 连续失败 3 次 → 熔断 5 分钟，期间 /recall 快速返回空而非卡 10s。
+        from core.sensory.circuit_breaker import EmbedCircuitBreaker
+        self._embed_circuit = EmbedCircuitBreaker(
+            enabled=config.get('embed_circuit'))
 
         logger.info(
             f"LivingMemoryLoop已初始化 "
@@ -638,10 +671,27 @@ class LivingMemoryLoop:
         """
         if not hasattr(self.embedder, 'embed_text'):
             return None, None
-        sem_vec = self.embedder.embed_text(text)
+
+        # T2.8/P2-6：embed 调用走熔断器（开关 LMS_EMBED_CIRCUIT=1 时生效）。
+        # 熔断 OPEN 期间快速失败（不触网）→ 调用方（/recall）返回空结果；
+        # 关闭状态行为与原来完全一致（embed 异常照常上抛）。
+        from core.sensory.circuit_breaker import CircuitOpenError
+        try:
+            sem_vec = self._embed_circuit.call(
+                self.embedder.embed_text, text)
+        except CircuitOpenError:
+            logger.warning(
+                "embed 熔断中：快速失败，跳过语义编码（/recall 将返回空）")
+            return None, None
         raw_vec = None
         if hasattr(self.embedder, 'embed_text_raw'):
-            raw_vec = self.embedder.embed_text_raw(text)
+            try:
+                raw_vec = self._embed_circuit.call(
+                    self.embedder.embed_text_raw, text)
+            except CircuitOpenError:
+                logger.warning(
+                    "embed 熔断中：跳过 raw 编码（退化为投影向量）")
+                return None, sem_vec
         return raw_vec, sem_vec
 
     def _retrieve_episodic(self, text: str) -> list[str] | None:
@@ -699,6 +749,108 @@ class LivingMemoryLoop:
             if text:
                 results.append({'text': text, 'score': float(score)})
         return results
+
+    # ================================================================== #
+    #  T2.3 检索扩容：归档导出 + 合并检索（内存活体优先、归档补充）
+    # ================================================================== #
+
+    def _export_episodic_to_archive(self) -> int:
+        """把当前情景缓冲区的条目追加导出到 data/archive/{session}.jsonl。
+
+        （T2.3：快照落盘时调用，按 (turn, text_hash) 去重；
+        供窗口外记忆的归档补充检索使用。任何异常由调用方兜底，fail-open。）
+
+        返回:
+            本次新增的归档条目数。
+        """
+        from core.archive.archive_store import export_episodic
+        entries = list(self.memory.iter_episodic())
+        if not entries:
+            return 0
+        return export_episodic(
+            self.session_id, entries,
+            archive_dir=self.config.get('archive_dir'))
+
+    def recall_merged_readonly(self, query: str, k: int = 5) -> list[dict]:
+        """合并情景检索（T2.3）：内存 200 条 ∪ 归档，内存优先、归档带来源标记。
+
+        **护栏（设计原理核对报告 2026-08-10 §5 R1）**：
+          - 内存（活体）结果 tier0 优先展示，归档结果仅作 tier1 补充——
+            绝不让 SQLite/JSONL 冷检索成为主路径；
+          - 归档条目显式携带 ``origin='archive'`` 来源标记；
+          - 归档检索带超时（默认 500ms，LMS_ARCHIVE_TIMEOUT_MS 可覆盖）：
+            超时/异常一律跳过归档只回内存（fail-open），/recall 响应 <2s 目标不变；
+          - 合并开关 ``LMS_ARCHIVE_ENABLED=0`` 可一键关闭（回滚路径），
+            关闭时行为与旧版 recall_episodic_readonly 完全一致。
+
+        与 process_turn 内检索（_retrieve_episodic）的关系：进程内每轮检索仍只走
+        内存窗口（快路径），本入口只供 /recall 等**外部只读查询**做归档扩容——
+        活体检索（attractor 驱动的潜变量检索）路径完全未动。
+
+        参数:
+            query: 查询文本。
+            k: 返回条数（调用方已钳制到 [1,20]）。
+
+        返回:
+            [{'text', 'score', 'origin'}, ...]（内存条目在前，归档条目在后，
+            各自按相似度降序；按 text 去重，内存版本优先；最多 k 条）。
+        """
+        # 0. 合并开关（LMS_ARCHIVE_ENABLED=0 关闭合并，回滚路径）
+        archive_enabled = str(self.config.get(
+            'archive_enabled',
+            os.environ.get('LMS_ARCHIVE_ENABLED', '1'))).strip().lower()
+        archive_enabled = archive_enabled not in ('0', 'false', 'no', 'off')
+        if not archive_enabled:
+            return self.recall_episodic_readonly(query, k=k)
+
+        # 1. 内存路径（活体优先；行为与旧版一致，仅补充 origin 标记）
+        results = self.recall_episodic_readonly(query, k=k)
+        for r in results:
+            r['origin'] = 'memory'
+
+        # 2. 归档补充检索（带超时，fail-open）
+        if not query or not query.strip():
+            return results
+        raw_vec, sem_vec = self._encode_query_vector(query)
+        if raw_vec is None and sem_vec is None:
+            return results  # embedder 无语义编码能力：只回内存
+        query_vec = raw_vec if raw_vec is not None else sem_vec
+        archive_dir = self.config.get('archive_dir')
+        timeout_ms = int(self.config.get(
+            'archive_timeout_ms',
+            os.environ.get('LMS_ARCHIVE_TIMEOUT_MS', '500')))
+
+        try:
+            from core.archive.archive_store import query_archive
+            fut = _get_archive_executor().submit(
+                query_archive, self.session_id, query_vec, k, archive_dir)
+            try:
+                archive_results = fut.result(timeout=max(0.05, timeout_ms / 1000.0))
+            except TimeoutError:
+                # 归档扫描超时：跳过归档只回内存（fail-open），
+                # 后台只读扫描自然结束，不影响后续请求
+                logger.warning(
+                    f"[{self.session_id}] 归档检索超时"
+                    f"（>{timeout_ms}ms），本次跳过归档（fail-open）")
+                archive_results = []
+        except Exception as e:
+            # 归档 IO/解析异常：跳过归档只回内存（fail-open）
+            logger.warning(
+                f"[{self.session_id}] 归档检索失败，本次跳过归档"
+                f"（fail-open）: {e}")
+            archive_results = []
+
+        # 3. 融合：内存优先展示（tier0），归档补充（tier1）
+        #    按 text 去重（同文本出现两次时内存版本先到、保留内存版）
+        seen: set = set()
+        merged: list = []
+        for r in results + archive_results:
+            t = r.get('text')
+            if not t or t in seen:
+                continue
+            seen.add(t)
+            merged.append(r)
+        return merged[:k]
 
     def _snapshot_dir_path(self) -> Path:
         """快照根目录：优先 config['snapshot_dir']，否则 core.paths.get_snapshot_dir()。
@@ -853,6 +1005,18 @@ class LivingMemoryLoop:
         except Exception as e:
             logger.warning(
                 f"同步 latest_{self.session_id}.pt 失败（不影响主快照）: {e}")
+
+        # T2.3 检索扩容：快照落盘后把 episodic 追加导出到归档
+        # （data/archive/{session}.jsonl，按 (turn,text_hash) 去重）。
+        # fail-open：归档导出失败绝不回滚/中断快照主流程，仅告警。
+        try:
+            added = self._export_episodic_to_archive()
+            logger.debug(
+                f"[{self.session_id}] episodic 归档导出 +{added} 条")
+        except Exception as e:
+            logger.warning(
+                f"[{self.session_id}] episodic 归档导出失败"
+                f"（fail-open，不影响快照）: {e}")
         return turn_path
 
     def latest_snapshot_path(self) -> str:

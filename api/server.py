@@ -23,19 +23,23 @@ run_in_executor 将阻塞调用交给线程池，避免阻塞事件循环。
 
 import os
 import re
+import math
+import uuid
 import asyncio
+import hashlib
 import logging
 import threading
 import time
 from datetime import datetime
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field, model_validator
 
 from api.session_manager import SessionManager
 from api.config import get_api_config
 from runtime.dream_scheduler import DreamScheduler
+from persistence.audit import audit
 
 # ---------------------------------------------------------------------------
 # 日志配置
@@ -195,8 +199,11 @@ _FEED_RATE_LIMIT = int(os.environ.get("LMS_FEED_RATE_LIMIT", "10"))
 _FEED_RATE_WINDOW = 60.0
 
 
-async def _feed_rate_limited() -> bool:
-    """滑动窗口限流：窗口内超过上限返回 True（429）。"""
+async def _feed_rate_check() -> Optional[float]:
+    """滑动窗口限流：窗口内超过上限返回剩余等待秒数（429 Retry-After），否则 None。
+
+    T2.8/P2-4：限流时携带 Retry-After（RFC 7231），让客户端知道何时可重试。
+    """
     global _feed_rate
     now = time.time()
     async with _feed_rate_lock:
@@ -204,7 +211,15 @@ async def _feed_rate_limited() -> bool:
             _feed_rate["window_start"] = now
             _feed_rate["count"] = 0
         _feed_rate["count"] += 1
-        return _feed_rate["count"] > _FEED_RATE_LIMIT
+        if _feed_rate["count"] > _FEED_RATE_LIMIT:
+            # 剩余等待 = 窗口结束时刻 - 当前时刻（至少 1s，供 Retry-After 用）
+            return max(1.0, _FEED_RATE_WINDOW - (now - _feed_rate["window_start"]))
+        return None
+
+
+async def _feed_rate_limited() -> bool:
+    """兼容包装：仅返回是否限流（bool）。"""
+    return await _feed_rate_check() is not None
 
 
 # ---------------------------------------------------------------------------
@@ -218,6 +233,21 @@ app = FastAPI(
     ),
     version="0.1.0",
 )
+
+
+# ---------------------------------------------------------------------------
+# T2.8/P2-4：request_id 中间件（幂等/链路追踪）
+# ---------------------------------------------------------------------------
+# 为每个请求生成 X-Request-ID（客户端已带则沿用，否则生成 uuid4 hex），
+# 存 request.state.request_id 并在响应头回传。纯观测性增量：
+# 不改任何业务逻辑，不依赖开关（新增响应头不影响既有行为）。
+@app.middleware("http")
+async def _request_id_middleware(request: Request, call_next):
+    rid = request.headers.get("X-Request-ID") or uuid.uuid4().hex
+    request.state.request_id = rid
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = rid
+    return response
 
 
 # ---------------------------------------------------------------------------
@@ -283,6 +313,23 @@ def _clamp_snapshot_path(raw_path) -> Optional[str]:
     return full
 
 
+def _sha256_of(path: Optional[str]) -> Optional[str]:
+    """计算文件 sha256（T2.6 审计用：记录被覆盖的 latest 快照旧哈希）。
+
+    文件不存在/读取失败时返回 None（fail-open，不阻塞主流程）。
+    """
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 16), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:  # pylint: disable=broad-except
+        return None
+
+
 # ---------------------------------------------------------------------------
 # 端点
 # ---------------------------------------------------------------------------
@@ -345,6 +392,10 @@ async def chat(req: ChatRequest):
                     f"[{req.session_id}] LLM 回复长度: {len(response_text)}")
             except Exception as e:
                 logger.error(f"[{req.session_id}] LLM 调用失败: {e}")
+                # T2.6：关键错误审计（LLM 调用失败，不中断服务）
+                audit("critical_error", component="llm",
+                      session_id=req.session_id,
+                      error=str(e)[:200])
                 response_text = (
                     f"[记忆context已生成，但LLM调用失败: {e}]\n\n"
                     f"---记忆context---\n{memory_context}"
@@ -420,10 +471,13 @@ async def feed(req: FeedRequest):
     if not req.text or not req.text.strip():
         raise HTTPException(status_code=400, detail="text 不能为空")
 
-    if await _feed_rate_limited():
+    # T2.8/P2-4：限流检查（一次性调用，返回剩余等待秒数或 None）
+    retry_after = await _feed_rate_check()
+    if retry_after is not None:
         raise HTTPException(
             status_code=429,
             detail=f"feed 限流：超过 {_FEED_RATE_LIMIT} 次/分钟，请稍后重试",
+            headers={"Retry-After": str(int(math.ceil(retry_after)))},
         )
 
     sm = get_session_manager()
@@ -459,10 +513,17 @@ async def feed(req: FeedRequest):
 
 @app.post("/recall")
 async def recall(req: RecallRequest):
-    """只读情景检索端点（T1.3/P0-9）。
+    """只读情景检索端点（T1.3/P0-9；T2.3 起为内存+归档合并检索）。
 
-    编码 query + 检索 episodic 缓冲区，**不 process_turn、不调 LLM、
+    编码 query + 合并检索：内存 200 条窗口（活体优先）∪ 归档 JSONL
+    （窗口外补充，条目带 origin 标记），**不 process_turn、不调 LLM、
     不写缓冲、不落盘**——纯读取路径，目标耗时 ~1s 内。
+
+    T2.3 变更（2026-08-10）：原只查内存，现改为 memory.recall_merged_readonly
+    （内存 tier0 优先、归档 tier1 补充；归档检索超时 500ms 则跳过归档
+    只回内存，fail-open，保持 <2s 目标；LMS_ARCHIVE_ENABLED=0 可一键
+    关闭合并回退到纯内存路径）。响应条目新增 origin 字段
+    （'memory' | 'archive'），旧客户端无感（多一个字段）。
     （/chat 7-10s 的根因是耦合了 LLM 对话与检索，本端点剥离。）
 
     会话不存在时惰性创建空脑（与 /self-ref/voice 一致）；创建本身
@@ -477,8 +538,9 @@ async def recall(req: RecallRequest):
 
     t0 = time.time()
     try:
+        # T2.3：内存+归档合并检索（内存优先；归档超时/异常内部 fail-open）
         results = await asyncio.get_event_loop().run_in_executor(
-            None, lambda: loop.recall_episodic_readonly(req.query, k=k))
+            None, lambda: loop.recall_merged_readonly(req.query, k=k))
     except Exception as e:
         # 只读路径异常：fail-open，返回空结果，绝不 500 拖垮调用方
         logger.error(f"[{req.session_id}] /recall 检索失败（返回空）: {e}")
@@ -531,6 +593,9 @@ async def snapshot(session_id: str, req: SnapshotRequest):
         )
 
     try:
+        # T2.6：保存前记录将被覆盖的 latest_{session}.pt 旧 sha256（审计对账用）
+        latest_path = loop.latest_snapshot_path()
+        old_sha256 = _sha256_of(latest_path)
         path = loop.save_session_state()
         if path is None:
             # 写锁超时被跳过（fail-open 策略的显式反馈，非静默）
@@ -539,6 +604,10 @@ async def snapshot(session_id: str, req: SnapshotRequest):
                 detail="快照写锁超时，保存被跳过，请稍后重试",
             )
         logger.info(f"[{session_id}] 快照已保存: {path}")
+        # T2.6：快照保存审计（含被覆盖的 latest 旧 sha256）
+        audit("snapshot_saved", session_id=session_id, path=path,
+              latest_path=latest_path, old_latest_sha256=old_sha256,
+              turn_count=loop.turn_count)
         return {
             "session_id": session_id,
             "saved": True,
@@ -550,6 +619,9 @@ async def snapshot(session_id: str, req: SnapshotRequest):
         raise
     except Exception as e:
         logger.error(f"[{session_id}] 快照保存失败: {e}")
+        # T2.6：关键错误审计（快照保存失败）
+        audit("critical_error", component="snapshot",
+              session_id=session_id, error=str(e)[:200])
         raise HTTPException(
             status_code=500,
             detail=f"快照保存失败: {e}",
@@ -591,6 +663,9 @@ async def restore(session_id: str, req: RestoreRequest):
     try:
         loop.load_state(full_path)
         logger.info(f"[{session_id}] 已从 {full_path} 恢复状态")
+        # T2.6：加载/回退审计（手动 /restore）
+        audit("state_restored", session_id=session_id, path=full_path,
+              turn_count=loop.turn_count)
         return {
             "session_id": session_id,
             "restored": True,
@@ -666,6 +741,8 @@ async def delete_session(session_id: str):
             detail=f"会话 '{session_id}' 不存在",
         )
     scheduler.unregister_session(session_id)
+    # T2.6：会话删除审计（session_manager.remove 内已 audit，此处补调度器侧信息）
+    audit("session_deleted", session_id=session_id, scheduler_unregistered=True)
     return {
         "session_id": session_id,
         "deleted": True,
@@ -717,6 +794,23 @@ async def dream_status():
 async def on_startup():
     """服务启动时初始化并启动做梦调度器。"""
     logger.info("活体记忆系统 API 服务启动")
+    # T2.6：服务启动审计
+    audit("startup", pid=os.getpid(), version=app.version)
+    # T1.4 补：启动时修剪快照（每会话只保留最近 N 个轮次快照，防目录无限增长）。
+    # keep 由 LMS_SNAPSHOT_PRUNE_KEEP 环境变量覆盖，默认 20（见 snapshot.py）。
+    try:
+        from persistence.snapshot import prune_snapshots
+        prune_keep = os.environ.get("LMS_SNAPSHOT_PRUNE_KEEP", "20")
+        prune_stats = prune_snapshots(
+            os.environ.get("LMS_SNAPSHOT_DIR", os.path.abspath("./snapshots")))
+        total_removed = sum(v["removed"] for v in prune_stats.values())
+        logger.info(
+            f"启动快照修剪完成（keep={prune_keep}）: "
+            f"扫描 {len(prune_stats)} 个会话目录，共删除 {total_removed} 个旧快照"
+        )
+    except Exception as e:
+        logger.warning(f"启动快照修剪失败（不影响启动）: {e}")
+
     # 预热默认配置（不创建 session，仅打印配置摘要）
     try:
         cfg = get_api_config()
@@ -727,12 +821,25 @@ async def on_startup():
             f"embedder={'Pretrained' if hasattr(cfg.get('embedder'), 'embed_text') else 'Simple'}, "
             f"llm={'ON' if llm_on else 'OFF'}"
         )
+        # T2.6：配置生效审计（含 T2.8 全部算法治理开关状态）
+        audit("config_effective",
+              nodes=cfg['num_nodes'], dim=cfg['input_dim'], llm_on=llm_on,
+              norm_surprise=cfg.get('norm_surprise'),
+              replay_surprise_cap=cfg.get('replay_surprise_cap'),
+              norm_latent=cfg.get('norm_latent'),
+              meta_lazy=cfg.get('meta_lazy'),
+              self_ref_no_bus=cfg.get('self_ref_no_bus'),
+              embed_circuit=cfg.get('embed_circuit'))
     except Exception as e:
         logger.warning(f"读取默认配置失败: {e}")
 
     # 启动做梦调度器后台线程
     scheduler = get_dream_scheduler()
     scheduler.start()
+    # T2.6：调度器启动审计
+    audit("scheduler_start",
+          idle_threshold=getattr(scheduler, 'idle_threshold', None),
+          dream_steps=getattr(scheduler, 'dream_steps', None))
     logger.info(
         f"DreamScheduler 已启动 "
         f"(idle_threshold={scheduler.idle_threshold}s, "
@@ -781,6 +888,8 @@ async def on_shutdown():
 
     scheduler = get_dream_scheduler()
     scheduler.stop()
+    # T2.6：调度器停止审计
+    audit("scheduler_stop")
     logger.info("DreamScheduler 已停止")
 
     sm = get_session_manager()
@@ -802,6 +911,8 @@ async def on_shutdown():
 
     n = sm.clear()
     logger.info(f"服务关闭，已清理 {n} 个会话")
+    # T2.6：服务停机审计
+    audit("shutdown", saved_count=len(saved_paths), sessions_cleared=n)
 
 
 # 模块导入时确保项目根目录在 sys.path 中（支持 `python api/run.py` 启动）

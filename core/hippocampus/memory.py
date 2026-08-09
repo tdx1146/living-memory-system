@@ -13,6 +13,7 @@ consolidation（巩固）机制将短时记忆迁移到长时记忆，
 参考：架构文档 第五节 5.3 MemoryManager 接口
 """
 
+import os
 import torch
 from collections import deque
 from dataclasses import dataclass
@@ -69,7 +70,9 @@ class MemoryManager:
                  consolidation_decay: float = 0.5,
                  buffer_capacity: int = 100,
                  episodic_capacity: int = 200,
-                 device: Union[str, torch.device] = "auto") -> None:
+                 device: Union[str, torch.device] = "auto",
+                 replay_surprise_cap: Optional[float] = None,
+                 norm_latent: Optional[bool] = None) -> None:
         """初始化记忆管理器。
 
         参数:
@@ -87,6 +90,14 @@ class MemoryManager:
             device: 计算设备（E-P2-1）。支持 "auto"/"cpu"/"cuda"/"cuda:0"
                 或 torch.device。短时/长时潜变量将创建在该设备上。
                 存入缓冲区的激活态和语义向量也会迁移到该设备。
+            replay_surprise_cap: 回放权重钳制上限（T2.8/P2-1）。
+                consolidate 时 weight = replay_weight * max(min(surprise, cap), 0)；
+                None 时读取环境变量 LMS_REPLAY_SURPRISE_CAP（默认 0 = 不钳制，
+                保持原行为）。
+            norm_latent: long_term_latent 归一化开关（T2.8/P2-1）。
+                consolidate 结束后将 long_term_latent 除以其 L2 范数，
+                防止潜变量范数正反馈爆涨（实测 27614）。None 时读取环境变量
+                LMS_NORM_LATENT（默认 0 = 关闭，保持原行为）。
         """
         self.num_nodes = num_nodes
         self.short_term_decay = short_term_decay
@@ -96,6 +107,17 @@ class MemoryManager:
         self.replay_weight = replay_weight
         self.consolidation_decay = consolidation_decay
         self._buffer_capacity = buffer_capacity
+
+        # T2.8/P2-1：回放权重钳制（LMS_REPLAY_SURPRISE_CAP，默认 0=不钳制）
+        if replay_surprise_cap is None:
+            replay_surprise_cap = float(
+                os.environ.get("LMS_REPLAY_SURPRISE_CAP", "0") or 0)
+        self.replay_surprise_cap: float = float(replay_surprise_cap)
+
+        # T2.8/P2-1：long_term_latent 归一化开关（LMS_NORM_LATENT=1 启用）
+        if norm_latent is None:
+            norm_latent = os.environ.get("LMS_NORM_LATENT", "0") == "1"
+        self.norm_latent: bool = bool(norm_latent)
 
         # E-P2-1: 统一设备管理
         self.device: torch.device = resolve_device(device)
@@ -169,6 +191,10 @@ class MemoryManager:
             replay_count = min(self.replay_count, len(sorted_buffer))
             for state, surprise in sorted_buffer[:replay_count]:
                 # 回放权重也按 surprise 加权（高 surprise = 重要经验）
+                # T2.8/P2-1：replay_surprise_cap > 0 时钳制 surprise 上限，
+                # 防止个别超大 surprise（数值缺陷）垄断回放权重。
+                if self.replay_surprise_cap > 0:
+                    surprise = min(surprise, self.replay_surprise_cap)
                 weight = self.replay_weight * max(surprise, 0.0)
                 self.long_term_latent = (
                     self.long_term_latent + weight * state
@@ -176,6 +202,14 @@ class MemoryManager:
 
         # 衰减短时记忆（为新记忆腾出空间）
         self.short_term_latent = self.short_term_latent * self.consolidation_decay
+
+        # T2.8/P2-1：long_term_latent 归一化（LMS_NORM_LATENT=1 启用）
+        # 除以 L2 范数，防止潜变量范数正反馈爆涨；零向量保持原样。
+        if self.norm_latent:
+            latent_norm = float(self.long_term_latent.norm().item())
+            if latent_norm > 1e-8:
+                self.long_term_latent = (
+                    self.long_term_latent / latent_norm)
 
     def recall(self, cue: torch.Tensor) -> torch.Tensor:
         """从记忆中检索：用线索激活相关记忆。

@@ -24,6 +24,7 @@
 """
 
 import math
+import os
 import logging
 from collections import deque
 from dataclasses import dataclass, field
@@ -174,12 +175,22 @@ class MetaPlasticityController:
                 - cw_gamma: ||J|| → cw 的系数（默认 1.0）
                 - lr_delta: surprise 趋势 → lr 的系数（默认 2.0）
                 - shy_target_norm: J 矩阵目标范数，用于计算饱和度（默认 10.0）
+                - lazy: 惰性规则开关（T2.8/P2-2）。True 时 update() 直接跳过
+                  （不收集信号、不调整倍率，倍率恒为 1.0，省算力）。
+                  None 时读取环境变量 LMS_META_LAZY（默认 0 = 正常元更新）。
 
         说明：
             meta_lr 作为倍率更新的平滑因子——每次元更新时，
             新倍率 = (1 - meta_lr) * 旧倍率 + meta_lr * 目标倍率。
             值越小变化越缓慢，保证"慢时间尺度"特性。
         """
+        config = config or {}
+
+        # T2.8/P2-2：惰性规则开关（LMS_META_LAZY=1 时跳过 update，省算力）
+        lazy = config.get('lazy')
+        if lazy is None:
+            lazy = os.environ.get("LMS_META_LAZY", "0") == "1"
+        self.lazy: bool = bool(lazy)
         config = config or {}
 
         # --- 元更新时序 ---
@@ -248,6 +259,12 @@ class MetaPlasticityController:
               {'lr_mult': float, 'orth_mult': float,
                'temp_mult': float, 'cw_mult': float}
         """
+        # --- 收集信号并判断是否触发元调整 ---
+        # T2.8/P2-2：惰性规则开关——跳过 update（不收集信号、不调整倍率，
+        # 倍率恒为 1.0）。省算力；开启后元参数保持基线（与 meta 未启用等价）。
+        if self.lazy:
+            return None
+
         # --- 每轮收集信号 ---
         self._surprise_deque.append(surprise)
         self._turn_count += 1

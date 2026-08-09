@@ -19,6 +19,7 @@
 参考：架构文档 第五节 5.3、第七节《FEP学习规则实现要点》
 """
 
+import os
 import torch
 from typing import Optional, Union
 
@@ -77,7 +78,8 @@ class AttractorNetwork:
     def __init__(self, num_nodes: int, input_dim: int,
                  seed: int = 42,
                  temperature: float = 0.05,
-                 device: Union[str, torch.device] = "auto") -> None:
+                 device: Union[str, torch.device] = "auto",
+                 norm_surprise: Optional[bool] = None) -> None:
         """初始化吸引子网络。
 
         参数:
@@ -129,6 +131,14 @@ class AttractorNetwork:
         # temperature > 0 时，相似但不同的输入有机会收敛到不同吸引子，
         # 使正交化学习规则能够发挥作用。设为 0 则退化为纯平均场推断。
         self.temperature: float = temperature
+
+        # T2.8/P2-1：惊讶度归一化开关（LMS_NORM_SURPRISE=1 启用，默认 0）。
+        # 自由能 F ∝ ‖J‖²（实测 ±1600~3400 量级），直接作为惊讶度会
+        # 让回放权重/目的演化对 J 幅度敏感——F 除以 ‖J‖_F 后量级收敛。
+        # 默认 0 保持原行为；显式传参优先，否则读环境变量。
+        if norm_surprise is None:
+            norm_surprise = os.environ.get("LMS_NORM_SURPRISE", "0") == "1"
+        self.norm_surprise: bool = bool(norm_surprise)
 
     # ------------------------------------------------------------------ #
     #  推断
@@ -444,6 +454,15 @@ class AttractorNetwork:
         complexity = 0.5 * self.complexity_weight * torch.sum(self.J ** 2)
 
         free_energy = corr_term + bias_term + accuracy + complexity
+
+        # T2.8/P2-1：惊讶度归一化（开关 LMS_NORM_SURPRISE=1 时启用）。
+        # F /= ‖J‖_F：消除 J 幅度对惊讶度量级的主导，使惊讶度可比。
+        # J≈0 时保持原值（避免除零放大；J=0 的网络本就不产生有意义的 F）。
+        if self.norm_surprise:
+            j_norm = float(torch.norm(self.J, p='fro').item())
+            if j_norm > 1e-8:
+                free_energy = free_energy / j_norm
+
         return float(free_energy)
 
     def _compute_entropy(self, sigma: torch.Tensor) -> float:

@@ -17,6 +17,7 @@ from typing import Dict, List, Optional
 from runtime.loop import LivingMemoryLoop
 from api.config import get_api_config
 from persistence.snapshot import sanitize_session_id, latest_path_for
+from persistence.audit import audit
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +77,9 @@ class SessionManager:
                 loop = LivingMemoryLoop(cfg)
                 self._sessions[session_id] = loop
                 self._configs[session_id] = cfg
+                # T2.6：会话创建审计（只加日志，不改业务逻辑）
+                audit("session_created", session_id=session_id,
+                      turn_count=loop.turn_count)
                 # 阶段1-A 补丁：启动自动恢复会话快照（P0-13 优雅停机的配套）。
                 # 进程重启后会话从零开始会丢失全部记忆演化，必须自动恢复：
                 #   候选 1）snapshots/{session}/latest_{session}.pt（新命名规范）
@@ -124,9 +128,17 @@ class SessionManager:
                 logger.info(
                     f"[{session_id}] 启动自动恢复快照: {best_path} "
                     f"(turn={loop.turn_count})")
+                # T2.6：快照加载审计（自动恢复路径）
+                audit("snapshot_loaded", session_id=session_id,
+                      path=best_path, turn_count=loop.turn_count,
+                      mode="auto_restore")
             except Exception as e:
                 logger.warning(
                     f"[{session_id}] 快照恢复失败 {best_path}: {e}")
+                # T2.6：关键错误审计（自动恢复失败）
+                audit("critical_error", component="auto_restore",
+                      session_id=session_id, path=best_path,
+                      error=str(e)[:200])
         except Exception as e:
             logger.warning(f"[{session_id}] 自动恢复流程异常（跳过）: {e}")
 
@@ -146,6 +158,8 @@ class SessionManager:
                 del self._sessions[session_id]
                 self._configs.pop(session_id, None)
                 logger.info(f"已删除会话: {session_id}")
+                # T2.6：会话删除审计（只加日志，不改业务逻辑）
+                audit("session_deleted", session_id=session_id)
                 return True
             return False
 

@@ -152,6 +152,104 @@ def latest_path_for(snapshot_dir: str, session_id: str) -> str:
     return os.path.join(snapshot_dir, sid, f"latest_{sid}.pt")
 
 
+# ---------------------------------------------------------------------------
+# 快照修剪（T1.4 补 / P2-8：prune keep=20，防止快照目录无限增长）
+# ---------------------------------------------------------------------------
+# 只匹配新命名规范 `snapshot_{session}_{turn}_{ts}.pt`（ts = %Y%m%d_%H%M%S）。
+# 旧版扁平文件（snapshot_NNN.pt / latest.pt 等散落在快照根目录）不在此正则
+# 范围内，由历史/迁移流程另行处理，prune 一律不动。
+_SNAPSHOT_RE = re.compile(
+    r"^snapshot_(?P<sid>[A-Za-z0-9_-]+)_(?P<turn>\d+)_(?P<ts>\d{8}_\d{6})\.pt$"
+)
+
+
+def _prune_keep_default() -> int:
+    """读取 LMS_SNAPSHOT_PRUNE_KEEP 环境变量（默认 20，非法值回退默认）。"""
+    raw = os.environ.get("LMS_SNAPSHOT_PRUNE_KEEP", "").strip()
+    if raw:
+        try:
+            v = int(raw)
+            if v >= 1:
+                return v
+        except ValueError:
+            pass
+        logger.warning(f"LMS_SNAPSHOT_PRUNE_KEEP 非法（{raw!r}），使用默认 20")
+    return 20
+
+
+def prune_snapshots(snapshot_dir: str, keep: Optional[int] = None) -> dict:
+    """按会话子目录修剪轮次快照，每个会话只保留最近 keep 个（T1.4 补 / P2-8）。
+
+    规则:
+      * 只处理 ``snapshots/{session}/`` 一级子目录中符合新命名规范
+        ``snapshot_{session}_{turn}_{ts}.pt`` 的文件（正则匹配）；
+      * 排序键 (ts, turn)：ts 为主序（文件名时间戳 %Y%m%d_%H%M%S，字典序即
+        时间序），同 ts 再按 turn 递增；保留最近 keep 个，其余删除；
+      * ``latest_{session}.pt``（会话"最新状态指针"）、``*.lock`` 伴生锁、
+        根目录散落的旧版文件一律不删；
+      * 删除前校验：仅删正则命中的 .pt 且非符号链接（防误删/防链接逃逸）；
+        单文件删除失败仅告警（fail-open，不中断其余会话）；
+      * 幂等：任意时刻可安全重跑；调整 keep 即可改变保留深度。
+
+    参数:
+        snapshot_dir: 快照根目录（如 ./snapshots）。
+        keep: 每个会话保留的轮次快照数；None 时读 LMS_SNAPSHOT_PRUNE_KEEP
+              （默认 20，<1 的非法值回退默认）。
+
+    返回:
+        {session: {"kept": int, "removed": int}} 统计字典；目录不存在/空返回 {}。
+    """
+    if keep is None:
+        keep = _prune_keep_default()
+    keep = max(1, int(keep))
+    snapshot_dir = str(snapshot_dir)
+    if not os.path.isdir(snapshot_dir):
+        logger.warning(f"prune_snapshots: 快照目录不存在，跳过: {snapshot_dir}")
+        return {}
+
+    try:
+        entries = sorted(os.listdir(snapshot_dir))
+    except OSError as e:
+        logger.warning(f"prune_snapshots: 读取快照目录失败 {snapshot_dir}: {e}")
+        return {}
+
+    stats: dict = {}
+    for name in entries:
+        sub = os.path.join(snapshot_dir, name)
+        # 只处理一级子目录（跳过根目录散落文件与符号链接）
+        if not os.path.isdir(sub) or os.path.islink(sub):
+            continue
+        try:
+            files = [f for f in os.listdir(sub)
+                     if _SNAPSHOT_RE.match(f)
+                     and os.path.isfile(os.path.join(sub, f))]
+        except OSError as e:
+            logger.warning(f"prune_snapshots: 读取会话目录失败 {sub}: {e}")
+            continue
+        if not files:
+            continue
+
+        def _sort_key(fn: str) -> tuple:
+            m = _SNAPSHOT_RE.match(fn)
+            return (m.group("ts"), int(m.group("turn")))
+
+        files.sort(key=_sort_key)
+        drop = files[:-keep] if len(files) > keep else []
+        removed = 0
+        for fn in drop:
+            path = os.path.join(sub, fn)
+            if os.path.islink(path):
+                continue  # 符号链接不删（防逃逸）
+            try:
+                os.remove(path)
+                removed += 1
+                logger.info(f"prune_snapshots: 删除旧快照 {path}")
+            except OSError as e:
+                logger.warning(f"prune_snapshots: 删除失败 {path}: {e}")
+        stats[name] = {"kept": len(files) - removed, "removed": removed}
+    return stats
+
+
 class Snapshot:
     """吸引子景观快照管理器。
 

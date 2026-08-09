@@ -5,10 +5,11 @@
 # 职责：
 #   1) 15 分钟级：snapshots/ 增量镜像复制 → backups/snapshots-15min/
 #      （rsync -a --delete：幂等、保留 mtime、增量传输；镜像即"最新快照集"）
-#   2) 每日 02:30：tar.zst 全量备份（snapshots/ + data/ + logs/，排除临时文件）
+#   2) 每小时：snapshots/ 归档 tar.zst → backups/hourly/（保留 BACKUP_KEEP_HOURS 小时）
+#   3) 每日 02:30：tar.zst 全量备份（snapshots/ + data/ + logs/，排除临时文件）
 #      → backups/daily/lms-YYYYMMDD.tar.zst，保留 BACKUP_KEEP_DAYS 天滚动
-#   3) 备份元数据：backups/MANIFEST.jsonl（时间/类型/大小/hash）追加式记录
-#   4) 跨机复制（可选）：REMOTE_BACKUP 配置 rsync 目标，默认空 = 仅本机
+#   4) 备份元数据：backups/MANIFEST.jsonl（时间/类型/大小/hash）追加式记录
+#   5) 跨机复制（可选）：REMOTE_BACKUP 配置 rsync 目标，默认空 = 仅本机
 #
 # 工程级特性：
 #   * 幂等：任意时刻可安全重跑（inc 是 rsync 镜像；daily 覆盖当日归档）
@@ -17,14 +18,16 @@
 #   * 不依赖第三方：bash + rsync + tar(zstd) + sha256sum，全部系统自带
 #
 # 用法：
-#   lms_backup.sh inc|incremental    # 15 分钟级增量镜像（cron */15）
-#   lms_backup.sh daily|full         # 每日全量 tar.zst（cron 02:30）
-#   lms_backup.sh status             # 查看备份状态（MANIFEST 尾部 + 目录大小）
+#   lms_backup.sh inc|incremental|--quick    # 15 分钟级增量镜像（cron */15）
+#   lms_backup.sh hourly|--hourly            # 每小时归档 tar.zst（cron 0 * * * *）
+#   lms_backup.sh daily|full|--daily         # 每日全量 tar.zst（cron 02:30）
+#   lms_backup.sh status                     # 查看备份状态（MANIFEST 尾部 + 目录大小）
 #
 # 环境变量（均可覆盖，默认值见下）：
 #   LMS_BACKUP_DIR      备份根目录（默认 /vol2/1000/AI专用/backups/lms）
 #   REMOTE_BACKUP       rsync 跨机目标（如 user@host:/path，默认空=本机）
-#   BACKUP_KEEP_DAYS    每日归档保留天数（默认 14）
+#   BACKUP_KEEP_DAYS    每日归档保留天数（默认 30，总体方案 §3.8）
+#   BACKUP_KEEP_HOURS   每小时归档保留小时数（默认 168 = 7 天，总体方案 §3.8）
 #   RSYNC_BWLIMIT       跨机 rsync 带宽限制 KB/s（默认 0=不限）
 # =============================================================================
 set -uo pipefail
@@ -47,8 +50,10 @@ fi
 # 备份根目录：默认 /vol2/1000/AI专用/backups/lms（与总体方案 §3.8 一致）
 BACKUP_ROOT="${LMS_BACKUP_DIR:-/vol2/1000/AI专用/backups/lms}"
 INC_DIR="$BACKUP_ROOT/snapshots-15min"
+HOURLY_DIR="$BACKUP_ROOT/hourly"
 DAILY_DIR="$BACKUP_ROOT/daily"
-KEEP_DAYS="${BACKUP_KEEP_DAYS:-14}"
+KEEP_DAYS="${BACKUP_KEEP_DAYS:-30}"
+KEEP_HOURS="${BACKUP_KEEP_HOURS:-168}"   # 7 天（总体方案 §3.8）
 REMOTE_BACKUP="${REMOTE_BACKUP:-}"
 RSYNC_BWLIMIT="${RSYNC_BWLIMIT:-0}"   # KB/s，0 = 不限
 
@@ -129,6 +134,59 @@ run_incremental() {
 
     local dur=$(( $(date +%s) - t0 ))
     log "== 增量镜像完成：${files} 个文件，${size} 字节，耗时 ${dur}s =="
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# 每小时归档 tar.zst（T2.4 补：--hourly，保留 BACKUP_KEEP_HOURS 小时）
+# ---------------------------------------------------------------------------
+run_hourly() {
+    local t0 stamp archive tmp_archive rc
+    t0="$(date +%s)"
+    stamp="$(date +%Y%m%d_%H%M)"
+    archive="$HOURLY_DIR/lms-hourly-$stamp.tar.zst"
+    tmp_archive="$HOURLY_DIR/.lms-hourly-$stamp.tar.zst.tmp.$$"
+    log "== 每小时归档开始 → $archive =="
+
+    if [ ! -d "$SNAPSHOT_DIR" ]; then
+        warn "快照目录不存在（$SNAPSHOT_DIR），跳过每小时归档（fail-open）"
+        return 0
+    fi
+    mkdir -p "$HOURLY_DIR"
+
+    # 仅打包 snapshots/（轻量高频层）；data/ 与 logs/ 由每日全量覆盖。
+    # 先写临时文件再原子 mv：中途失败不会留下半个归档冒充本轮备份。
+    if ! ( cd "$LMS_HOME" && tar --zstd -cf "$tmp_archive" \
+            --exclude='*.lock' --exclude='*.tmp' --exclude='*.swp' \
+            snapshots ); then
+        rm -f "$tmp_archive" 2>/dev/null || true
+        fail "每小时归档 tar.zst 打包失败"
+        return 1
+    fi
+    mv -f "$tmp_archive" "$archive"
+
+    # 完整性冒烟：zstd 帧校验 + tar 列表可读
+    if ! zstd -t "$archive" >/dev/null 2>&1; then
+        fail "完整性校验失败（zstd -t）: $archive"
+        return 1
+    fi
+    if ! tar --zstd -tf "$archive" >/dev/null 2>&1; then
+        fail "完整性校验失败（tar -tf）: $archive"
+        return 1
+    fi
+
+    # 元数据：大小 + sha256
+    local size hash
+    size="$(stat -c %s "$archive" 2>/dev/null || echo 0)"
+    hash="$(sha256sum "$archive" | awk '{print $1}')"
+    manifest "hourly" "hourly/$(basename "$archive")" "$size" "\"$hash\""
+
+    # 滚动保留：只删 lms-hourly-*.tar.zst，超过 KEEP_HOURS 小时的删除
+    find "$HOURLY_DIR" -maxdepth 1 -name 'lms-hourly-*.tar.zst' \
+        -mmin "+$((KEEP_HOURS * 60))" -delete 2>/dev/null || true
+    local kept
+    kept="$(find "$HOURLY_DIR" -maxdepth 1 -name 'lms-hourly-*.tar.zst' 2>/dev/null | wc -l | tr -d ' ')"
+    log "== 每小时归档完成：$(basename "$archive")（${size} 字节，sha256=${hash:0:16}…），保留 ${kept} 份 =="
     return 0
 }
 
@@ -224,6 +282,7 @@ run_status() {
     fi
     echo
     [ -d "$INC_DIR" ] && echo "15min 镜像 : $(du -sh "$INC_DIR" 2>/dev/null | awk '{print $1}')（$(find "$INC_DIR" -type f | wc -l | tr -d ' ') 文件）" || echo "15min 镜像 : 未执行"
+    [ -d "$HOURLY_DIR" ] && echo "每小时归档 : $(du -sh "$HOURLY_DIR" 2>/dev/null | awk '{print $1}')（$(find "$HOURLY_DIR" -name 'lms-hourly-*.tar.zst' | wc -l | tr -d ' ') 份）" || echo "每小时归档 : 未执行"
     [ -d "$DAILY_DIR" ] && echo "每日归档   : $(du -sh "$DAILY_DIR" 2>/dev/null | awk '{print $1}')（$(find "$DAILY_DIR" -name 'lms-*.tar.zst' | wc -l | tr -d ' ') 份）" || echo "每日归档   : 未执行"
     return 0
 }
@@ -237,14 +296,21 @@ main() {
     acquire_lock
 
     case "$action" in
-        inc|incremental)
+        inc|incremental|--quick)
             run_incremental
             rc=$?
             if [ $rc -eq 0 ]; then
                 run_remote || rc=1
             fi
             ;;
-        daily|full)
+        hourly|--hourly)
+            run_hourly
+            rc=$?
+            if [ $rc -eq 0 ]; then
+                run_remote || rc=1
+            fi
+            ;;
+        daily|full|--daily)
             run_daily
             rc=$?
             if [ $rc -eq 0 ]; then
@@ -256,7 +322,7 @@ main() {
             return $?
             ;;
         *)
-            echo "用法: $0 {inc|daily|status}" >&2
+            echo "用法: $0 {inc|incremental|--quick|hourly|--hourly|daily|full|--daily|status}" >&2
             return 2
             ;;
     esac

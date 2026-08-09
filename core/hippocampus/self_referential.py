@@ -877,6 +877,15 @@ class SelfReferentialLoop:
         self.voice_persist_path: Optional[str] = (
             self._resolve_voice_persist_path(cfg))
 
+        # T2.8/P2-3：bus 禁 LLM 自述开关（LMS_SELF_REF_NO_BUS=1 启用，默认 0）。
+        # bus 会话 1456 条 LLM 蒸馏几乎全是「我正高度唤醒…」模板套话（信息量≈0）；
+        # 总线已禁做梦（P1-4），此开关为兜底：bus 会话跳过 LLM 增强蒸馏，
+        # 只用规则蒸馏（避免套话继续污染 self_voice 历史）。
+        # 优先级：cfg 显式键 > 环境变量 LMS_SELF_REF_NO_BUS。
+        self.self_ref_no_bus: bool = bool(cfg.get(
+            "self_ref_no_bus",
+            os.environ.get("LMS_SELF_REF_NO_BUS", "0") == "1"))
+
         # Phase 1 配置参数
         self_ref_autocorr_lag = int(
             cfg.get("self_ref_autocorr_lag", 5))
@@ -1396,7 +1405,10 @@ class SelfReferentialLoop:
         """
         # 1. 蒸馏自述
         # Phase 3.3: 若 LLM 蒸馏器已注入，使用 LLM 增强蒸馏；否则回退规则蒸馏
-        if self.llm_distiller is not None:
+        # T2.8/P2-3: bus 会话跳过 LLM 蒸馏（LMS_SELF_REF_NO_BUS=1 时），
+        # 只做规则蒸馏——总线事件套话不进 self_voice 历史。
+        if (self.llm_distiller is not None
+                and not (self.self_ref_no_bus and self._session_id == 'bus')):
             self_voice_text = self.llm_distiller.distill(
                 memory_context, activation)
         else:

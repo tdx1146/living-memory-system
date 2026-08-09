@@ -218,6 +218,26 @@ def get_api_config() -> dict:
     config['self_ref_llm_distill_interval'] = int(
         _get_env("LMS_SELF_REF_LLM_DISTILL_INTERVAL", "5"))
 
+    # --- T2.8 算法治理开关（全部默认关闭 = 保持原行为；详见 .env.example）---
+    # 惊讶度归一化：F /= ‖J‖_F（LMS_NORM_SURPRISE=1 启用）
+    config['norm_surprise'] = (
+        _get_env("LMS_NORM_SURPRISE", "0") == "1")
+    # 回放权重钳制：replay_weight × min(surprise, cap)（0 = 不钳制）
+    config['replay_surprise_cap'] = float(
+        _get_env("LMS_REPLAY_SURPRISE_CAP", "0") or 0)
+    # long_term_latent 归一化：consolidate 后除以 L2 范数（=1 启用）
+    config['norm_latent'] = (
+        _get_env("LMS_NORM_LATENT", "0") == "1")
+    # meta 惰性规则：跳过 meta.update（省算力，=1 启用）
+    config['meta_lazy'] = (
+        _get_env("LMS_META_LAZY", "0") == "1")
+    # 自述 LLM 蒸馏跳过 bus 会话（兜底防套话，=1 启用）
+    config['self_ref_no_bus'] = (
+        _get_env("LMS_SELF_REF_NO_BUS", "0") == "1")
+    # embed 熔断器：连续 3 次失败 → 熔断 5 分钟（=1 启用）
+    config['embed_circuit'] = (
+        _get_env("LMS_EMBED_CIRCUIT", "0") == "1")
+
     # --- 快照配置 ---
     config['auto_snapshot'] = True
     config['auto_snapshot_interval'] = 50
