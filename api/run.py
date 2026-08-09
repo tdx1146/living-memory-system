@@ -59,6 +59,8 @@ def main() -> None:
             host=host,
             port=port,
             reload=True,
+            # T1.4/P0-13：uvicorn 层也给 30s 优雅停机上限（与 server.py 看门狗一致）
+            timeout_graceful_shutdown=30,
         )
     else:
         # 非重载模式直接传入 app 对象，减少一次导入开销
@@ -74,6 +76,8 @@ def main() -> None:
             app,
             host=host,
             port=port,
+            # T1.4/P0-13：uvicorn 层也给 30s 优雅停机上限（与 server.py 看门狗一致）
+            timeout_graceful_shutdown=30,
         )
 
 

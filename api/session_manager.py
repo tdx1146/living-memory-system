@@ -10,11 +10,13 @@
 """
 
 import logging
+import os
 import threading
 from typing import Dict, List, Optional
 
 from runtime.loop import LivingMemoryLoop
 from api.config import get_api_config
+from persistence.snapshot import sanitize_session_id, latest_path_for
 
 logger = logging.getLogger(__name__)
 
@@ -74,7 +76,59 @@ class SessionManager:
                 loop = LivingMemoryLoop(cfg)
                 self._sessions[session_id] = loop
                 self._configs[session_id] = cfg
+                # 阶段1-A 补丁：启动自动恢复会话快照（P0-13 优雅停机的配套）。
+                # 进程重启后会话从零开始会丢失全部记忆演化，必须自动恢复：
+                #   候选 1）snapshots/{session}/latest_{session}.pt（新命名规范）
+                #   候选 2）snapshots/latest.pt（存量旧格式，向后兼容）
+                # 任何恢复失败仅告警不阻断（fail-open，不因快照损坏拒绝服务）。
+                self._try_auto_restore(loop, session_id)
             return self._sessions[session_id]
+
+    def _try_auto_restore(self, loop: LivingMemoryLoop, session_id: str) -> None:
+        """启动自动恢复：在候选快照中选择"最有内容"者加载。
+
+        候选（按优先级）：
+          1）snapshots/{session}/latest_{session}.pt（新命名规范）
+          2）snapshots/latest.pt（存量旧格式，向后兼容）
+        但"新规范存在"不能排除"旧格式更丰富"——优雅停机可能保存
+        turn=0 的空新格式快照（首次启动即停机时），此时应回退到
+        旧格式真实快照。策略：peek 各候选的 meta.turn_count，
+        选择 turn 最大的恢复（内容最丰富的状态）。
+        任何失败仅告警不阻断（fail-open，不因快照损坏拒绝服务）。
+        """
+        try:
+            import torch
+            snap_dir = loop._snapshot_dir_path()
+            sid = sanitize_session_id(session_id)
+            candidates = [
+                latest_path_for(str(snap_dir), sid),   # 新规范 latest_{sid}.pt
+                str(snap_dir / "latest.pt"),          # 旧格式根目录 latest.pt
+            ]
+            best_path: Optional[str] = None
+            best_turn = -1
+            for path in candidates:
+                if not os.path.isfile(path):
+                    continue
+                try:
+                    st = torch.load(path, map_location="cpu", weights_only=False)
+                    turn = int((st.get("meta") or {}).get("turn_count", 0))
+                    if turn > best_turn:
+                        best_path, best_turn = path, turn
+                except Exception as e:
+                    logger.warning(
+                        f"[{session_id}] 快照探测失败 {path}: {e}")
+            if best_path is None:
+                return
+            try:
+                loop.load_state(best_path)
+                logger.info(
+                    f"[{session_id}] 启动自动恢复快照: {best_path} "
+                    f"(turn={loop.turn_count})")
+            except Exception as e:
+                logger.warning(
+                    f"[{session_id}] 快照恢复失败 {best_path}: {e}")
+        except Exception as e:
+            logger.warning(f"[{session_id}] 自动恢复流程异常（跳过）: {e}")
 
     def get(self, session_id: str) -> Optional[LivingMemoryLoop]:
         """获取指定 session（不存在返回 None）。"""

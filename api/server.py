@@ -7,6 +7,7 @@
 端点概览:
     POST   /chat              完整对话（手动控制 LLM 注入时机）
     POST   /chat/simple       简化对话（自动处理记忆+LLM查询）
+    POST   /recall            只读情景检索（T1.3/P0-9：不 process_turn、不调 LLM）
     GET    /status/{sid}      查询会话记忆状态
     POST   /snapshot/{sid}    保存快照
     POST   /restore/{sid}     从快照恢复
@@ -21,14 +22,16 @@ run_in_executor 将阻塞调用交给线程池，避免阻塞事件循环。
 """
 
 import os
+import re
 import asyncio
 import logging
+import threading
 import time
 from datetime import datetime
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from api.session_manager import SessionManager
 from api.config import get_api_config
@@ -91,6 +94,26 @@ class ChatRequest(BaseModel):
     user_input: str = Field(..., description="用户输入文本")
     session_id: str = Field("default", description="会话标识")
     llm_output: str = Field("", description="上一轮LLM输出（可选）")
+    # P0-3 止血：兼容字段 sid（旧版 lms-http MCP 客户端发送）。
+    # pydantic 默认 extra="ignore" 会静默丢弃未知字段 → 旧客户端所有 /chat
+    # 请求的 sid 被丢弃、session_id 恒为 default，全部流量静默落进 default 脑
+    # （P0-2/P0-3 根因）。显式声明别名并在映射时记录告警，防静默丢弃重演。
+    sid: Optional[str] = Field(None, description="session_id 兼容别名（旧客户端）")
+
+    @model_validator(mode="after")
+    def _apply_sid_alias(self) -> "ChatRequest":
+        """P0-3：旧客户端 sid → session_id 映射（session_id 显式指定时以它为准）。"""
+        if self.sid is not None:
+            if self.session_id == "default":
+                self.session_id = self.sid
+                logger.warning(
+                    f"[ChatRequest] 兼容字段 sid='{self.sid}' 已映射为 session_id"
+                    "（P0-3 兼容；新客户端请直接使用 session_id）")
+            elif self.session_id != self.sid:
+                logger.warning(
+                    f"[ChatRequest] 同时收到 session_id='{self.session_id}' 与 sid='{self.sid}'，"
+                    "以 session_id 为准（P0-3 兼容告警）")
+        return self
 
 
 class ChatResponse(BaseModel):
@@ -122,6 +145,30 @@ class RestoreRequest(BaseModel):
 class DreamRequest(BaseModel):
     steps: int = Field(20, description="做梦步数")
     full_cycle: bool = Field(False, description="是否启用完整七阶段周期")
+
+
+class RecallRequest(BaseModel):
+    """T1.3/P0-9：/recall 只读检索请求。"""
+    session_id: str = Field("default", description="会话标识")
+    query: str = Field(..., description="检索查询文本")
+    k: int = Field(5, description="返回条数（服务端钳制到 1-20）")
+    # 兼容旧客户端 sid 字段（与 ChatRequest 同策略，防静默丢弃）
+    sid: Optional[str] = Field(None, description="session_id 兼容别名（旧客户端）")
+
+    @model_validator(mode="after")
+    def _apply_sid_alias(self) -> "RecallRequest":
+        """旧客户端 sid → session_id 映射（与 ChatRequest 的 P0-3 兼容同款）。"""
+        if self.sid is not None:
+            if self.session_id == "default":
+                self.session_id = self.sid
+                logger.warning(
+                    f"[RecallRequest] 兼容字段 sid='{self.sid}' 已映射为 session_id"
+                    "（P0-3 兼容；新客户端请直接使用 session_id）")
+            elif self.session_id != self.sid:
+                logger.warning(
+                    f"[RecallRequest] 同时收到 session_id='{self.session_id}' 与 "
+                    f"sid='{self.sid}'，以 session_id 为准（P0-3 兼容告警）")
+        return self
 
 
 # ---------------------------------------------------------------------------
@@ -176,11 +223,6 @@ app = FastAPI(
 # ---------------------------------------------------------------------------
 # 工具函数
 # ---------------------------------------------------------------------------
-def _now_ts() -> str:
-    """返回紧凑时间戳字符串（用于快照文件名）。"""
-    return datetime.now().strftime("%Y%m%d_%H%M%S")
-
-
 def _status_for(loop) -> dict:
     """从 LivingMemoryLoop 提取状态字典（含情景缓冲区与LLM标记）。"""
     status = loop.get_status()
@@ -190,6 +232,55 @@ def _status_for(loop) -> dict:
         status['episodic_buffer_size'] = 0
     status['llm_enabled'] = loop.bridge is not None
     return status
+
+
+# ---------------------------------------------------------------------------
+# P0-7 止血：快照路径钳制（/snapshot 与 /restore 共用）
+# ---------------------------------------------------------------------------
+# 快照文件名白名单：安全字符集 + .pt 后缀。覆盖新式 {session}_{YYYYMMDD_HHMMSS}.pt
+# 与存量 latest.pt / snapshot_{n}.pt / snap_{session}_{ts}.pt 等命名规则文件；
+# 拒绝分隔符、..、绝对路径及任何目录外路径（详见 _clamp_snapshot_path）。
+_SNAPSHOT_FILENAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\.pt$")
+# T1.1/P0-5：新命名规范允许一层会话子目录
+# （snapshots/{session}/snapshot_{session}_{turn}_{ts}.pt 等）；
+# 两级组件均须命中安全字符集，拒绝更深层级。
+_SNAPSHOT_SUBDIR_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*\.pt$")
+
+
+def _clamp_snapshot_path(raw_path) -> Optional[str]:
+    """P0-7 止血：把用户提供的快照路径钳制到 snapshots/ 目录内。
+
+    规则：
+      1. 拒绝空值/非字符串/绝对路径/含 .. 的路径（拒绝任何穿越）；
+      2. 反斜杠统一归一为斜杠；
+      3. 含斜杠 → 仅允许一层会话子目录（T1.1 新命名规范，命中
+         _SNAPSHOT_SUBDIR_RE）；不含斜杠 → 平铺旧格式（命中
+         _SNAPSHOT_FILENAME_RE）；其余一律拒绝；
+      4. 最终路径 = snapshots/ + 规范化相对路径，绝对化后再次校验目录
+         包含关系（防御纵深）。
+    任何不满足 → 返回 None（调用方回 4xx），绝不触碰目录外文件。
+    """
+    if not raw_path or not isinstance(raw_path, str):
+        return None
+    path = raw_path.strip().replace("\\", "/")
+    if path.startswith("/"):
+        return None  # 绝对路径
+    if ".." in path:
+        return None  # 路径穿越
+    if "/" in path:
+        # T1.1：允许且仅允许一层会话子目录（snapshots/{session}/{file}.pt）
+        if not _SNAPSHOT_SUBDIR_RE.match(path):
+            return None
+    else:
+        # 平铺旧格式（存量 latest.pt / snapshot_{n}.pt / {sid}_{ts}.pt）
+        if not _SNAPSHOT_FILENAME_RE.match(path):
+            return None
+    snapshot_dir = os.path.abspath("./snapshots")
+    full = os.path.abspath(os.path.join(snapshot_dir, path))
+    if not full.startswith(snapshot_dir + os.sep):
+        return None  # 防御纵深：必须仍落在 snapshots/ 内
+    return full
 
 
 # ---------------------------------------------------------------------------
@@ -366,6 +457,46 @@ async def feed(req: FeedRequest):
     )
 
 
+@app.post("/recall")
+async def recall(req: RecallRequest):
+    """只读情景检索端点（T1.3/P0-9）。
+
+    编码 query + 检索 episodic 缓冲区，**不 process_turn、不调 LLM、
+    不写缓冲、不落盘**——纯读取路径，目标耗时 ~1s 内。
+    （/chat 7-10s 的根因是耦合了 LLM 对话与检索，本端点剥离。）
+
+    会话不存在时惰性创建空脑（与 /self-ref/voice 一致）；创建本身
+    不产生任何记忆写入。
+    """
+    if not req.query or not req.query.strip():
+        raise HTTPException(status_code=400, detail="query 不能为空")
+    k = max(1, min(int(req.k), 20))  # 钳制返回条数
+
+    sm = get_session_manager()
+    loop = sm.get_or_create(req.session_id)
+
+    t0 = time.time()
+    try:
+        results = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: loop.recall_episodic_readonly(req.query, k=k))
+    except Exception as e:
+        # 只读路径异常：fail-open，返回空结果，绝不 500 拖垮调用方
+        logger.error(f"[{req.session_id}] /recall 检索失败（返回空）: {e}")
+        results = []
+    duration_ms = round((time.time() - t0) * 1000, 1)
+
+    return {
+        "session_id": req.session_id,
+        "query": req.query,
+        "k": k,
+        "count": len(results),
+        "results": results,
+        "duration_ms": duration_ms,
+        # 只读校验锚点：检索不应改变轮次（测试与可观测性用）
+        "turn_count": loop.turn_count,
+    }
+
+
 @app.get("/status/{session_id}")
 async def get_status(session_id: str):
     """返回指定 session 的记忆系统状态。"""
@@ -384,9 +515,12 @@ async def get_status(session_id: str):
 
 @app.post("/snapshot/{session_id}")
 async def snapshot(session_id: str, req: SnapshotRequest):
-    """保存指定 session 的快照。
+    """保存指定 session 的快照（T1.1/P0-5 新命名规范）。
 
-    默认保存到 ./snapshots/{session_id}_{timestamp}.pt
+    P0-7 止血延续：忽略用户传入的任意 path，路径完全由服务端生成。
+    新命名：snapshots/{session}/snapshot_{session}_{turn}_{ts}.pt，
+    并同步 snapshots/{session}/latest_{session}.pt（最新指针）。
+    session_id 参与路径前清洗为安全字符集，杜绝任何路径穿越。
     """
     sm = get_session_manager()
     loop = sm.get(session_id)
@@ -396,25 +530,24 @@ async def snapshot(session_id: str, req: SnapshotRequest):
             detail=f"会话 '{session_id}' 不存在",
         )
 
-    snapshot_dir = "./snapshots"
-    os.makedirs(snapshot_dir, exist_ok=True)
-
-    if req.path:
-        path = req.path
-    else:
-        path = os.path.join(
-            snapshot_dir, f"{session_id}_{_now_ts()}.pt")
-
     try:
-        loop.save_state(path)
-        abs_path = os.path.abspath(path)
-        logger.info(f"[{session_id}] 快照已保存: {abs_path}")
+        path = loop.save_session_state()
+        if path is None:
+            # 写锁超时被跳过（fail-open 策略的显式反馈，非静默）
+            raise HTTPException(
+                status_code=503,
+                detail="快照写锁超时，保存被跳过，请稍后重试",
+            )
+        logger.info(f"[{session_id}] 快照已保存: {path}")
         return {
             "session_id": session_id,
             "saved": True,
-            "path": abs_path,
+            "path": path,
+            "latest_path": loop.latest_snapshot_path(),
             "turn_count": loop.turn_count,
         }
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"[{session_id}] 快照保存失败: {e}")
         raise HTTPException(
@@ -425,9 +558,21 @@ async def snapshot(session_id: str, req: SnapshotRequest):
 
 @app.post("/restore/{session_id}")
 async def restore(session_id: str, req: RestoreRequest):
-    """从快照恢复指定 session 的状态。"""
+    """从快照恢复指定 session 的状态。
+
+    P0-7 止血：只允许 snapshots/ 内符合命名规则的 .pt 文件；
+    任何 ../、绝对路径、目录外路径一律 4xx 拒绝（防任意文件 torch.load）。
+    """
     if not req.path:
         raise HTTPException(status_code=400, detail="path 不能为空")
+
+    # P0-7：路径钳制（非法/目录外路径直接拒绝）
+    full_path = _clamp_snapshot_path(req.path)
+    if full_path is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"非法快照路径: {req.path!r}（仅允许 snapshots/ 内的 .pt 快照文件）",
+        )
 
     sm = get_session_manager()
     loop = sm.get(session_id)
@@ -437,19 +582,19 @@ async def restore(session_id: str, req: RestoreRequest):
             detail=f"会话 '{session_id}' 不存在",
         )
 
-    if not os.path.exists(req.path):
+    if not os.path.isfile(full_path):
         raise HTTPException(
             status_code=404,
-            detail=f"快照文件不存在: {req.path}",
+            detail=f"快照文件不存在: {full_path}",
         )
 
     try:
-        loop.load_state(req.path)
-        logger.info(f"[{session_id}] 已从 {req.path} 恢复状态")
+        loop.load_state(full_path)
+        logger.info(f"[{session_id}] 已从 {full_path} 恢复状态")
         return {
             "session_id": session_id,
             "restored": True,
-            "path": req.path,
+            "path": full_path,
             "status": _status_for(loop),
         }
     except Exception as e:
@@ -594,14 +739,67 @@ async def on_startup():
         f"dream_steps={scheduler.dream_steps})")
 
 
+# ---------------------------------------------------------------------------
+# T1.4/P0-13：优雅停机落盘
+# ---------------------------------------------------------------------------
+# SIGTERM/SIGINT 由 uvicorn 捕获并触发优雅停机（运行 on_shutdown）；
+# 此处给出 30s 优雅窗口（LMS_SHUTDOWN_GRACE_SECONDS 可覆盖）：on_shutdown 内
+# 启动看门狗线程，超时则 os._exit 强制退出，防止落盘卡死导致进程无限挂起。
+SHUTDOWN_GRACE_SECONDS = float(os.environ.get("LMS_SHUTDOWN_GRACE_SECONDS", "30"))
+
+
+def _start_shutdown_watchdog(grace_seconds: float = SHUTDOWN_GRACE_SECONDS) -> None:
+    """启动停机看门狗：grace 秒后强制退出（兜底防挂死）。
+
+    uvicorn 收到 SIGTERM/SIGINT 后进入优雅停机并触发 on_shutdown；
+    若 on_shutdown 内落盘卡死，看门狗线程到点 os._exit 强制退出，
+    保证进程不会无限挂起（T1.4/P0-13）。
+    """
+    def _force_exit() -> None:
+        time.sleep(grace_seconds)
+        logger.critical(
+            f"优雅停机超时（>{grace_seconds}s），强制退出（可能未完成全部落盘）")
+        os._exit(1)
+
+    threading.Thread(
+        target=_force_exit, daemon=True, name="shutdown-watchdog").start()
+
+
 @app.on_event("shutdown")
 async def on_shutdown():
-    """服务关闭时停止调度器并清理会话。"""
+    """优雅停机（T1.4/P0-13）：先落盘再清理。
+
+    顺序（比任务原文"先 save 再停调度器"更安全的一个偏差，理由见下）：
+      1. 停止做梦调度器（join 等待，≤5s），杜绝落盘与后台做梦并发写同一脑；
+      2. 对每个活跃会话 save_session_state()（新命名规范最终快照）；
+      3. clear 会话。
+    若做梦进行中直接落盘，会读到半巩固状态；先停调度器再落盘可保证
+    快照一致性，且同样满足"停机前保存最终快照"的目标。
+    """
+    logger.info("开始优雅停机：停止调度器 → 保存最终快照 → 清理会话")
+    _start_shutdown_watchdog()  # 30s 兜底强退
+
     scheduler = get_dream_scheduler()
     scheduler.stop()
     logger.info("DreamScheduler 已停止")
 
     sm = get_session_manager()
+    saved_paths = []
+    for sid in sm.list_sessions():
+        loop = sm.get(sid)
+        if loop is None:
+            continue
+        try:
+            path = loop.save_session_state()
+            if path:
+                saved_paths.append(path)
+                logger.info(f"[{sid}] 停机最终快照已保存: {path}")
+            else:
+                logger.warning(f"[{sid}] 停机最终快照因写锁超时被跳过")
+        except Exception as e:
+            logger.error(f"[{sid}] 停机最终快照保存失败: {e}")
+    logger.info(f"优雅停机：已保存 {len(saved_paths)} 个会话的最终快照")
+
     n = sm.clear()
     logger.info(f"服务关闭，已清理 {n} 个会话")
 

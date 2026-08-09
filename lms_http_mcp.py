@@ -28,9 +28,11 @@ def lms_recall(user_input: str, sid: str = DEFAULT_SESSION) -> dict:
         包含记忆context的字典
     """
     try:
+        # P0-3 止血修复：旧请求体用 sid 字段，服务端 pydantic 默认忽略未知字段
+        # → 检索也静默落进 default 脑。统一改用 session_id 字段。
         response = requests.post(
             f"{LMS_API_URL}/chat",
-            json={"sid": sid, "user_input": user_input},
+            json={"session_id": sid, "user_input": user_input},
             timeout=10
         )
         response.raise_for_status()
@@ -58,14 +60,17 @@ def lms_store(user_input: str, llm_output: str = "", sid: str = DEFAULT_SESSION)
         存储结果
     """
     try:
-        # 组合对话文本
-        text = f"用户: {user_input}"
-        if llm_output:
-            text += f"\n助手: {llm_output}"
-        
+        # P0-2 止血修复：旧实现拼接了 text 却从未发送（死代码），且请求体用 sid
+        # 字段（服务端 pydantic 默认忽略未知字段）→ 所有 MCP 存储静默落进 default 脑。
+        # 现在真正 POST {session_id, user_input, llm_output}，文本由服务端
+        # process_turn(user_input, llm_output) 落库（session_id 为统一字段名）。
         response = requests.post(
             f"{LMS_API_URL}/chat",
-            json={"sid": sid, "user_input": user_input},
+            json={
+                "session_id": sid,
+                "user_input": user_input,
+                "llm_output": llm_output,
+            },
             timeout=10
         )
         response.raise_for_status()

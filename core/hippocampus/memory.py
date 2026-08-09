@@ -245,12 +245,16 @@ class MemoryManager:
         )
         self._episodic_buffer.append(entry)
 
-    def recall_episodic(self, query_vector: torch.Tensor,
-                        top_k: int = 3,
-                        fallback_query: Optional[torch.Tensor] = None,
-                        source_filter: Optional[str] = 'external'
-                        ) -> List[EpisodicEntry]:
-        """基于语义相似度检索情景记忆，返回最相关的文本条目。
+    def _recall_episodic_scored(
+            self, query_vector: torch.Tensor,
+            top_k: int = 3,
+            fallback_query: Optional[torch.Tensor] = None,
+            source_filter: Optional[str] = 'external'
+            ) -> List[Tuple[float, EpisodicEntry]]:
+        """基于语义相似度检索情景记忆，返回 (相似度, 条目) 列表。
+
+        （0.5.0/T1.3 支撑：原 recall_episodic 函数体整体提取至此，
+        额外保留相似度分数供 /recall 只读端点返回。行为与原实现一致。）
 
         用查询向量与缓冲区中所有条目的语义向量做余弦相似度，
         返回相似度最高的 top_k 个条目。
@@ -278,7 +282,7 @@ class MemoryManager:
                 ``'self_ref'`` 只检索自指条目，``None`` 不过滤。
 
         返回:
-            最相关的 EpisodicEntry 列表（按相似度降序）。
+            [(score, EpisodicEntry), ...]（按相似度降序，最多 top_k 条）；
             缓冲区为空时返回空列表。
         """
         if len(self._episodic_buffer) == 0:
@@ -341,7 +345,43 @@ class MemoryManager:
         # 按相似度降序取 top_k
         k = min(top_k, len(scored))
         scored.sort(key=lambda x: x[0], reverse=True)
-        return [entry for _, entry in scored[:k]]
+        return scored[:k]
+
+    def recall_episodic(self, query_vector: torch.Tensor,
+                        top_k: int = 3,
+                        fallback_query: Optional[torch.Tensor] = None,
+                        source_filter: Optional[str] = 'external'
+                        ) -> List[EpisodicEntry]:
+        """基于语义相似度检索情景记忆，返回最相关的文本条目。
+
+        （0.5.0/T1.3 支撑：委托 _recall_episodic_scored()，行为与旧版一致。）
+
+        返回:
+            最相关的 EpisodicEntry 列表（按相似度降序）。
+            缓冲区为空时返回空列表。
+        """
+        scored = self._recall_episodic_scored(
+            query_vector, top_k=top_k, fallback_query=fallback_query,
+            source_filter=source_filter)
+        return [entry for _, entry in scored]
+
+    def recall_episodic_scored(
+            self, query_vector: torch.Tensor,
+            top_k: int = 3,
+            fallback_query: Optional[torch.Tensor] = None,
+            source_filter: Optional[str] = 'external'
+            ) -> List[Tuple[float, EpisodicEntry]]:
+        """带相似度分数的情景检索（只读，0.5.0/T1.3 /recall 端点使用）。
+
+        与 recall_episodic 共用同一实现，额外返回每条目与查询向量的
+        余弦相似度分数。
+
+        返回:
+            [(score, EpisodicEntry), ...]（按相似度降序，最多 top_k 条）。
+        """
+        return self._recall_episodic_scored(
+            query_vector, top_k=top_k, fallback_query=fallback_query,
+            source_filter=source_filter)
 
     # ------------------------------------------------------------------ #
     #  公开缓冲区访问接口

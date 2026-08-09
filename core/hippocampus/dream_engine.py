@@ -27,6 +27,7 @@
 """
 
 import os
+import re
 import time
 import random
 import logging
@@ -35,6 +36,52 @@ from typing import Optional, Tuple, List
 
 import torch
 
+# fcntl 伴生锁（T1.2/P0-4 过渡期兜底；与 persistence/snapshot.py 同款模式，
+# core 层保持自包含不反向依赖 persistence——阶段 1-B 单写者收口后此落盘
+# 将统一走 API，届时可删去本处重复代码）
+try:
+    import fcntl
+    _DREAM_HAVE_FCNTL = True
+except ImportError:  # pragma: no cover - 仅非 POSIX 平台
+    fcntl = None  # type: ignore[assignment]
+    _DREAM_HAVE_FCNTL = False
+
+_DREAM_LOCK_TIMEOUT = 5.0
+_DREAM_LOCK_RETRY = 0.05
+
+
+def _dream_lock_path_for(path: str) -> str:
+    """伴生锁文件路径（与 persistence.snapshot._lock_path_for 同规则）。"""
+    return path + ".lock"
+
+
+def _dream_acquire_write_lock(lock_path: str) -> Optional[int]:
+    """排他锁（非阻塞 + 重试至超时）；超时返回 None（调用方跳过保存，fail-open）。"""
+    if not _DREAM_HAVE_FCNTL:
+        return None
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    deadline = time.time() + _DREAM_LOCK_TIMEOUT
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd
+        except (BlockingIOError, OSError):
+            if time.time() >= deadline:
+                os.close(fd)
+                return None
+            time.sleep(_DREAM_LOCK_RETRY)
+
+
+def _dream_release_lock(fd: Optional[int]) -> None:
+    """释放锁并关闭 fd（尽力而为）。"""
+    if fd is None:
+        return
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError:
+        pass
+    os.close(fd)
+
 from core.types import Activation
 
 logger = logging.getLogger("dream_engine")
@@ -42,7 +89,7 @@ logger = logging.getLogger("dream_engine")
 # 快照格式版本（与 persistence.snapshot.SNAPSHOT_VERSION 保持一致，
 # 此处硬编码以避免 core 层反向依赖 persistence 层，保持架构 DAG 无环）
 # 0.3.0: 新增可选 meta 字段（元可塑性状态）
-_SNAPSHOT_VERSION = "0.3.0"
+_SNAPSHOT_VERSION = "0.5.0"
 
 
 class DreamEngine:
@@ -108,6 +155,8 @@ class DreamEngine:
         self.memory = memory
         self.embedder = embedder
         self.meta = meta
+        # 保存 config 引用（T1.1/P0-5：_save_snapshot 读取 session_id 用）
+        self.config = config
 
         # --- 便捷属性（转发到 attractor，便于测试与外部访问） ---
         self.num_nodes = attractor.num_nodes
@@ -875,6 +924,10 @@ class DreamEngine:
         coherence/encounter_count）和记忆潜变量。当 meta 可用时，
         额外保存元可塑性状态（meta 字段）。
 
+        0.5.0/T1.1：目标路径改为会话级 `snapshots/{session}/latest_{session}.pt`
+        （session_id 取自 config，默认 default）；写入加 fcntl 排他锁
+        （T1.2 过渡期兜底，超时告警跳过，fail-open）。
+
         返回:
             快照文件路径，保存失败时返回 None。
         """
@@ -889,31 +942,50 @@ class DreamEngine:
             }
             memory_state = self.memory.get_state()
 
+            session_id = str(self.config.get('session_id', 'default'))
+            sid = re.sub(r"[^A-Za-z0-9_-]", "_", session_id) or "session"
+
             data = {
                 'version': _SNAPSHOT_VERSION,
                 'timestamp': time.time(),
                 'attractor': landscape,
                 'purpose': purpose_dict,
                 'memory': memory_state,
+                # 0.5.0：会话归属元数据（与 persistence.snapshot 顶层一致）
+                'session_id': sid,
             }
             # 元可塑性状态（可选）
             if self.meta is not None:
                 data['meta'] = self.meta.get_state()
 
             snap_dir = self.snapshot_dir
-            os.makedirs(snap_dir, exist_ok=True)
-            path = os.path.join(snap_dir, 'latest.pt')
-            # 原子写入：先写临时文件，再原子替换，避免崩溃时截断原有快照
-            fd, tmp_path = tempfile.mkstemp(
-                prefix=".snap_", suffix=".tmp", dir=snap_dir)
+            path = os.path.join(snap_dir, sid, f'latest_{sid}.pt')
+
+            # 先确保会话子目录存在（锁文件与快照同目录，目录缺失时无法建锁）
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+
+            # T1.2：fcntl 排他锁（写路径串行化）
+            lock_fd = _dream_acquire_write_lock(_dream_lock_path_for(path))
+            if lock_fd is None and _DREAM_HAVE_FCNTL:
+                logger.warning(
+                    f"做梦快照写锁超时（{_DREAM_LOCK_TIMEOUT}s），本次跳过: {path}")
+                return None
+
             try:
-                with os.fdopen(fd, "wb") as f:
-                    torch.save(data, f)
-                os.replace(tmp_path, path)
-            except Exception:
-                if os.path.exists(tmp_path):
-                    os.remove(tmp_path)
-                raise
+                # 原子写入：先写临时文件，再原子替换，避免崩溃时截断原有快照
+                fd, tmp_path = tempfile.mkstemp(
+                    prefix=".snap_", suffix=".tmp",
+                    dir=os.path.dirname(path))
+                try:
+                    with os.fdopen(fd, "wb") as f:
+                        torch.save(data, f)
+                    os.replace(tmp_path, path)
+                except Exception:
+                    if os.path.exists(tmp_path):
+                        os.remove(tmp_path)
+                    raise
+            finally:
+                _dream_release_lock(lock_fd)
             logger.info(f"做梦快照已保存: {path}")
             return path
         except Exception as e:

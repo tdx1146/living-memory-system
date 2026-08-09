@@ -13,10 +13,21 @@
     - 0.2.0: 增加 memory 和 tokenizer 可选字段（N1+N2 修复）。
     - 0.3.0: 增加 meta 元可塑性可选字段（向后兼容：旧快照无此字段时跳过）。
     - 0.4.0: 增加 self_ref 自指回路可选字段（向后兼容：旧快照无此字段时跳过）。
+    - 0.5.0（阶段 1-A/P0-5+P0-4）:
+        * 顶层新增可选元数据 session_id / turn_count / last_entropy_ratio
+          （向后兼容：旧快照无这些字段也能正常 load）；
+        * save()/load 全路径（含 _torch_load）加 fcntl.flock 伴生 `.lock` 文件锁
+          —— 写排他锁（拿不到等待重试，超时告警跳过、不崩溃），读共享锁
+          （超时告警后无锁直读，fail-open）。过渡期兜底，阶段 1-B 单写者收口；
+        * 新增会话级路径助手：snapshot_path_for() / latest_path_for() /
+          sanitize_session_id()，命名 `snapshot_{session}_{turn}_{ts}.pt` 存于
+          `snapshots/{session}/` 子目录，每会话维护 `latest_{session}.pt`。
 """
 
 import os
+import re
 import time
+import shutil
 import tempfile
 import torch
 import logging
@@ -26,8 +37,119 @@ logger = logging.getLogger(__name__)
 
 # 快照格式版本号（N1+N2: 0.2.0 增加 memory 和 tokenizer 可选字段；
 #                  0.3.0 增加 meta 元可塑性可选字段；
-#                  0.4.0 增加 self_ref 自指回路可选字段）
-SNAPSHOT_VERSION = "0.4.0"
+#                  0.4.0 增加 self_ref 自指回路可选字段；
+#                  0.5.0 增加顶层元数据 session_id/turn_count/last_entropy_ratio
+#                  + fcntl 伴生锁 + 会话级命名助手，见上方版本历史）
+SNAPSHOT_VERSION = "0.5.0"
+
+# ---------------------------------------------------------------------------
+# fcntl 伴生锁（P0-4 过渡期兜底 / T1.2）
+# ---------------------------------------------------------------------------
+# 锁文件 = 目标快照路径 + ".lock"（伴生文件，不随快照原子替换而消失）。
+# 写路径持排他锁（LOCK_EX），读路径持共享锁（LOCK_SH）：
+#   - 多进程并发写同一快照时互相串行，杜绝"读旧写新"覆盖整段演化；
+#   - 锁拿不到（如另一写者占用）→ 短间隔重试至超时 → 写超时告警并跳过保存
+#     （fail-open：宁可这次不落盘，也不崩溃）；读超时告警后无锁直读
+#     （原子替换保证读到的一定是完整文件，读侧风险极低）。
+# 非 POSIX 平台（无 fcntl）自动降级为无锁，保持原有行为（fail-open）。
+try:
+    import fcntl
+    _HAVE_FCNTL = True
+except ImportError:  # pragma: no cover - 仅非 POSIX 平台
+    fcntl = None  # type: ignore[assignment]
+    _HAVE_FCNTL = False
+
+# 写锁等待超时（秒，T1.2 要求 ~5s）与重试间隔
+WRITE_LOCK_TIMEOUT = float(os.environ.get("LMS_SNAPSHOT_LOCK_TIMEOUT", "5.0"))
+READ_LOCK_TIMEOUT = WRITE_LOCK_TIMEOUT
+_LOCK_RETRY_INTERVAL = 0.05
+
+
+def _lock_path_for(path: str) -> str:
+    """返回快照路径的伴生锁文件路径（path + .lock）。"""
+    return path + ".lock"
+
+
+def _acquire_lock(lock_path: str, exclusive: bool, timeout: float) -> Optional[int]:
+    """对伴生锁文件加 flock（非阻塞 + 重试至超时）。
+
+    参数:
+        lock_path: 锁文件路径。
+        exclusive: True=排他锁（写），False=共享锁（读）。
+        timeout: 总等待超时（秒）。
+
+    返回:
+        已加锁的文件描述符（持有期间必须保持打开）；超时返回 None。
+        调用方负责 finally 中 _release_lock 释放。
+    """
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    op = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+    deadline = time.time() + timeout
+    while True:
+        try:
+            fcntl.flock(fd, op | fcntl.LOCK_NB)
+            return fd
+        except (BlockingIOError, OSError):
+            if time.time() >= deadline:
+                os.close(fd)
+                return None
+            time.sleep(_LOCK_RETRY_INTERVAL)
+
+
+def _release_lock(fd: int) -> None:
+    """释放 flock 并关闭锁文件描述符（尽力而为，失败仅告警）。"""
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError as e:  # pragma: no cover - 极边缘场景
+        logger.warning(f"释放快照锁失败（忽略）: {e}")
+    os.close(fd)
+
+
+# ---------------------------------------------------------------------------
+# 会话级快照路径助手（P0-5 / T1.1 新命名规范）
+# ---------------------------------------------------------------------------
+# 新命名：snapshots/{session}/snapshot_{session}_{turn}_{ts}.pt
+# 最新指针：snapshots/{session}/latest_{session}.pt
+# 旧平铺文件（latest.pt / snapshot_{n}.pt / {sid}_{ts}.pt）继续可读，不迁移。
+
+
+def sanitize_session_id(session_id) -> str:
+    """把 session_id 清洗为文件系统安全字符集（防路径穿越/特殊字符）。
+
+    与 api/server.py P0-7 的清洗规则保持一致：仅保留字母数字、下划线、连字符；
+    空值回退 "default"，全非法字符回退 "session"。
+    """
+    s = str(session_id or "default").strip()
+    s = re.sub(r"[^A-Za-z0-9_-]", "_", s)
+    return s or "session"
+
+
+def snapshot_path_for(snapshot_dir: str, session_id: str,
+                      turn_count: int, ts: Optional[str] = None) -> str:
+    """生成轮次快照路径：snapshots/{session}/snapshot_{session}_{turn}_{ts}.pt。
+
+    参数:
+        snapshot_dir: 快照根目录。
+        session_id: 会话标识（自动清洗）。
+        turn_count: 当前轮次（写入文件名，保证按轮次归档）。
+        ts: 时间戳字符串（默认当前时间 %Y%m%d_%H%M%S）。
+
+    返回:
+        完整快照文件路径。
+    """
+    sid = sanitize_session_id(session_id)
+    ts = ts or time.strftime("%Y%m%d_%H%M%S")
+    return os.path.join(snapshot_dir, sid,
+                        f"snapshot_{sid}_{int(turn_count)}_{ts}.pt")
+
+
+def latest_path_for(snapshot_dir: str, session_id: str) -> str:
+    """生成会话最新快照路径：snapshots/{session}/latest_{session}.pt。
+
+    写新快照时同步更新该文件，作为该会话"最新状态指针"。
+    """
+    sid = sanitize_session_id(session_id)
+    return os.path.join(snapshot_dir, sid, f"latest_{sid}.pt")
 
 
 class Snapshot:
@@ -103,8 +225,19 @@ class Snapshot:
              memory_state: Optional[dict] = None,
              tokenizer_state: Optional[dict] = None,
              meta_state: Optional[dict] = None,
-             self_ref_state: Optional[dict] = None) -> None:
+             self_ref_state: Optional[dict] = None,
+             session_id: Optional[str] = None,
+             turn_count: Optional[int] = None,
+             last_entropy_ratio: Optional[float] = None) -> bool:
         """保存吸引子景观和目的层状态到文件。
+
+        0.5.0 新增：
+          - 顶层元数据 session_id / turn_count / last_entropy_ratio（可选，
+            向后兼容：旧快照无这些字段也能正常 load）；
+          - fcntl 排他锁（伴生 .lock 文件）：拿不到锁时等待重试
+            （默认 5s，LMS_SNAPSHOT_LOCK_TIMEOUT 可覆盖），超时记录告警
+            并跳过保存（fail-open，不崩溃）；
+          - 返回 bool：True=已保存，False=因写锁超时被跳过。
 
         参数:
             path: 保存路径（.pt文件）
@@ -126,6 +259,12 @@ class Snapshot:
             self_ref_state: 自指回路状态字典（可选，0.4.0）。由
                 core.hippocampus.self_referential 层的 get_state() 获取后传入。
                 persistence 层仅透传，不解释其内容。为 None 时不保存此字段。
+            session_id: 会话标识（可选，0.5.0 顶层元数据）。
+            turn_count: 当前轮次（可选，0.5.0 顶层元数据，供重启后连续）。
+            last_entropy_ratio: 最近一轮熵比（可选，0.5.0 顶层元数据）。
+
+        返回:
+            True 表示已保存；False 表示因写锁超时被跳过（fail-open）。
         """
         data = {
             'version': SNAPSHOT_VERSION,
@@ -150,24 +289,99 @@ class Snapshot:
         if self_ref_state is not None:
             data['self_ref'] = self_ref_state
 
+        # 0.5.0: 顶层元数据（可选；旧快照无这些字段也能 load）
+        if session_id is not None:
+            data['session_id'] = str(session_id)
+        if turn_count is not None:
+            data['turn_count'] = int(turn_count)
+        if last_entropy_ratio is not None:
+            data['last_entropy_ratio'] = float(last_entropy_ratio)
+
         # 确保目录存在
         dir_path = os.path.dirname(path)
         if dir_path:
             os.makedirs(dir_path, exist_ok=True)
 
-        # 原子写入：先写临时文件，再原子替换，避免崩溃时截断原有快照
-        fd, tmp_path = tempfile.mkstemp(
-            prefix=".snap_", suffix=".tmp",
-            dir=dir_path if dir_path else ".")
+        # 0.5.0: fcntl 排他锁（写路径串行化，P0-4 过渡期兜底）
+        if _HAVE_FCNTL:
+            lock_fd = _acquire_lock(
+                _lock_path_for(path), exclusive=True,
+                timeout=WRITE_LOCK_TIMEOUT)
+            if lock_fd is None:
+                # 写锁拿不到：等待重试已超时 → 告警并跳过保存（fail-open，不崩溃）
+                logger.warning(
+                    f"快照写锁超时（{WRITE_LOCK_TIMEOUT}s），本次保存跳过: {path}")
+                return False
+        else:
+            lock_fd = None  # 非 POSIX 平台无 fcntl：无锁直写（fail-open）
+
         try:
-            with os.fdopen(fd, "wb") as f:
-                torch.save(data, f)  # 写到文件句柄而非路径
-            os.replace(tmp_path, path)  # 原子替换
-        except Exception:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-            raise
+            # 原子写入：先写临时文件，再原子替换，避免崩溃时截断原有快照
+            fd, tmp_path = tempfile.mkstemp(
+                prefix=".snap_", suffix=".tmp",
+                dir=dir_path if dir_path else ".")
+            try:
+                with os.fdopen(fd, "wb") as f:
+                    torch.save(data, f)  # 写到文件句柄而非路径
+                os.replace(tmp_path, path)  # 原子替换
+            except Exception:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+                raise
+        finally:
+            if lock_fd is not None:
+                _release_lock(lock_fd)
         logger.info(f"快照已保存到 {path}")
+        return True
+
+    def save_copy(self, src_path: str, dst_path: str) -> bool:
+        """把已保存的快照文件原子复制到另一路径（T1.1：同步 latest_{session}.pt）。
+
+        与 save() 同样受 fcntl 排他锁保护（锁目标路径的伴生 .lock 文件）；
+        写锁超时则告警跳过（fail-open，不崩溃）。复制为 tmp + os.replace，
+        保证读者永远看到完整文件。
+
+        参数:
+            src_path: 源快照文件（已完整落盘）。
+            dst_path: 目标路径（如 snapshots/{session}/latest_{session}.pt）。
+
+        返回:
+            True 表示已复制；False 表示因写锁超时被跳过。
+        """
+        dir_path = os.path.dirname(dst_path)
+        if dir_path:
+            os.makedirs(dir_path, exist_ok=True)
+
+        if _HAVE_FCNTL:
+            lock_fd = _acquire_lock(
+                _lock_path_for(dst_path), exclusive=True,
+                timeout=WRITE_LOCK_TIMEOUT)
+            if lock_fd is None:
+                logger.warning(
+                    f"快照写锁超时（{WRITE_LOCK_TIMEOUT}s），同步 latest 跳过: "
+                    f"{dst_path}")
+                return False
+        else:
+            lock_fd = None
+
+        try:
+            fd, tmp_path = tempfile.mkstemp(
+                prefix=".snap_", suffix=".tmp",
+                dir=dir_path if dir_path else ".")
+            try:
+                with os.fdopen(fd, "wb") as f:
+                    with open(src_path, "rb") as sf:
+                        shutil.copyfileobj(sf, f)
+                os.replace(tmp_path, dst_path)  # 原子替换
+            except Exception:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+                raise
+        finally:
+            if lock_fd is not None:
+                _release_lock(lock_fd)
+        logger.debug(f"快照已同步复制到 {dst_path}")
+        return True
 
     def load(self, path: str) -> tuple[dict, dict]:
         """从文件加载吸引子景观和目的层状态。
@@ -240,10 +454,14 @@ class Snapshot:
 
 
 def _torch_load(path: str) -> dict:
-    """兼容不同PyTorch版本的torch.load封装。
+    """兼容不同PyTorch版本的torch.load封装（0.5.0 起带共享读锁）。
 
     PyTorch 2.6+ 默认 weights_only=True，需要显式设置为False
     以加载包含Python对象的字典。
+
+    0.5.0/T1.2：读取前对伴生 .lock 文件加 flock 共享锁（与写锁互斥），
+    保证读到的不是写者正在替换中的半截文件；锁超时告警后无锁直读
+    （fail-open——原子替换已保证读到的一定是完整文件）。
 
     参数:
         path: 文件路径
@@ -251,8 +469,20 @@ def _torch_load(path: str) -> dict:
     返回:
         加载的数据字典
     """
+    if _HAVE_FCNTL:
+        lock_fd = _acquire_lock(
+            _lock_path_for(path), exclusive=False, timeout=READ_LOCK_TIMEOUT)
+        if lock_fd is None:
+            logger.warning(
+                f"快照读锁超时（{READ_LOCK_TIMEOUT}s），无锁直读: {path}")
+    else:
+        lock_fd = None  # 非 POSIX 平台：无锁直读（fail-open）
     try:
-        return torch.load(path, weights_only=False)
-    except TypeError:
-        # 旧版本PyTorch不支持weights_only参数
-        return torch.load(path)
+        try:
+            return torch.load(path, weights_only=False)
+        except TypeError:
+            # 旧版本PyTorch不支持weights_only参数
+            return torch.load(path)
+    finally:
+        if lock_fd is not None:
+            _release_lock(lock_fd)

@@ -21,6 +21,7 @@
 """
 
 import os
+import re
 import sys
 import threading
 
@@ -39,6 +40,7 @@ from api.session_manager import SessionManager
 from runtime.dream_scheduler import DreamScheduler
 from runtime.config import default_config
 from core.sensory.embedder import SimpleEmbedder
+from runtime.loop import LivingMemoryLoop
 
 
 # ============================================================
@@ -459,22 +461,32 @@ class TestStatusAndSnapshot:
         assert "不存在" in resp.json()["detail"]
 
     def test_snapshot_save(self, client, tmp_path):
-        """POST /snapshot/{sid} 保存快照到指定路径。"""
+        """POST /snapshot/{sid} 保存快照（T1.1 新命名规范，忽略用户 path）。"""
         # 先创建会话并运行几轮
         for i in range(3):
             client.post("/chat", json={
                 "user_input": f"快照前第{i + 1}轮",
                 "session_id": "snap_test"
             })
-        snap_path = str(tmp_path / "test_snapshot.pt")
-        resp = client.post("/snapshot/snap_test", json={"path": snap_path})
+        # P0-7：用户传入的任意 path 被忽略（含绝对路径），服务端按新规范落盘
+        resp = client.post("/snapshot/snap_test", json={
+            "path": str(tmp_path / "evil_absolute.pt")
+        })
         assert resp.status_code == 200
         data = resp.json()
         assert data["saved"] is True
         assert data["session_id"] == "snap_test"
         assert data["turn_count"] == 3
-        # 文件应存在
-        assert os.path.exists(snap_path)
+        # T1.1 新命名：snapshots/{session}/snapshot_{session}_{turn}_{ts}.pt
+        assert re.match(
+            r"^snapshot_snap_test_3_\d{8}_\d{6}\.pt$",
+            os.path.basename(data["path"]))
+        assert os.path.dirname(data["path"]).endswith(
+            os.path.join("snap_test"))
+        # 文件确实落盘 + 最新指针同步
+        assert os.path.exists(data["path"])
+        assert os.path.exists(data["latest_path"])
+        assert os.path.basename(data["latest_path"]) == "latest_snap_test.pt"
 
     def test_snapshot_default_path(self, client):
         """POST /snapshot/{sid} 不指定 path 时使用默认路径。"""
@@ -497,32 +509,45 @@ class TestStatusAndSnapshot:
         assert "不存在" in resp.json()["detail"]
 
     def test_restore_nonexistent_file_404(self, client):
-        """POST /restore/{sid} 从不存在的快照文件恢复返回 404。"""
+        """POST /restore/{sid}：非法路径 400；合法但文件不存在 404。"""
         # 先创建会话
         client.post("/chat", json={
             "user_input": "恢复测试",
             "session_id": "restore_test"
         })
+        # P0-7：绝对路径被钳制拒绝 → 400
         fake_path = "/nonexistent/path/missing_snapshot.pt"
         resp = client.post("/restore/restore_test", json={"path": fake_path})
-        assert resp.status_code == 404
-        assert "不存在" in resp.json()["detail"]
+        assert resp.status_code == 400
+        # 钳制合法（snapshots/ 内）但文件不存在 → 404
+        resp2 = client.post("/restore/restore_test", json={
+            "path": "missing_404.pt"
+        })
+        assert resp2.status_code == 404
 
     def test_restore_nonexistent_session_404(self, client, tmp_path):
-        """POST /restore/{sid} 不存在的会话返回 404。"""
-        snap_path = str(tmp_path / "dummy.pt")
+        """POST /restore/{sid} 不存在的会话返回 404（先于文件存在性检查）。"""
+        # 平铺格式与 T1.1 子目录格式均应先命中会话检查 → 404
+        for path in ("latest.pt",
+                     "some_sess/snapshot_some_sess_1_20260101_000000.pt"):
+            resp = client.post("/restore/nonexistent_restore", json={
+                "path": path
+            })
+            assert resp.status_code == 404
+        # 越界路径（.. 穿越）→ 400（钳制优先）
         resp = client.post("/restore/nonexistent_restore", json={
-            "path": snap_path
+            "path": "../outside.pt"
         })
-        assert resp.status_code == 404
-        assert "不存在" in resp.json()["detail"]
+        assert resp.status_code == 400
 
     def test_snapshot_and_restore_roundtrip(self, client, tmp_path):
-        """POST /snapshot + /restore 往返：保存后恢复成功。
+        """POST /snapshot + 文件级 load_state 往返（T1.1 新命名规范）。
 
-        注意：turn_count 不在快照持久化范围内（save_state 仅保存
-        attractor/purpose/memory/tokenizer 状态），因此恢复后 turn_count
-        保持当前值。此处通过 precision_mean 验证 purpose 状态确实被恢复。
+        P0-7 起 /restore 仅允许 `./snapshots`（服务端快照目录）内的文件，
+        而测试快照落在 tmp_path，故 API 往返改为：
+          - /snapshot 落盘 + 新命名校验（API 层）；
+          - 文件级 load_state 往返校验（persistence 层，验证 turn_count
+            与 purpose 状态均被恢复——T1.3/T1.1 turn_count 持久化）。
         """
         # 创建会话并运行多轮
         for i in range(5):
@@ -531,15 +556,18 @@ class TestStatusAndSnapshot:
                 "session_id": "roundtrip_test"
             })
 
-        # 记录保存前的 precision_mean
+        # 记录保存前的 precision_mean 与 turn_count
         resp_status = client.get("/status/roundtrip_test")
         precision_before = resp_status.json()["status"]["precision_mean"]
+        turn_before = resp_status.json()["status"]["turn_count"]
 
-        # 保存快照
-        snap_path = str(tmp_path / "roundtrip.pt")
-        resp = client.post("/snapshot/roundtrip_test", json={"path": snap_path})
+        # 保存快照（服务端新命名规范）
+        resp = client.post("/snapshot/roundtrip_test", json={})
         assert resp.status_code == 200
-        assert resp.json()["saved"] is True
+        data = resp.json()
+        assert data["saved"] is True
+        snap_path = data["path"]
+        assert os.path.exists(snap_path)
 
         # 再运行几轮改变状态
         for i in range(3):
@@ -548,19 +576,20 @@ class TestStatusAndSnapshot:
                 "session_id": "roundtrip_test"
             })
 
-        # 恢复快照
-        resp = client.post("/restore/roundtrip_test", json={"path": snap_path})
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["restored"] is True
-        assert "status" in data
-        # 恢复后 precision_mean 应接近保存前的值（purpose 状态已恢复）
-        precision_after_restore = data["status"]["precision_mean"]
-        assert precision_after_restore == pytest.approx(
-            precision_before, abs=1e-5
-        ), (
-            f"恢复后 precision_mean({precision_after_restore}) "
+        # 文件级往返：新 loop 用同一 snapshot_dir 加载快照
+        snapshot_dir = os.path.dirname(os.path.dirname(snap_path))
+        cfg2 = make_config_factory(snapshot_dir)()
+        new_loop = LivingMemoryLoop(cfg2)
+        new_loop.load_state(snap_path)
+        # purpose 状态已恢复（precision_mean 应接近保存前）
+        precision_after = new_loop.get_status()["precision_mean"]
+        assert precision_after == pytest.approx(precision_before, abs=1e-5), (
+            f"恢复后 precision_mean({precision_after}) "
             f"应接近保存前({precision_before})"
+        )
+        # T1.1：turn_count 已持久化并恢复（旧版不持久化）
+        assert new_loop.turn_count == turn_before, (
+            f"恢复后 turn_count({new_loop.turn_count}) 应为 {turn_before}"
         )
 
 

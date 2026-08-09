@@ -95,6 +95,12 @@ def _build_config() -> dict:
     config['auto_snapshot_interval'] = 50
     config['snapshot_dir'] = os.path.join(_SCRIPT_DIR, 'snapshots')
 
+    # --- 会话标识（T1.1/P0-5：快照按会话命名与元数据持久化需要） ---
+    # 本 MCP 直连进程代表单一脑；默认 "main"（与 lms-http 桥的 sid=main
+    # 对齐），可用 LMS_MCP_SESSION_ID 覆盖。快照读写将落在
+    # snapshots/{session}/latest_{session}.pt（新命名规范）。
+    config['session_id'] = os.environ.get("LMS_MCP_SESSION_ID", "main").strip() or "main"
+
     return config
 
 
@@ -103,23 +109,46 @@ def _get_snapshot_dir() -> str:
     return os.path.join(_SCRIPT_DIR, 'snapshots')
 
 
-def _get_latest_snapshot() -> str | None:
-    """查找最新的快照文件路径。
+def _get_latest_snapshot(session_id: str | None = None) -> str | None:
+    """按新命名规范查找最新快照（T1.1/P0-5 跟随新路径）。
 
-    返回:
-        最新快照文件路径，若无则返回 None。
+    查找顺序（fail-open，逐步回退）：
+      1. snapshots/{session}/latest_{session}.pt（会话专属最新指针，优先）；
+      2. 各会话子目录下 mtime 最新的 latest_*.pt（未指定/无专属文件时）；
+      3. 根目录平铺旧格式 *.pt（存量 latest.pt / snapshot_{n}.pt 等，mtime 最新）。
     """
+    from persistence.snapshot import sanitize_session_id, latest_path_for
+
     snap_dir = _get_snapshot_dir()
     if not os.path.isdir(snap_dir):
         return None
 
-    # 查找 .pt 文件并按修改时间排序
+    # 1. 会话专属最新指针（新命名规范）
+    if session_id:
+        sid = sanitize_session_id(session_id)
+        cand = latest_path_for(snap_dir, sid)
+        if os.path.isfile(cand):
+            return cand
+
+    # 2. 各会话子目录下的 latest_*.pt（按 mtime 取最新）
+    best: str | None = None
+    for sub in sorted(os.listdir(snap_dir)):
+        sub_path = os.path.join(snap_dir, sub)
+        if not os.path.isdir(sub_path):
+            continue
+        for fname in os.listdir(sub_path):
+            if fname.startswith("latest_") and fname.endswith(".pt"):
+                cand = os.path.join(sub_path, fname)
+                if best is None or os.path.getmtime(cand) > os.path.getmtime(best):
+                    best = cand
+    if best is not None:
+        return best
+
+    # 3. 旧格式平铺（存量兼容）
     import glob
     snapshots = glob.glob(os.path.join(snap_dir, '*.pt'))
     if not snapshots:
         return None
-
-    # 按修改时间排序，取最新
     snapshots.sort(key=lambda x: os.path.getmtime(x), reverse=True)
     return snapshots[0]
 
@@ -152,7 +181,8 @@ def get_loop() -> LivingMemoryLoop:
         logger.info("LivingMemoryLoop 初始化完成")
 
         # 自动加载最新快照，恢复跨会话记忆
-        latest_snap = _get_latest_snapshot()
+        # T1.1/P0-5：按本进程会话标识查找新命名规范下的最新快照
+        latest_snap = _get_latest_snapshot(_loop.session_id)
         if latest_snap:
             try:
                 _loop.load_state(latest_snap)
@@ -333,14 +363,15 @@ def do_store_memory(text: str) -> str:
     buffer_size = loop.memory.episodic_size()
 
     # 自动保存快照，确保持久化跨会话记忆
+    # T1.1/P0-5：会话级命名规范（snapshots/{session}/... + latest_{session}.pt）
     snapshot_saved = False
     try:
-        snap_dir = _get_snapshot_dir()
-        os.makedirs(snap_dir, exist_ok=True)
-        snap_path = os.path.join(snap_dir, 'latest.pt')
-        loop.save_state(snap_path)
-        snapshot_saved = True
-        logger.info(f"记忆已保存到快照: {snap_path}")
+        path = loop.save_session_state()
+        if path:
+            snapshot_saved = True
+            logger.info(f"记忆已保存到快照: {path}")
+        else:
+            logger.warning("快照保存被写锁超时跳过（不影响当前操作）")
     except Exception as e:
         logger.warning(f"快照保存失败（不影响当前操作）: {e}")
 

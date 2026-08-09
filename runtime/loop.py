@@ -30,7 +30,9 @@ from bridge.encoder import Encoder
 from bridge.decoder import Decoder
 from bridge.llm_bridge import LLMBridge
 
-from persistence.snapshot import Snapshot
+from persistence.snapshot import (
+    Snapshot, snapshot_path_for, latest_path_for, sanitize_session_id,
+)
 from persistence.recovery import Recovery
 
 logger = logging.getLogger(__name__)
@@ -102,6 +104,10 @@ class LivingMemoryLoop:
                 - snapshot_dir: 快照保存目录
         """
         self.config = config
+
+        # 会话标识（T1.1/P0-5：快照按会话命名与元数据持久化需要）。
+        # SessionManager 注入 config['session_id']；未注入时默认 'default'。
+        self.session_id = str(config.get('session_id', 'default'))
 
         # 核心参数
         num_nodes = config.get('num_nodes', 256)
@@ -619,6 +625,25 @@ class LivingMemoryLoop:
         except Exception as e:
             logger.debug("Phase 4 dream_complete 发布跳过（静默降级）: %s", e)
 
+    def _encode_query_vector(
+        self, text: str
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """编码查询文本为语义向量（检索共用，T1.3/P0-9 提取）。
+
+        与 process_turn 内的检索编码完全一致：优先取 384 维原始向量
+        （embed_text_raw，高精度），退化为投影向量（embed_text）。
+
+        返回:
+            (raw_vec, sem_vec)：embedder 不支持语义编码时返回 (None, None)。
+        """
+        if not hasattr(self.embedder, 'embed_text'):
+            return None, None
+        sem_vec = self.embedder.embed_text(text)
+        raw_vec = None
+        if hasattr(self.embedder, 'embed_text_raw'):
+            raw_vec = self.embedder.embed_text_raw(text)
+        return raw_vec, sem_vec
+
     def _retrieve_episodic(self, text: str) -> list[str] | None:
         """情景记忆检索：用语义向量找最相关的历史文本。
 
@@ -630,39 +655,78 @@ class LivingMemoryLoop:
         返回:
             检索到的情景文本列表，或 None（embedder 无 embed_text 方法时）
         """
-        episodic_texts = None
-        if hasattr(self.embedder, 'embed_text'):
-            sem_vec = self.embedder.embed_text(text)
-            raw_vec = None
-            if hasattr(self.embedder, 'embed_text_raw'):
-                raw_vec = self.embedder.embed_text_raw(text)
-            episodic_query = raw_vec if raw_vec is not None else sem_vec
-            entries = self.memory.recall_episodic(
-                episodic_query, top_k=3, fallback_query=sem_vec)
-            if entries:
-                episodic_texts = [e.text for e in entries]
-        return episodic_texts
+        raw_vec, sem_vec = self._encode_query_vector(text)
+        if raw_vec is None and sem_vec is None:
+            return None
+        episodic_query = raw_vec if raw_vec is not None else sem_vec
+        entries = self.memory.recall_episodic(
+            episodic_query, top_k=3, fallback_query=sem_vec)
+        if entries:
+            return [e.text for e in entries]
+        return None
+
+    def recall_episodic_readonly(self, query: str, k: int = 5) -> list[dict]:
+        """只读情景检索（T1.3/P0-9：/recall 端点专用）。
+
+        编码 query + 检索 episodic 缓冲区，**不做任何状态更新**：
+          - 不 process_turn（不推断/不学习/不更新 turn_count）
+          - 不调 LLM
+          - 不写缓冲（不 store_episodic）
+          - 不落盘（不保存快照）
+
+        与 process_turn 内的检索共用同一套编码/检索逻辑
+        （_encode_query_vector + memory.recall_episodic_scored）。
+
+        参数:
+            query: 查询文本
+            k: 返回条数（调用方已钳制到 [1,20]）
+
+        返回:
+            [{'text': str, 'score': float}, ...]（按相关度降序）；
+            embedder 不支持语义编码或缓冲区为空时返回空列表（fail-open）。
+        """
+        if not query or not query.strip():
+            return []
+        raw_vec, sem_vec = self._encode_query_vector(query)
+        if raw_vec is None and sem_vec is None:
+            return []  # embedder 无 embed_text：无可检索的语义空间（fail-open）
+        query_vec = raw_vec if raw_vec is not None else sem_vec
+        scored = self.memory.recall_episodic_scored(
+            query_vec, top_k=k, fallback_query=sem_vec)
+        results = []
+        for score, entry in scored:
+            text = getattr(entry, 'text', None)
+            if text:
+                results.append({'text': text, 'score': float(score)})
+        return results
+
+    def _snapshot_dir_path(self) -> Path:
+        """快照根目录：优先 config['snapshot_dir']，否则 core.paths.get_snapshot_dir()。
+
+        （T1.1/P0-5：从 _auto_snapshot / dream 中提取的公共逻辑，
+        避免两处重复且口径不一致。）
+        """
+        snapshot_dir_cfg = self.config.get('snapshot_dir')
+        if snapshot_dir_cfg:
+            return Path(snapshot_dir_cfg).expanduser()
+        return get_snapshot_dir()
 
     def _auto_snapshot(self) -> None:
         """自动快照（G4 修复：按间隔自动保存状态）。
 
         根据配置的间隔，在特定轮次自动保存状态快照。
-        快照目录优先取 config['snapshot_dir']，否则使用
-        core.paths.get_snapshot_dir()（支持 LMS_SNAPSHOT_DIR 环境变量覆盖）。
+        0.5.0/T1.1：改用会话级命名规范 save_session_state()——
+        `snapshots/{session}/snapshot_{session}_{turn}_{ts}.pt` +
+        同步 `snapshots/{session}/latest_{session}.pt`。
         """
         # 7. 自动快照（G4 修复：按间隔自动保存状态）
         if self.config.get('auto_snapshot', False):
             interval = self.config.get('auto_snapshot_interval', 50)
             if self.turn_count > 0 and self.turn_count % interval == 0:
-                snapshot_dir_cfg = self.config.get('snapshot_dir')
-                if snapshot_dir_cfg:
-                    snapshot_dir_path = Path(snapshot_dir_cfg).expanduser()
-                else:
-                    snapshot_dir_path = get_snapshot_dir()
-                snapshot_path = snapshot_dir_path / f'snapshot_{self.turn_count}.pt'
                 try:
-                    self.save_state(str(snapshot_path))
-                    logger.info(f"自动快照已保存: {snapshot_path}")
+                    path = self.save_session_state()
+                    if path:
+                        logger.info(f"自动快照已保存: {path}")
                 except Exception as e:
                     logger.warning(f"自动快照失败: {e}")
 
@@ -701,15 +765,22 @@ class LivingMemoryLoop:
 
         return response
 
-    def save_state(self, path: str) -> None:
+    def save_state(self, path: str) -> bool:
         """保存当前状态到快照文件。
 
         保存吸引子景观（J矩阵、bias、sigma）、目的层状态（precision、history、
         coherence、encounter_count）、记忆潜变量（short/long_term_latent）
         和分词器词表。
 
+        0.5.0/T1.1：快照顶层额外写入元数据 session_id / turn_count /
+        last_entropy_ratio（供重启后恢复轮次连续与归属校验）。
+
         参数:
             path: 快照文件路径
+
+        返回:
+            True 表示已保存；False 表示因写锁超时被跳过（fail-open，见
+            persistence.snapshot.save）。
         """
         # 获取吸引子景观
         landscape = self.attractor.get_landscape()
@@ -742,12 +813,54 @@ class LivingMemoryLoop:
         if self.self_ref is not None:
             self_ref_state = self.self_ref.get_state()
 
-        self.snapshot.save(path, landscape, purpose_dict,
+        saved = self.snapshot.save(path, landscape, purpose_dict,
                            memory_state=memory_state,
                            tokenizer_state=tokenizer_state,
                            meta_state=meta_state,
-                           self_ref_state=self_ref_state)
+                           self_ref_state=self_ref_state,
+                           session_id=self.session_id,
+                           turn_count=self.turn_count,
+                           last_entropy_ratio=self.last_entropy_ratio)
+        if not saved:
+            # P1-1 修复：传播写锁超时的真实结果，禁止"声称已保存、实际未落盘"。
+            # （调用方依赖该返回值触发 503/跳过提示/优雅停机重试。）
+            logger.warning(f"状态保存被跳过（写锁超时，fail-open）: {path}")
+            return False
         logger.info(f"状态已保存到 {path}")
+        return True
+
+    def save_session_state(self) -> Optional[str]:
+        """按新命名规范保存会话快照，并同步更新 latest_{session}.pt（T1.1/P0-5）。
+
+        - 轮次快照：snapshots/{session}/snapshot_{session}_{turn}_{ts}.pt
+          （按轮次归档，天然隔离会话，杜绝跨会话撞名）；
+        - 最新指针：snapshots/{session}/latest_{session}.pt（写最新时同步更新，
+          供加载方快速定位该会话最新状态）。
+
+        返回:
+            轮次快照路径；保存被写锁超时跳过时返回 None（fail-open）。
+        """
+        snap_dir = self._snapshot_dir_path()
+        snap_dir.mkdir(parents=True, exist_ok=True)
+        turn_path = snapshot_path_for(
+            str(snap_dir), self.session_id, self.turn_count)
+        saved = self.save_state(turn_path)
+        if not saved:
+            return None
+        latest_path = latest_path_for(str(snap_dir), self.session_id)
+        try:
+            self.snapshot.save_copy(turn_path, latest_path)
+        except Exception as e:
+            logger.warning(
+                f"同步 latest_{self.session_id}.pt 失败（不影响主快照）: {e}")
+        return turn_path
+
+    def latest_snapshot_path(self) -> str:
+        """返回当前会话最新快照路径（snapshots/{session}/latest_{session}.pt）。
+
+        （供 API 层在 /snapshot 响应中回传；不校验文件是否存在。）
+        """
+        return latest_path_for(str(self._snapshot_dir_path()), self.session_id)
 
     def load_state(self, path: str) -> None:
         """从快照文件恢复状态。
@@ -797,6 +910,24 @@ class LivingMemoryLoop:
             logger.info("快照含 self_ref 字段但自指回路未启用，跳过恢复")
         else:
             logger.info("快照不含 self_ref 字段，跳过自指回路恢复（向后兼容）")
+
+        # 0.5.0/T1.1: 恢复 turn_count / last_entropy_ratio 元数据（向后兼容：
+        # 旧快照无这些字段时 turn_count 从 0 重数，并记录 WARNING）
+        snap_turn = raw_data.get('turn_count')
+        if snap_turn is None:
+            logger.warning(
+                f"快照 {path} 无 turn_count 字段（旧版快照），turn_count 从 0 重数")
+            self.turn_count = 0
+        else:
+            self.turn_count = int(snap_turn)
+        snap_entropy = raw_data.get('last_entropy_ratio')
+        if snap_entropy is not None:
+            self.last_entropy_ratio = float(snap_entropy)
+        snap_session = raw_data.get('session_id')
+        if snap_session is not None and str(snap_session) != self.session_id:
+            logger.warning(
+                f"快照 session_id={snap_session} 与当前会话 "
+                f"{self.session_id} 不一致（以当前会话为准）")
 
         logger.info(f"已从 {path} 恢复状态")
 
@@ -917,20 +1048,15 @@ class LivingMemoryLoop:
             self.self_ref.on_dream_end()
 
         # 做梦后自动保存快照（完整状态，含 tokenizer）
-        # 快照目录优先取 config['snapshot_dir']，否则使用
-        # core.paths.get_snapshot_dir()（pathlib.Path 跨平台处理）
+        # 0.5.0/T1.1：会话级命名规范 save_session_state()——
+        # `snapshots/{session}/snapshot_{session}_{turn}_{ts}.pt` +
+        # 同步 `snapshots/{session}/latest_{session}.pt`（替换原平铺 latest.pt）
         snapshot_saved = False
         try:
-            snapshot_dir_cfg = self.config.get('snapshot_dir')
-            if snapshot_dir_cfg:
-                snapshot_dir_path = Path(snapshot_dir_cfg)
-            else:
-                snapshot_dir_path = get_snapshot_dir()
-            snapshot_dir_path.mkdir(parents=True, exist_ok=True)
-            snapshot_path = snapshot_dir_path / 'latest.pt'
-            self.save_state(str(snapshot_path))
-            snapshot_saved = True
-            logger.info(f"做梦后快照已保存: {snapshot_path}")
+            path = self.save_session_state()
+            if path:
+                snapshot_saved = True
+                logger.info(f"做梦后快照已保存: {path}")
         except Exception as e:
             logger.warning(f"做梦后快照保存失败（不影响做梦结果）: {e}")
 

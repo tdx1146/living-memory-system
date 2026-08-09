@@ -19,6 +19,7 @@
   - 浮点比较使用 pytest.approx
 """
 
+import os
 import pytest
 import torch
 
@@ -493,15 +494,20 @@ class TestDreamEngine:
     # ------------------------------------------------------------
 
     def test_dream_mvp_saves_snapshot(self, dream_engine, tmp_path):
-        """dream_mvp 后快照文件被创建（使用 tmp_path）。"""
+        """dream_mvp 后快照文件被创建（使用 tmp_path）。
+
+        T1.1/P0-5：快照存入会话子目录 snapshots/{session}/latest_{session}.pt。
+        """
         engine = dream_engine
         populate_buffer(engine, n=5)
         engine.dream_mvp(n_steps=5)
 
-        snapshots = list(tmp_path.glob('*.pt'))
+        snapshots = list(tmp_path.glob('default/*.pt'))
         assert len(snapshots) >= 1, (
-            f"dream_mvp 后应创建快照文件，实际 {len(snapshots)} 个"
+            f"dream_mvp 后应创建会话级快照文件，实际 {len(snapshots)} 个"
         )
+        assert os.path.exists(
+            os.path.join(str(tmp_path), 'default', 'latest_default.pt'))
 
     # ------------------------------------------------------------
     # 13. 稳定性
