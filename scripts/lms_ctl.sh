@@ -24,10 +24,19 @@ set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LMS_HOME="$(cd "$SCRIPT_DIR/.." && pwd)"
+# 统一配置：优先加载 Agent OS/env.local（同布局兄弟目录），缺失则用自身默认
+_AGENT_OS="${AGENT_OS_HOME:-}"
+if [ -z "$_AGENT_OS" ] && [ -d "$LMS_HOME/../Agent OS" ]; then
+    _AGENT_OS="$(cd "$LMS_HOME/../Agent OS" && pwd)"
+fi
+if [ -n "$_AGENT_OS" ] && [ -f "$_AGENT_OS/env.local" ]; then
+    set -a; . "$_AGENT_OS/env.local"; set +a
+fi
 UNIT_NAME="lms-api.service"
-RUN_DIR="$LMS_HOME/run"
+# RUN_DIR 随统一配置（与 stack_ctl 共用 PID 文件）；日志保留 LMS 自己的 logs（可被 LMS_LOG_FILE 覆盖）
+RUN_DIR="${RUN_DIR:-$LMS_HOME/run}"
 PID_FILE="$RUN_DIR/lms_api.pid"
-LOG_FILE="$LMS_HOME/logs/lms_api.log"
+LOG_FILE="${LMS_LOG_FILE:-$LMS_HOME/logs/lms_api.log}"
 API_HOST="${LMS_API_HOST:-127.0.0.1}"
 API_PORT="${LMS_API_PORT:-8190}"
 HEALTH_URL="http://$API_HOST:$API_PORT/health"

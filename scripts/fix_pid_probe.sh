@@ -24,7 +24,21 @@
 # =============================================================================
 set -u
 
-AGENT_OS_HOME="${AGENT_OS_HOME:-/vol2/1000/AI专用/Agent OS}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LMS_HOME="$(cd "$SCRIPT_DIR/.." && pwd)"
+# Agent OS 定位：优先环境变量，否则按同布局兄弟目录相对推导（零硬编码）
+AGENT_OS_HOME="${AGENT_OS_HOME:-$(cd "$LMS_HOME/../Agent OS" 2>/dev/null && pwd)}"
+if [ -z "$AGENT_OS_HOME" ]; then
+    echo "[fix-pid][WARN] 无法定位 Agent OS（请设置 AGENT_OS_HOME 环境变量）" >&2
+    exit 1
+fi
+# 统一配置：端口等从 Agent OS/env.local 读取
+if [ -f "$AGENT_OS_HOME/env.local" ]; then
+    set -a; . "$AGENT_OS_HOME/env.local"; set +a
+fi
+SANDGLASS_API_PORT="${SANDGLASS_API_PORT:-17333}"
+LMS_API_PORT="${LMS_API_PORT:-8190}"
+GLUE_PORT="${GLUE_PORT:-19000}"
 DRY_RUN=0
 ADOPT=0
 for arg in "$@"; do
@@ -68,9 +82,9 @@ pattern_for() {
 port_for() {
     local name="$1"
     case "$name" in
-        lms_api.pid)            echo "8190" ;;
-        glue_server.pid)        echo "19000" ;;
-        sandglass_http_api.pid) echo "17333" ;;
+        lms_api.pid)            echo "$LMS_API_PORT" ;;
+        glue_server.pid)        echo "$GLUE_PORT" ;;
+        sandglass_http_api.pid) echo "$SANDGLASS_API_PORT" ;;
         *)                      echo "" ;;
     esac
 }
