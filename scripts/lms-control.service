@@ -1,0 +1,44 @@
+# =============================================================================
+# LMS 活体记忆系统 - Control Plane（:8191）systemd 用户单元（阶段 2 / T2.1·T2.3）
+# -----------------------------------------------------------------------------
+# 管理面：自我配置端口（认证/审计/热配置/注册/诊断）。独立于数据面 lms-api.service。
+#
+# 安装（用户单元，不要求 root；仅建议，本次未安装）：
+#   mkdir -p ~/.config/systemd/user
+#   ln -s /vol2/1000/AI专用/living-memory-system-cloud/scripts/lms-control.service \
+#         ~/.config/systemd/user/lms-control.service
+#   export XDG_RUNTIME_DIR=/run/user/$(id -u)
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now lms-control
+#
+# 前置条件：.env 中配置 LMS_CONTROL_TOKEN（缺失 = 只读模式，写端点 503）。
+# 生成建议：openssl rand -hex 32
+# =============================================================================
+
+[Unit]
+Description=LMS Control Plane (:8191, 自我配置/审计/诊断)
+After=network.target lms-api.service
+Wants=lms-api.service
+StartLimitIntervalSec=60
+StartLimitBurst=10
+
+[Service]
+Type=simple
+WorkingDirectory=/vol2/1000/AI专用/living-memory-system-cloud
+EnvironmentFile=/vol2/1000/AI专用/living-memory-system-cloud/.env
+
+# api.control 导入时自动加载 .env（含 LMS_CONTROL_TOKEN）；端口固定 127.0.0.1:8191
+ExecStart=/vol2/1000/AI专用/living-memory-system-cloud/.venv/bin/python scripts/run_control.py --host 127.0.0.1 --port 8191
+ExecStartPre=/bin/mkdir -p logs data/control run
+
+Restart=always
+RestartSec=5
+TimeoutStartSec=30
+TimeoutStopSec=15
+
+# 控制面是管理面，OOM 时优先保数据面（lms-api OOMScoreAdjust=-200）→ 本服务中性即可
+StandardOutput=append:/vol2/1000/AI专用/living-memory-system-cloud/logs/lms_control.log
+StandardError=inherit
+
+[Install]
+WantedBy=default.target
