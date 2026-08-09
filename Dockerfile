@@ -1,9 +1,14 @@
 # ============================================================================
 # 活体记忆系统 (Living Memory System) - Dockerfile
-# 任务编号: E-P2-2
+# 对齐 2026-08-10 稳定化架构：数据面 :8190 + 管理面 :8191
 # CPU-only 镜像，多阶段构建以减小体积
-# 构建: docker build -t living-memory-system:0.1.0 .
-# 运行: docker run -p 8000:8000 --env-file .env -v $(pwd)/snapshots:/app/snapshots living-memory-system:0.1.0
+# 构建: docker build -t living-memory-system:latest .
+# 运行: docker run -p 8190:8190 --env-file .env \
+#         -v $(pwd)/snapshots:/app/snapshots -v $(pwd)/data:/app/data \
+#         -v $(pwd)/logs:/app/logs living-memory-system:latest
+#   （管理面: 另起容器 docker run -p 127.0.0.1:8191:8191 \
+#         --env-file .env -e LMS_CTRL_HOST=0.0.0.0 \
+#         living-memory-system:latest python scripts/run_control.py）
 # ============================================================================
 
 # ---------- Stage 1: 构建阶段（安装 Python 依赖） ----------
@@ -43,7 +48,7 @@ LABEL org.opencontainers.image.title="living-memory-system" \
 
 # 运行时系统依赖:
 #   git  -- huggingface / sentence-transformers 模型拉取可能需要
-#   curl -- HEALTHCHECK 健康检查
+#   curl -- HEALTHCHECK 健康检查（compose 与 Dockerfile 内均使用）
 RUN apt-get update && apt-get install -y --no-install-recommends \
         git \
         curl \
@@ -55,15 +60,15 @@ ENV PATH="/opt/venv/bin:$PATH"
 
 WORKDIR /app
 
-# 复制项目源码（.dockerignore 已排除 tests/docs/.git/snapshots/.env 等）
+# 复制项目源码（.dockerignore 已排除 tests/docs/.git/snapshots/data/logs/.env 等）
 COPY . .
 
 # 以可编辑模式安装本包
 # 依赖已在 venv 中，--no-deps 仅注册包路径与 console_scripts 入口，无需重新解析/下载依赖
 RUN pip install -e . --no-deps
 
-# 快照目录（运行时由 docker-compose 挂载卷持久化）
-RUN mkdir -p /app/snapshots
+# 运行时目录（由 docker-compose 挂载卷持久化；data/ 含 self_voice、archive、control）
+RUN mkdir -p /app/snapshots /app/data /app/logs
 
 # ----------------------------------------------------------------------------
 # 环境变量默认值（参考 .env.example / api/config.py / runtime/config.py）
@@ -71,10 +76,18 @@ RUN mkdir -p /app/snapshots
 
 # 服务监听（容器内必须为 0.0.0.0 才能接受宿主机/外部访问）
 ENV LMS_API_HOST=0.0.0.0
-ENV LMS_API_PORT=8000
+ENV LMS_API_PORT=8190
+
+# 管理面（control.py，独立容器运行 scripts/run_control.py 时生效）
+# 默认仅本机 127.0.0.1:8191；容器内须置 0.0.0.0 才能被端口映射暴露
+ENV LMS_CTRL_HOST=0.0.0.0
+ENV LMS_CTRL_PORT=8191
+ENV LMS_CTRL_API_BASE=http://127.0.0.1:8190
 
 # 嵌入器: Docker 默认 simple（纯 CPU、离线、秒级启动）
-# 切换 pretrained 需设置 LMS_PRETRAINED_MODEL 并联网下载或挂载模型
+# 生产推荐 cloud（远端 Ollama bge-m3，见 .env.docker.example 的
+# LMS_CLOUD_EMBED_URL：局域网 http://192.168.0.103:11435/v1/embeddings，
+# 外网隧道 https://11435.tdx1146.cc/v1/embeddings —— 容器网络用隧道域名更稳）
 ENV LMS_EMBEDDER=simple
 ENV LMS_INPUT_DIM=64
 ENV LMS_NUM_NODES=256
@@ -98,14 +111,15 @@ ENV DREAM_CHECK_INTERVAL=5
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
 
-# 暴露 API 端口
-EXPOSE 8000
+# 暴露 API 端口（数据面 8190 + 管理面 8191）
+EXPOSE 8190 8191
 
-# 健康检查：访问 /health 端点
+# 健康检查：访问 /health 端点（管理面为 /control/health）
 # start-period 60s 给 torch / 模型初始化留出预热时间
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD curl -fsS http://127.0.0.1:8000/health || exit 1
+    CMD curl -fsS http://127.0.0.1:8190/health || exit 1
 
-# 启动 FastAPI 服务
+# 启动 FastAPI 服务（数据面）
 # run.py 会读取 LMS_API_HOST/LMS_API_PORT，并在 startup 事件中启动 DreamScheduler
+# 管理面（同镜像）请用: python scripts/run_control.py
 CMD ["python", "-m", "api.run"]

@@ -38,6 +38,8 @@ dist
 
 # 运行时数据（生产镜像不需要，运行时由卷挂载持久化）
 snapshots
+data
+logs
 *.pt
 *.pth
 *.bin
