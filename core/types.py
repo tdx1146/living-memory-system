@@ -60,17 +60,28 @@ class SensoryInput:
 class Activation:
     """海马体激活态：吸引子网络的输出。
 
-    FEP 推断收敛后的网络状态，包含激活值、熵和惊讶度（自由能）。
+    FEP 推断收敛后的网络状态，包含激活值、熵、惊讶度与自由能。
 
     属性:
         state: 节点激活值，形状 [num_nodes]，取值范围 (-1, 1)（Langevin 函数输出）。
         entropy: 激活熵，衡量状态的不确定性/分散程度。
-        surprise: 自由能（惊讶度），标量。越低表示当前状态越符合网络预期。
+        surprise: 惊讶度 = 准确性项（precision-weighted prediction error），
+            恒 ≥ 0。供报告/回放/目的层/做梦/元可塑性使用。
+        free_energy: 自由能（未规范化变分能量，可负；严格 VFE ≥ 0 需
+            Bregman 形式 = 后续项 §3.6），= 现有 F 公式。
+            仅供学习目标与诊断；默认 0.0 保证旧构造点兼容。
+        per_dim_surprise: 逐维惊讶度 π_i·(σ_i−s_i)² [input_dim]，
+            供目的层/注意力使用；默认 None（旧构造点兼容）。
+        mse: 均方预测误差 (1/input_dim)·Σ(σ_i−s_i)²，跨尺度可比；
+            默认 None（旧构造点兼容）。
     """
 
     state: torch.Tensor
     entropy: float
-    surprise: float
+    surprise: float          # 语义变更：准确性项（原为自由能）
+    free_energy: float = 0.0        # 新增（默认值 → 旧构造点零破坏）
+    per_dim_surprise: Optional[torch.Tensor] = None   # 新增
+    mse: Optional[float] = None     # 新增
 
 
 @dataclass

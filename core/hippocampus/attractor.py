@@ -20,10 +20,13 @@
 """
 
 import os
+import logging
 import torch
 from typing import Optional, Union
 
 from core.types import Activation, resolve_device
+
+logger = logging.getLogger(__name__)
 
 
 def langevin(b: torch.Tensor) -> torch.Tensor:
@@ -133,12 +136,16 @@ class AttractorNetwork:
         self.temperature: float = temperature
 
         # T2.8/P2-1：惊讶度归一化开关（LMS_NORM_SURPRISE=1 启用，默认 0）。
-        # 自由能 F ∝ ‖J‖²（实测 ±1600~3400 量级），直接作为惊讶度会
-        # 让回放权重/目的演化对 J 幅度敏感——F 除以 ‖J‖_F 后量级收敛。
-        # 默认 0 保持原行为；显式传参优先，否则读环境变量。
+        # ⚠️ 已弃用（2026-08-10 惊讶度语义拆分，惊讶度修复-01-设计方案.md §3.3）：
+        #     F/‖J‖ 归一化已整块移除，本开关不再参与任何计算。属性保留仅为
+        #     防 config/api 审计引用崩（api/config.py、api/server.py 仍读取）。
         if norm_surprise is None:
             norm_surprise = os.environ.get("LMS_NORM_SURPRISE", "0") == "1"
         self.norm_surprise: bool = bool(norm_surprise)
+        if self.norm_surprise:
+            logger.warning(
+                "LMS_NORM_SURPRISE=1 已弃用：F/‖J‖ 归一化自 2026-08-10 起 "
+                "不再参与任何计算（no-op），可安全移除此环境变量")
         # 2026-08-10 设计回归：J 范数钳制目标（‖J‖_F 上限）
         self.j_target_norm: float = float(os.environ.get("LMS_J_TARGET_NORM", "40.0"))
 
@@ -242,11 +249,19 @@ class AttractorNetwork:
         if update_internal_state:
             self.sigma = sigma.clone()
 
-        # 计算熵与惊讶度
-        surprise = self._compute_free_energy(sigma, sensory_input, precision)
+        # 计算惊讶度（准确性项）、自由能、逐维惊讶度、MSE
+        surprise = self._compute_surprise(sigma, sensory_input, precision)
+        free_energy = self._compute_free_energy(sigma, sensory_input, precision)
+        per_dim_surprise = self._compute_per_dim_surprise(
+            sigma, sensory_input, precision)
+        mse = float(torch.mean(
+            (sigma[:self.input_dim] - sensory_input) ** 2).item())
         entropy = self._compute_entropy(sigma)
 
-        return Activation(state=sigma, entropy=entropy, surprise=surprise)
+        return Activation(state=sigma, entropy=entropy, surprise=surprise,
+                          free_energy=free_energy,
+                          per_dim_surprise=per_dim_surprise,
+                          mse=mse)
 
     # ------------------------------------------------------------------ #
     #  学习
@@ -349,16 +364,16 @@ class AttractorNetwork:
         self.J.fill_diagonal_(0)
 
         # 设计回归 2026-08-10（dandan 拍板：回到首版精神，治本而非开关）：
-        # J 范数钳制——FEP 的连接权重应保持有界，否则 ‖J‖² 项（复杂性项）
-        # 会随 J 增长主导自由能，使惊讶度失真（实测 -10⁴ 量级）。
-        # 原设计（权重衰减）存在但被 Hebbian 增长盖过；此处显式钳制到
-        # SPECTRAL_TARGET（默认 40.0，对应 ‖J‖²≈1600，与准确性项同量级）。
-        # 原理：J = J * min(1, target/‖J‖_F)，J 永不发散，惊讶度永回"预测误差"语义。
-        if self.norm_surprise:  # 复用 T2.8 开关，语义改为"J 有界化"
-            target = float(getattr(self, "j_target_norm", 40.0))
-            j_norm = float(torch.norm(self.J, p="fro").item())
-            if j_norm > target > 1e-8:
-                self.J.mul_(target / j_norm)
+        # J 范数钳制（LMS_J_TARGET_NORM=40）为参数先验/复杂度上界，无条件生效
+        # （惊讶度修复-01-设计方案.md §3.4）。J 永不发散，F 中复杂性项
+        # 0.5·complexity_weight·‖J‖² = 0.5×0.01×1600 = O(8)，远小于准确性项
+        # 常态 O(1~100)，不主导。与做梦 SHY（shy_target_norm=10）并存不冲突：
+        # 在线钳制到 40 防发散，做梦 SHY 下调到 10 恢复容量。
+        # 原理：J = J * min(1, target/‖J‖_F)。
+        target = float(getattr(self, "j_target_norm", 40.0))
+        j_norm = float(torch.norm(self.J, p="fro").item())
+        if j_norm > target > 1e-8:
+            self.J.mul_(target / j_norm)
 
     def _complexity_gradient(self, sigma: torch.Tensor,
                              orth_weight: Optional[float] = None,
@@ -429,10 +444,38 @@ class AttractorNetwork:
     #  自由能与熵
     # ------------------------------------------------------------------ #
 
+    def _compute_surprise(self, sigma: torch.Tensor,
+                          sensory_input: torch.Tensor,
+                          precision: torch.Tensor) -> float:
+        """惊讶度 = 准确性项 = precision-weighted prediction error（恒 ≥ 0）。
+
+        surprise = 0.5 · Σ_{i∈sensory} π_i · (σ_i − s_i)²
+        = 主动推断中"precision-weighted prediction error"的标准二次型
+          （Feldman & Friston 2010；Spisak & Friston v2 的 accuracy 分量——
+          与论文 eq.(14) 逐节点 VFE 中的期望对数似然项构成**结构性对应
+          （高斯似然类比）**：同为"期望对数似然"分量，但 LMS 用高斯二次型、
+          论文用连续伯努利（CB）参数化，非字面同一公式，措辞以"类比"为准）。
+        注意：只对感官节点（前 input_dim 个）求和；非感官节点无外部参照，
+        不进入惊讶度。σ、s 均在 (-1,1) 附近、π ∈ [0.1, 10]，故恒 ≥ 0。
+        """
+        sensory_error = sigma[:self.input_dim] - sensory_input
+        return float(0.5 * torch.sum(precision * sensory_error ** 2).item())
+
+    def _compute_per_dim_surprise(self, sigma: torch.Tensor,
+                                   sensory_input: torch.Tensor,
+                                   precision: torch.Tensor) -> torch.Tensor:
+        """逐维惊讶度 surprise_i = π_i·(σ_i−s_i)²，形状 [input_dim]。
+
+        供目的层/注意力使用；detach + clone 避免与计算图耦合。
+        """
+        sensory_error = sigma[:self.input_dim] - sensory_input
+        return (precision * sensory_error ** 2).detach().clone()
+
     def _compute_free_energy(self, sigma: torch.Tensor,
                              sensory_input: torch.Tensor,
                              precision: torch.Tensor) -> float:
-        """计算自由能（惊讶度）。
+        """计算自由能（未规范化变分能量，可负；严格 VFE ≥ 0 需 Bregman
+        形式 = 后续项 §3.6；仅供学习目标与诊断）。
 
         F = 能量项 + 准确性项 + 复杂性项
 
@@ -440,7 +483,7 @@ class AttractorNetwork:
             -0.5 * σ^T J σ - b^T σ
             高共激活 → 低能量 → 低自由能（状态更"自然"）
 
-        准确性项（感官预测误差）:
+        准确性项（感官预测误差，与 surprise = _compute_surprise 数值一致）:
             0.5 * Σ precision_i * (σ_i - sensory_i)^2
             预测越准 → 误差越小 → 自由能越低
 
@@ -448,13 +491,17 @@ class AttractorNetwork:
             0.5 * complexity_weight * ||J||^2
             模型越简单 → 自由能越低
 
+        注意：LMS 的 F 缺熵项 E_q[ln q] 与归一化常数，是**未规范化**变分
+        能量，可负（深陷吸引子时能量项为负）——这是设计意图（"负值是能量，
+        不是惊讶度"），不是缺陷。
+
         参数:
             sigma: 激活态，形状 [num_nodes]。
             sensory_input: 感官输入，形状 [input_dim]。
             precision: 精度向量，形状 [input_dim]。
 
         返回:
-            自由能标量（惊讶度）。越低表示状态越符合网络预期。
+            自由能标量。越低表示状态越符合网络预期（仅学习目标/诊断）。
         """
         # 能量项：共激活越强，自由能越低
         corr_term = -0.5 * (sigma @ self.J @ sigma)
@@ -468,14 +515,6 @@ class AttractorNetwork:
         complexity = 0.5 * self.complexity_weight * torch.sum(self.J ** 2)
 
         free_energy = corr_term + bias_term + accuracy + complexity
-
-        # T2.8/P2-1：惊讶度归一化（开关 LMS_NORM_SURPRISE=1 时启用）。
-        # F /= ‖J‖_F：消除 J 幅度对惊讶度量级的主导，使惊讶度可比。
-        # J≈0 时保持原值（避免除零放大；J=0 的网络本就不产生有意义的 F）。
-        if self.norm_surprise:
-            j_norm = float(torch.norm(self.J, p='fro').item())
-            if j_norm > 1e-8:
-                free_energy = free_energy / j_norm
 
         return float(free_energy)
 
