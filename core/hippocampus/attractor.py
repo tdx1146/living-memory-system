@@ -139,6 +139,8 @@ class AttractorNetwork:
         if norm_surprise is None:
             norm_surprise = os.environ.get("LMS_NORM_SURPRISE", "0") == "1"
         self.norm_surprise: bool = bool(norm_surprise)
+        # 2026-08-10 设计回归：J 范数钳制目标（‖J‖_F 上限）
+        self.j_target_norm: float = float(os.environ.get("LMS_J_TARGET_NORM", "40.0"))
 
     # ------------------------------------------------------------------ #
     #  推断
@@ -345,6 +347,18 @@ class AttractorNetwork:
 
         # 对角线置零（无自连接）
         self.J.fill_diagonal_(0)
+
+        # 设计回归 2026-08-10（dandan 拍板：回到首版精神，治本而非开关）：
+        # J 范数钳制——FEP 的连接权重应保持有界，否则 ‖J‖² 项（复杂性项）
+        # 会随 J 增长主导自由能，使惊讶度失真（实测 -10⁴ 量级）。
+        # 原设计（权重衰减）存在但被 Hebbian 增长盖过；此处显式钳制到
+        # SPECTRAL_TARGET（默认 40.0，对应 ‖J‖²≈1600，与准确性项同量级）。
+        # 原理：J = J * min(1, target/‖J‖_F)，J 永不发散，惊讶度永回"预测误差"语义。
+        if self.norm_surprise:  # 复用 T2.8 开关，语义改为"J 有界化"
+            target = float(getattr(self, "j_target_norm", 40.0))
+            j_norm = float(torch.norm(self.J, p="fro").item())
+            if j_norm > target > 1e-8:
+                self.J.mul_(target / j_norm)
 
     def _complexity_gradient(self, sigma: torch.Tensor,
                              orth_weight: Optional[float] = None,
