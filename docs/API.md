@@ -107,7 +107,9 @@
 | `num_nodes` | integer | 吸引子网络节点数 |
 | `input_dim` | integer | 感官输入维度 |
 | `last_entropy` | float | 上一轮激活熵 |
-| `last_surprise` | float | 上一轮自由能（惊讶度） |
+| `last_surprise` | float | 上一轮惊讶度（准确性项，恒≥0；2026-08-10 语义拆分，原为自由能） |
+| `last_free_energy` | float | 上一轮自由能（未规范化变分能量，可负；仅供学习目标/诊断） |
+| `last_mse` | float | 上一轮均方预测误差（跨尺度可比） |
 | `entropy_ratio` | float | 在线熵管理比例 |
 | `entropy_high_threshold` | float | 熵上限阈值 |
 | `entropy_low_threshold` | float | 熵下限阈值 |

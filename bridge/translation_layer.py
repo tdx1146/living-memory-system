@@ -277,7 +277,7 @@ class TranslationLayer:
           - ``semantic_vector``: 语义向量（转换为 list，便于序列化）
           - ``vector_dim``: 语义向量维度
           - ``timestamp``: 时间戳（用对话轮次 turn 作为时序标记）
-          - ``surprise``: 惊讶度（自由能），衡量该记忆的"意外/重要"程度
+          - ``surprise``: 惊讶度（准确性项，恒≥0），衡量该记忆的"意外/重要"程度
           - ``activation_strength``: 激活强度（语义向量 L2 范数，
             作为记忆痕迹强度的代理度量）
           - ``source``: 来源标记（``'lms_episodic'``）
@@ -339,7 +339,7 @@ class TranslationLayer:
           - ``num_active``: 显著激活节点数
           - ``entropy``: 激活熵
           - ``entropy_ratio``: 熵占最大熵（ln(num_nodes)）的比例
-          - ``surprise``: 惊讶度（自由能）
+          - ``surprise``: 惊讶度（准确性项，恒≥0）
           - ``num_nodes``: 节点总数
           - ``mean_activation``: 平均激活绝对值
           - ``max_activation``: 最大激活绝对值

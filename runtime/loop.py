@@ -1110,6 +1110,11 @@ class LivingMemoryLoop:
         if self.last_activation is not None:
             status['last_entropy'] = self.last_activation.entropy
             status['last_surprise'] = self.last_activation.surprise
+            # 2026-08-10 惊讶度语义拆分（设计v1.1 §3.5/C9）：增量暴露自由能
+            # 与 MSE（纯增量字段，旧客户端忽略）。surprise 为准确性项恒≥0；
+            # free_energy 为未规范化变分能量可负，仅供学习目标/诊断。
+            status['last_free_energy'] = self.last_activation.free_energy
+            status['last_mse'] = self.last_activation.mse
 
         # 在线熵管理状态
         status['entropy_ratio'] = self.last_entropy_ratio

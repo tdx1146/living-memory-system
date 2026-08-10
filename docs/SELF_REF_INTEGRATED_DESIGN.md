@@ -272,7 +272,8 @@ class StabilityArbiter:
             'ext_novelty': float,     # L5
             'entropy_ratio': float,   # 既有在线熵管理
             'coherence': float,       # 目的层
-            'surprise': float,        # 自由能
+            'surprise': float,        # 惊讶度（准确性项，恒≥0）
+            'free_energy': float,     # 自由能（未规范化变分能量，可负；仅供学习目标/诊断）
         }
         返回最终 alpha_t ∈ [0, alpha_base]
         """

@@ -202,7 +202,8 @@
 | `turn_count` | integer | 存储后的对话总轮次 |
 | `episodic_buffer_size` | integer | 情景记忆缓冲区大小 |
 | `last_entropy` | float \| null | 本轮激活熵 |
-| `last_surprise` | float \| null | 本轮自由能（惊讶度） |
+| `last_surprise` | float \| null | 本轮惊讶度（准确性项，恒≥0；2026-08-10 语义拆分，原为自由能） |
+| `last_free_energy` | float \| null | 本轮自由能（未规范化变分能量，可负；仅供学习目标/诊断） |
 | `precision_mean` | float \| null | precision 均值 |
 | `purpose_coherence` | float \| null | 目的层 coherence |
 | `snapshot_saved` | boolean | 是否成功保存快照 |
@@ -278,7 +279,8 @@
 | `num_nodes` | integer | 吸引子网络节点数 |
 | `input_dim` | integer | 感官输入维度 |
 | `last_entropy` | float | 上一轮激活熵（无激活态时缺失） |
-| `last_surprise` | float | 上一轮自由能/惊讶度（无激活态时缺失） |
+| `last_surprise` | float | 上一轮惊讶度（准确性项，恒≥0；2026-08-10 语义拆分，原为自由能；无激活态时缺失） |
+| `last_free_energy` | float | 上一轮自由能（未规范化变分能量，可负；仅供学习目标/诊断；无激活态时缺失） |
 | `entropy_ratio` | float | 在线熵管理比例 |
 | `entropy_high_threshold` | float | 熵上限阈值 |
 | `entropy_low_threshold` | float | 熵下限阈值 |

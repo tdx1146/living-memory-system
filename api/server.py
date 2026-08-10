@@ -187,7 +187,9 @@ class FeedRequest(BaseModel):
 class FeedResponse(BaseModel):
     status: str = Field("ok", description="处理状态")
     entropy: float = Field(0.0, description="本轮回塑形后的激活熵")
-    surprise: float = Field(0.0, description="本轮回塑形后的惊讶度")
+    surprise: float = Field(0.0, description="本轮回塑形后的惊讶度（准确性项，恒≥0）")
+    free_energy: float = Field(0.0, description="本轮回塑形后的自由能（未规范化变分能量，可负；仅供学习目标/诊断）")
+    mse: float = Field(0.0, description="本轮回塑形后的均方预测误差（跨尺度可比）")
     turn_count: int = Field(0, description="该会话累计轮次")
     session_id: str = Field(..., description="会话标识")
 
@@ -506,6 +508,8 @@ async def feed(req: FeedRequest):
         status="ok",
         entropy=float(status.get("last_entropy", 0.0) or 0.0),
         surprise=float(status.get("last_surprise", 0.0) or 0.0),
+        free_energy=float(status.get("last_free_energy", 0.0) or 0.0),
+        mse=float(status.get("last_mse", 0.0) or 0.0),
         turn_count=int(status.get("turn_count", 0) or 0),
         session_id=req.session_id,
     )

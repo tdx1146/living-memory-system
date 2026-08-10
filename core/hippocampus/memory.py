@@ -203,6 +203,9 @@ class MemoryManager:
         )
 
         # 按 surprise 排序回放重要经验（G3 修复：重要性加权而非时间序）
+        # （2026-08-10 惊讶度语义拆分：surprise 现为准确性项恒≥0，排序 =
+        # 预测误差优先，直接对齐 DREAM_ENGINE_DESIGN §2.1 神经科学依据；
+        # 下方 max(surprise, 0.0) 对 ≥0 输入为恒等，保留为防御性代码）
         if self._buffer:
             # 按 surprise 降序排列，优先回放高 surprise 条目
             sorted_buffer = sorted(self._buffer, key=lambda x: x[1], reverse=True)

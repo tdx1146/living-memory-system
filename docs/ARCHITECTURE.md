@@ -132,7 +132,10 @@ class Activation:
     """海马体激活态：吸引子网络的输出"""
     state: torch.Tensor         # [num_nodes] 节点激活值
     entropy: float              # 激活熵
-    surprise: float             # 自由能（惊讶度）
+    surprise: float             # 惊讶度 = 准确性项（precision-weighted prediction error，恒≥0）
+    free_energy: float = 0.0    # 自由能（未规范化变分能量，可负；严格 VFE ≥ 0 需 Bregman 形式=后续项；仅供学习目标与诊断）
+    per_dim_surprise: Optional[torch.Tensor] = None  # 逐维惊讶度 π_i·(σ_i−s_i)² [input_dim]
+    mse: Optional[float] = None # 均方预测误差 (1/input_dim)·Σ(σ_i−s_i)²
 
 @dataclass
 class PurposeState:
@@ -183,7 +186,7 @@ class AttractorNetwork:
             sigma = langevin(b_q)         # Langevin激活: coth(b) - 1/b
             感官节点被sensory_input * precision clamping
         
-        返回: 收敛后的激活态 + 熵 + 惊讶度（自由能）
+        返回: 收敛后的激活态 + 熵 + 惊讶度（准确性项，恒≥0）+ 自由能（可负）
         """
         ...
     
@@ -381,11 +384,14 @@ def infer(self, sensory_input, precision, num_steps=10):
         # Langevin激活
         sigma = langevin(b_q)  # coth(b) - 1/b
     
-    # 计算自由能（惊讶度）
-    surprise = self._compute_free_energy(sigma, sensory_input, precision)
+    # 计算惊讶度（准确性项）与自由能（未规范化变分能量，可负；
+    # 严格 VFE ≥ 0 需 Bregman 形式=后续项；仅供学习目标与诊断）
+    surprise = self._compute_surprise(sigma, sensory_input, precision)
+    free_energy = self._compute_free_energy(sigma, sensory_input, precision)
     entropy = -torch.sum(sigma * torch.log(sigma + 1e-8))
     
-    return Activation(state=sigma, entropy=entropy, surprise=surprise)
+    return Activation(state=sigma, entropy=entropy, surprise=surprise,
+                      free_energy=free_energy)
 ```
 
 ### 7.2 学习规则

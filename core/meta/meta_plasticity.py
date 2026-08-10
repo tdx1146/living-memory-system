@@ -247,7 +247,7 @@ class MetaPlasticityController:
         而是积累足够信号后才做一次有依据的调整。
 
         参数:
-            surprise: 当前轮的惊讶度（自由能），来自 AttractorNetwork。
+            surprise: 当前轮的惊讶度（准确性项，恒≥0），来自 AttractorNetwork。
             coherence: 当前目的层 coherence (0-1)，来自 PurposeLayer。
             collapse_occurred: 本轮是否发生坍缩（吸引子坍缩到
                 已有模式，丧失区分新输入的能力）。
