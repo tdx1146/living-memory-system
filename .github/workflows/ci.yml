@@ -3,8 +3,8 @@
 # 在无 GPU、无网络（测试阶段）、无预训练模型、无 API Key 的环境下运行测试。
 #
 # 触发条件:
-#   - push 到 master 分支
-#   - pull request 到 master 分支
+#   - push 到 main 分支
+#   - pull request 到 main 分支
 #
 # 设计说明:
 #   - 运行环境为 CPU-only（CI runner 无 GPU），故显式安装 CPU 版 PyTorch。
@@ -17,9 +17,9 @@ name: CI
 
 on:
   push:
-    branches: [master]
+    branches: [main]
   pull_request:
-    branches: [master]
+    branches: [main]
 
 # 对同一分支的连续 push 取消旧的运行，节省 CI 资源
 concurrency:

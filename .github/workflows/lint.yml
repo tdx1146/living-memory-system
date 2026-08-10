@@ -3,8 +3,8 @@
 # 使用 ruff 对核心源码目录进行静态检查。
 #
 # 触发条件:
-#   - push 到 master 分支
-#   - pull request 到 master 分支
+#   - push 到 main 分支
+#   - pull request 到 main 分支
 #
 # 检查范围: core/ runtime/ bridge/ persistence/ api/
 # 规则:
@@ -19,9 +19,9 @@ name: Lint
 
 on:
   push:
-    branches: [master]
+    branches: [main]
   pull_request:
-    branches: [master]
+    branches: [main]
 
 jobs:
   lint:
