@@ -179,7 +179,11 @@ class DreamEngine:
         self.snapshot_dir = config.get('snapshot_dir', 'snapshots')
 
         # --- 采样与各阶段参数 ---
-        self.surprise_beta = config.get('surprise_beta', 5.0)
+        # surprise_beta：惊讶度加权采样 softmax 温度。
+        # 2026-08-10 惊讶度语义拆分：采样输入改为缓冲区内 z-score 标准化 +
+        # z 截断（clamp ±3），β 默认从 5.0 降至 1.0（"强但不退化"第二道保险，
+        # 防准确性项重尾离群下 exp(βz) 退化为 argmax）。
+        self.surprise_beta = config.get('surprise_beta', 1.0)
         self.shy_target_norm = config.get('shy_target_norm', 10.0)
         self.drift_scale = config.get('drift_scale', 0.001)
         self.collapse_window = config.get('collapse_window', 5)
@@ -438,10 +442,13 @@ class DreamEngine:
         高 surprise（意外/重要）的记忆被更频繁地回放，对应生物海马体
         按"预测误差"而非"奖赏"优先回放的机制。
 
-        权重公式:
-            w_i = exp(beta * surprise_i) / sum(exp(beta * surprise_j))
+        权重公式（2026-08-10 惊讶度语义拆分后）：
+            z_i = (surprise_i − mean) / std          # 缓冲区内 z-score
+            z_i = clamp(z_i, −3, 3)                   # z 截断防重尾离群退化
+            w_i = exp(beta * z_i) / sum(exp(beta * z_j))
 
-        使用 max 减法保证数值稳定性（surprise 可为负值）。
+        标准化使采样对 surprise 任意量级稳健（准确性项 O(1~100) 或重尾
+        分布下不再退化为 argmax）；β 默认 1.0，可配置 surprise_beta。
 
         参数:
             buffer: 可选的自定义缓冲区（deque of (state, surprise)）。
@@ -462,9 +469,21 @@ class DreamEngine:
         surprises = torch.tensor([float(s) for (_, s) in entries],
                                  dtype=torch.float32)
 
-        # softmax 加权（max 减法保证数值稳定性）
+        # softmax 加权（2026-08-10 起：z-score 标准化 + z 截断 + β=1.0）
+        # 标准化使采样尺度无关（surprise 现为准确性项 O(1~100)，且重尾分布
+        # 下原始值 softmax 会退化为近似 argmax）；z 截断 clamp(±3) 防单条
+        # 离群记忆（z≈10）垄断采样；β 默认降至 1.0 作为第二道保险。
         beta = self.surprise_beta
-        shifted = beta * (surprises - surprises.max())
+        mean_s = surprises.mean()
+        # 单元素缓冲区无标准差可言（避免自由度警告），按退化处理
+        std_s = (surprises.std() if surprises.numel() > 1
+                 else torch.tensor(0.0, dtype=surprises.dtype))
+        if std_s > 1e-8:
+            z = (surprises - mean_s) / std_s
+        else:
+            z = torch.zeros_like(surprises)
+        z = z.clamp(-3.0, 3.0)
+        shifted = beta * z
         weights = torch.exp(shifted)
         weights = weights / weights.sum()
 
@@ -486,6 +505,14 @@ class DreamEngine:
         为了让回放"重访"特定记忆，将传入的记忆状态作为网络初始 sigma
         的种子，使动力学从该记忆附近出发并放松到吸引子。
 
+        惊讶度语义（2026-08-10 修复零精度陷阱）：零 precision 下准确性项
+        恒为 0，做梦 surprise 会退化为 0，使 avg_surprise/回填/遗忘修剪
+        全部失真。因此做梦时的惊讶度改为**对种子记忆的重构误差**
+        （π=1）：surprise = 0.5·Σ(σ − seed)²，语义 = "回放漂移越大的记忆
+        越值得巩固"，与神经科学（高预测误差优先回放）一致。
+        （_rem_integration 的 blended 是人工凸组合，重构误差以种子记忆为
+        参照，混合态下为近似度量。）
+
         E-P2-1: 零精度输入向量创建在 attractor 所在 device 上。
         E-P2-5: 不再"保存→修改→恢复"实例属性，改为通过 infer() 的
             override 参数传递空闲态值：
@@ -498,7 +525,7 @@ class DreamEngine:
                 若维度与 num_nodes 不匹配，则不设种子（从当前 sigma 出发）。
 
         返回:
-            生成式回放得到的 Activation。
+            生成式回放得到的 Activation（surprise = 对种子的重构误差）。
         """
         # 计算有效温度（若 meta 可用，使用元调整后的温度）
         effective_temp = self.idle_temperature
@@ -530,6 +557,22 @@ class DreamEngine:
             initial_state=seed,
             update_internal_state=False,
         )
+
+        # 做梦时的惊讶度 = 生成式回放对种子记忆的重构误差（π=1）
+        # 零精度陷阱修复（2026-08-10）：零 precision 下 infer 的准确性项恒为
+        # 0（surprise≡0），导致 avg_surprise/buffer 回填/遗忘修剪全部退化。
+        # 改以被回放的种子记忆为参照计算重构误差，语义="回放漂移越大的记忆
+        # 越值得巩固"（与神经科学高预测误差优先回放一致）。
+        # 注意：sensory_input 是 [num_nodes] 记忆态，种子感官部分取前
+        # input_dim 个节点（与在线感官节点定义一致）。
+        if seed is not None:
+            seed_sensory = sensory_input[:self.attractor.input_dim]
+            replay_error = (
+                activation.state[:self.attractor.input_dim] - seed_sensory)
+            activation.surprise = float(
+                0.5 * torch.sum(replay_error ** 2).item())
+            activation.per_dim_surprise = (
+                replay_error ** 2).detach().clone()
 
         return activation
 
