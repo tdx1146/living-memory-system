@@ -3,6 +3,12 @@
 > 一个基于海马体模型的"活体"记忆痕迹维护器：通过自由能原理（FEP）学习规则，
 > 让记忆在与对话的持续交互中**涌现**、**巩固**与**演化**，而不是静态的键值存取。
 
+> 🔗 **系统定位**（2026-08-10）：本模块是「LMS 活体记忆」。
+> 上游依赖：无（被胶水层/self_pulse/OpenClaw 调用）｜ 下游消费者：胶水层(:19000)、self_pulse、OpenClaw 插件
+> 外部接口：`:8190` /health、`/status/{sid}`、`/feed`、`/recall`；`:8191` 控制口
+> 仓库：`https://github.com/tdx1146/living-memory-system`（master，私有）
+> 系统全图：**见 `tdx1146/agent-os` 仓库的 `TOPOLOGY.md`**（https://github.com/tdx1146/agent-os/blob/main/TOPOLOGY.md）
+
 ## 目录
 
 - [核心理念](#核心理念)
@@ -94,7 +100,9 @@ LMS 把记忆建模为一组相互竞争的**吸引子**（attractor），其连
 ```bash
 git clone <repo-url>
 cd 活体记忆系统
-pip install -r requirements.txt
+# 创建虚拟环境（全部脚本都依赖 .venv，必须建）
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
 ```
 
 ### 2. 配置环境变量
@@ -102,6 +110,13 @@ pip install -r requirements.txt
 ```bash
 cp .env.example .env
 # 编辑 .env，填入 DeepSeek API Key（不填则 LLM 功能禁用，仅返回记忆 context）
+```
+
+⚠️ **关键**：`.env` 不会自动加载，启动前必须 source（否则得到静默降级实例：
+embed 变 simple、LLM 不启用、/health 却显示正常——这是最常见的"部署了但没生效"坑）：
+
+```bash
+set -a; . ./.env; set +a
 ```
 
 `.env` 关键项：
@@ -124,11 +139,14 @@ LMS_CLOUD_EMBED_DIM=1024
 ### 3a. 启动 HTTP API 服务
 
 ```bash
+set -a; . ./.env; set +a   # 先加载配置（必做！）
 python -m api.run
 # 或: python api/run.py --host 0.0.0.0 --port 8190 --reload
 ```
 
 服务默认监听 `http://127.0.0.1:8190`，交互式文档位于 `http://127.0.0.1:8190/docs`。
+验证是否真的加载了配置：`curl http://127.0.0.1:8190/status/main` 应返回非空 turn_count，
+且启动日志不应出现 "降级" 字样。
 
 ### 3b. 启动 MCP 服务器（供 TRAE IDE 调用）
 

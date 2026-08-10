@@ -56,7 +56,13 @@ _BJT = timezone(timedelta(hours=8))
 # ---------------------------------------------------------------------------
 # 默认配置（环境变量可覆盖）
 # ---------------------------------------------------------------------------
-_DEFAULT_BUS_FILE = "/vol1/@team/qh团队/QH/AI专用/Agent OS/iso-sand/data/event_bus.jsonl"
+_DEFAULT_BUS_FILE = os.environ.get(
+    "LMS_BUS_FILE",
+    os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "..", "Agent OS", "iso-sand", "data", "event_bus.jsonl",
+    ),
+)
 _PRODUCER = "lms"
 
 _MAX_PAYLOAD_DEPTH = 4          # payload 序列化最大嵌套深度（防意外递归）

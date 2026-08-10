@@ -240,3 +240,13 @@ else
         *)       fail "未知动作: $ACTION（支持 start|stop|restart|status）" ;;
     esac
 fi
+
+# ── 怀疑钩子：部署/重启后自动怀疑（fail-open 不阻断）────────────────
+# 每次 LMS API 启动/重启后生成 novelty 怀疑，喂 LMS 塑形 + 账本留痕
+if [ "$ACTION" = "start" ] || [ "$ACTION" = "restart" ]; then
+    _HOOK="$LMS_HOME/../Agent OS/doubt-system/doubt_hook.py"
+    if [ -f "$_HOOK" ]; then
+        python3 "$_HOOK" --deploy "lms_ctl.sh $ACTION $(date '+%F %T')" \
+            --health "$HEALTH_URL" --topic deploy-lms --quiet 2>/dev/null || true
+    fi
+fi
