@@ -61,6 +61,8 @@ class PurposeLayer:
                  activation_threshold: float = 0.3,
                  coherence_direction_weight: float = 0.5,
                  coherence_magnitude_weight: float = 0.5,
+                 per_dim_surprise_scale: float = 0.1,
+                 total_surprise_scale: float = 20.0,
                  device: Union[str, torch.device] = "auto") -> None:
         """初始化目的层。
 
@@ -86,6 +88,17 @@ class PurposeLayer:
                 衡量 precision 幅度的稳定性。默认 0.5。
                 方向权重与幅度权重之和无需为 1，内部会归一化以保证
                 coherence 落在 [0, 1]。
+            per_dim_surprise_scale: 逐维惊讶度映射的尺度常数 k（tanh(raw/k)）。
+                默认 0.1（C2 落地时按实测 per_dim_surprise 分布校准：生产景观
+                1280 样本 median=0.97/P10=0.70/P90=1.24；k=1.0 拍脑袋初值
+                会因 habituation(≈0.13) 压目标 + π 乘性反馈螺旋，使 precision
+                百轮内崩塌到下限，已证伪；k=0.1 落在审计预估 0.1~0.3 区间，
+                300 轮 A/B 与旧 |σ| 代理行为最接近（0.44 vs 0.36，std 0.045
+                vs 0.037），详见惊讶度修复-01-设计方案.md §4.4 校准记录）。
+            total_surprise_scale: 全局惊讶度缩放常数（sigmoid(surprise/scale)），
+                默认 20.0。生产 surprise（准确性项）实测 26~32，除以 20 后
+                sigmoid 取值 0.79~0.83，不饱和；语义"总惊讶度越高，调整幅度
+                越大"单调保留。
             device: 计算设备（E-P2-1）。支持 "auto"/"cpu"/"cuda"/"cuda:0"
                 或 torch.device。precision 向量、attention 和 encounter_count
                 将创建在该设备上。
@@ -100,6 +113,9 @@ class PurposeLayer:
         self.max_history = max_history
         self.habituation_rate = habituation_rate
         self.activation_threshold = activation_threshold
+        # 逐维惊讶度映射尺度 k（tanh(raw/k)）与全局缩放常数（sigmoid(surprise/scale)）
+        self.per_dim_surprise_scale = per_dim_surprise_scale
+        self.total_surprise_scale = total_surprise_scale
         # coherence 混合权重（方向分量 + 幅度分量）
         self.coherence_direction_weight = coherence_direction_weight
         self.coherence_magnitude_weight = coherence_magnitude_weight
@@ -132,13 +148,15 @@ class PurposeLayer:
     # ------------------------------------------------------------------ #
 
     def _compute_per_dim_surprise(self, activation: Activation) -> torch.Tensor:
-        """计算每个感官维度的惊讶度。
+        """逐维惊讶度 = π_i·(σ_i−s_i)²（由 attractor.infer 填充），映射到
+        [precision_min, precision_max]。
 
-        惊讶度代理：感官节点的激活强度 |σ_i|。
-        高激活 = 该维度承载了信息 = 令人惊讶。
-        低激活 = 该维度无信息 = 不令人惊讶。
+        回退：activation.per_dim_surprise 为 None（旧构造点/旧测试手搓的
+        Activation）时，沿用 |σ_i| 激活强度代理（行为降级，不崩溃）。
 
-        将惊讶度缩放到 precision 的合理范围 [precision_min, precision_max]。
+        映射为单调饱和函数 tanh(raw/k)：surprise_i ∈ [0,∞) →
+        [precision_min, precision_max]。k = per_dim_surprise_scale 为尺度
+        常数（C2 落地时实测校准，使典型误差落在 tanh 灵敏区）。
 
         参数:
             activation: 吸引子网络的激活态。
@@ -146,14 +164,24 @@ class PurposeLayer:
         返回:
             每个感官维度的惊讶度，形状 [input_dim]，值域映射到 precision 范围。
         """
-        # 感官节点的激活强度（取绝对值，范围 (0, 1)）
-        # E-P2-1: 迁移到正确 device
-        sensory_activation = activation.state[:self.input_dim].abs().to(self.device)
-
-        # 缩放到 precision 范围：0 → precision_min，1 → precision_max
-        scale = self.precision_max - self.precision_min
-        per_dim_surprise = self.precision_min + sensory_activation * scale
-        return per_dim_surprise
+        raw = activation.per_dim_surprise
+        if raw is None:
+            # 回退分支：旧构造点无 per_dim_surprise，用 |σ_i| 激活强度代理
+            # （E-P2-1: 迁移到正确 device）
+            sensory_activation = (
+                activation.state[:self.input_dim].abs().to(self.device))
+            scale = self.precision_max - self.precision_min
+            return self.precision_min + sensory_activation * scale
+        raw = raw.to(self.device)
+        # 单调饱和映射：surprise_i ∈ [0,∞) → [precision_min, precision_max]
+        # tanh(raw / k)：k 为尺度常数（per_dim_surprise_scale）。
+        # 理由：|σ| 代理天然 ∈(0,1)，而 π(σ−s)² 无量纲上限，需有界单调映射
+        # 才能继续喂给 EMA 与 clamp。
+        k = self.per_dim_surprise_scale
+        mapped = (self.precision_min
+                  + (self.precision_max - self.precision_min)
+                  * torch.tanh(raw / k))
+        return mapped
 
     # ------------------------------------------------------------------ #
     #  Layer 2: 注意力分配 + 一致性计算
@@ -330,12 +358,18 @@ class PurposeLayer:
         # habituation = 1 / (1 + encounter_count * rate)
         # encounter_count=0 → habituation=1.0（无衰减）
         # encounter_count=20 → habituation=1/(1+20*0.05)=0.5（衰减一半）
+        # 注：误差小本身已反映熟悉（per_dim_surprise 已低），habituation 再乘
+        # 一次属双重复合，冗余不有害（惊讶度修复-01-设计方案.md §4.4 注）。
         habituation = 1.0 / (1.0 + self.encounter_count * self.habituation_rate)
         per_dim_surprise = per_dim_surprise * habituation
 
         # 指数移动平均：precision 向 per_dim_surprise 靠拢
-        # surprise 全局缩放因子：总惊讶度越高，调整幅度越大
-        surprise_scale = torch.sigmoid(torch.tensor(surprise))  # (0, 1)
+        # surprise 全局缩放因子：总惊讶度越高，调整幅度越大。
+        # 现 surprise 为准确性项（量级 O(1~100)），除以 total_surprise_scale
+        # （默认 20.0）后落在 sigmoid 灵敏区；旧式 sigmoid(surprise) 在
+        # 大输入下恒≈1，全局缩放饱和失效（惊讶度修复-01-设计方案.md §4.4）。
+        surprise_scale = torch.sigmoid(
+            torch.tensor(surprise) / self.total_surprise_scale)
         effective_lr = self.precision_lr * (0.5 + surprise_scale.item())
 
         self.sensory_precision = (
