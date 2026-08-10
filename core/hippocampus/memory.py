@@ -14,10 +14,28 @@ consolidation（巩固）机制将短时记忆迁移到长时记忆，
 """
 
 import os
+import re
 import torch
 from collections import deque
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
+
+# 2026-08-10 设计回归：记忆入口垃圾过滤（dandan：回到首版精神）
+# 消息元数据包装/系统事件不是对话，不该进入海马体（此前误存污染召回）。
+_GARBAGE_TEXT_RE = [
+    re.compile(r"Sender \(untrusted metadata\)", re.I),
+    re.compile(r"System \(untrusted\)", re.I),
+    re.compile(r"^System:", re.I),
+    re.compile(r"端口探测"),
+]
+_GARBAGE_FILTERED = 0  # 计数器（进程内，可被 status 读取）
+
+
+def _is_garbage_text(text: str) -> bool:
+    """判断文本是否为消息元数据/系统事件垃圾（非对话）。"""
+    if not text:
+        return False
+    return any(p.search(text) for p in _GARBAGE_TEXT_RE)
 
 from core.types import Activation, resolve_device
 
@@ -254,6 +272,12 @@ class MemoryManager:
           - source='external'：来自外部对话（默认，向后兼容）
           - source='self_ref'：来自自指回路（防止污染 LLM 可见 context）
 
+        2026-08-10 设计回归（dandan：回到首版精神，不允许乱改）：
+        入口垃圾过滤——消息元数据包装（Sender (untrusted metadata)/System 事件）
+        不是对话，不该进入海马体。此前 8/5-8/10 有 6-12 条此类垃圾被误存
+        （占满召回排序），已清洗。此处过滤防止复发；被滤条目只记日志不丢弃
+        调用方（fail-open：过滤逻辑异常时照常存储）。
+
         参数:
             text: 原始对话文本。
             semantic_vector: 投影后的语义向量（低维，用于吸引子网络路径，
@@ -270,6 +294,13 @@ class MemoryManager:
                         else semantic_vector)
         # E-P2-1: 迁移到正确 device
         store_vector = store_vector.to(self.device)
+        # 2026-08-10 入口垃圾过滤（设计回归）：消息元数据/系统事件不是对话。
+        # 命中即丢弃（不写入记忆），fail-open：过滤逻辑异常照常存储。
+        try:
+            if _is_garbage_text(text):
+                return
+        except Exception:
+            pass
         entry = EpisodicEntry(
             text=text,
             semantic_vector=store_vector.detach().clone(),
