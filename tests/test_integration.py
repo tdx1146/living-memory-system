@@ -288,6 +288,27 @@ class TestProcessTurn:
         assert isinstance(status['last_entropy'], float)
         assert isinstance(status['last_surprise'], float)
 
+    def test_api_contract_backward(self, loop):
+        """契约向后兼容：status 含 last_surprise 且新增 last_free_energy。
+
+        （惊讶度修复-01-设计方案.md §5.2 新增：/status 响应字段 last_surprise
+        保留（值语义变为准确性项），纯增量新增 last_free_energy / last_mse，
+        旧客户端解析字段不缺失。）
+        """
+        loop.process_turn("契约兼容测试")
+        status = loop.get_status()
+        # 旧字段保留
+        assert 'last_surprise' in status
+        assert isinstance(status['last_surprise'], float)
+        # 新字段增量存在
+        assert 'last_free_energy' in status
+        assert isinstance(status['last_free_energy'], float)
+        assert 'last_mse' in status
+        assert isinstance(status['last_mse'], float)
+        # 语义：surprise 恒 ≥ 0（准确性项）；free_energy 可负（能量项主导时）
+        assert status['last_surprise'] >= 0.0
+        assert status['last_free_energy'] == status['last_free_energy']  # 非 NaN
+
 
 # ============================================================
 # 2. save_state() / load_state() 往返一致性

@@ -235,6 +235,65 @@ class TestDreamEngine:
             f"高 surprise 应被采样更多，实际 high_count={high_count}/{n}"
         )
 
+    def test_dream_softmax_not_degenerate(self, dream_engine):
+        """surprise 跨度 [1, 100] 时 softmax 不退化（标准化后非 argmax）。
+
+        （惊讶度修复-01-设计方案.md §5.2 新增：z-score 标准化 + z 截断 +
+        β=1.0 下，权重应有可辨方差，且最高 surprise 采样概率仍最高。）
+        """
+        engine = dream_engine
+        # 构造跨度 [1, 100] 的缓冲区
+        buf = []
+        for i in range(20):
+            state = torch.ones(engine.num_nodes) * (i + 1) / 20.0
+            surprise = 1.0 + i * (99.0 / 19.0)
+            buf.append((state, surprise))
+        # 计算权重分布（复用引擎内部逻辑）
+        surprises = torch.tensor([s for (_, s) in buf], dtype=torch.float32)
+        z = (surprises - surprises.mean()) / surprises.std()
+        z = z.clamp(-3.0, 3.0)
+        weights = torch.exp(1.0 * z)
+        weights = weights / weights.sum()
+        assert float(weights.std()) > 0.01, (
+            f"权重方差过小（{float(weights.std()):.4f}），采样退化为均匀")
+        # 最高 surprise 项权重仍最高
+        assert float(weights.argmax().item()) == int(surprises.argmax().item())
+
+    def test_dream_softmax_single_outlier(self, dream_engine):
+        """重尾单离群（99 条 ~0.1 + 1 条 100）不退化 argmax。
+
+        （惊讶度修复-01-设计方案.md §5.2 新增，v1.1 审计必须修改项 4：
+        z 截断 clamp(±3) + β=1.0 下离群项权重 < 0.9（对照：无截断时
+        exp(β·z≈10) 退化为 argmax ≈1.0），且离群项采样概率仍最高。）
+        """
+        engine = dream_engine
+        buf = [(torch.zeros(engine.num_nodes), 0.1) for _ in range(99)]
+        buf.append((torch.ones(engine.num_nodes), 100.0))
+
+        # 权重计算（z 截断 + β=1.0）
+        surprises = torch.tensor([s for (_, s) in buf], dtype=torch.float32)
+        z = (surprises - surprises.mean()) / surprises.std()
+        z = z.clamp(-3.0, 3.0)
+        weights = torch.exp(1.0 * z)
+        weights = weights / weights.sum()
+        outlier_w = float(weights[-1].item())
+        assert outlier_w < 0.9, (
+            f"离群项权重 {outlier_w:.4f} ≥ 0.9，softmax 退化为 argmax")
+        assert float(weights.std()) > 0.01
+        assert float(weights.argmax().item()) == 99, (
+            "离群项（最高 surprise）采样概率应仍最高")
+
+        # 端到端采样验证（多次采样统计，离群项应被采到但非垄断）
+        torch.manual_seed(3)
+        high_count = 0
+        n = 1000
+        for _ in range(n):
+            state, _ = engine._sample_by_surprise(buffer=buf)
+            if float(state.sum()) > 0:
+                high_count += 1
+        assert 0.05 < high_count / n < 0.9, (
+            f"离群项采样率 {high_count / n:.3f} 异常（应 >0 且 <0.9）")
+
     # ------------------------------------------------------------
     # 3. 空闲态推断与学习
     # ------------------------------------------------------------
@@ -253,6 +312,27 @@ class TestDreamEngine:
         assert isinstance(activation.surprise, float)
         # 零精度向量全零
         assert torch.all(engine.idle_precision == 0)
+
+    def test_dream_idle_surprise_reconstruction(self, dream_engine):
+        """做梦 surprise = 对种子记忆的重构误差（零精度陷阱回归钉死）。
+
+        （惊讶度修复-01-设计方案.md §5.2 新增：零 precision 下准确性项恒为 0，
+        做梦 surprise 须改用 0.5·Σ(σ−seed)²；断言 > 0 且等于手算值。）
+        """
+        engine = dream_engine
+        seed = torch.randn(engine.num_nodes) * 0.5
+        torch.manual_seed(42)
+        activation = engine._idle_infer(seed)
+        # 手算重构误差（感官部分 = 前 input_dim 个节点）
+        replay_error = (
+            activation.state[:engine.input_dim] - seed[:engine.input_dim])
+        manual = float(0.5 * torch.sum(replay_error ** 2).item())
+        assert activation.surprise > 0.0, (
+            f"做梦 surprise={activation.surprise} 应为正（重构误差）")
+        assert activation.surprise == pytest.approx(manual, abs=1e-6)
+        # per_dim 同步填充（供目的层/回填使用）
+        assert activation.per_dim_surprise is not None
+        assert activation.per_dim_surprise.shape == (engine.input_dim,)
 
     def test_idle_learn_low_lr(self, dream_engine):
         """低学习率学习后 J 变化小于在线学习。"""

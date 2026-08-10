@@ -198,6 +198,27 @@ class TestConsolidation:
         # 短时记忆应衰减
         assert short_after < short_before
 
+    def test_replay_weights_nonzero(self):
+        """surprise≥0 时回放权重非零：consolidate 后 long_term_latent 变化。
+
+        （惊讶度修复-01-设计方案.md §5.2 新增：旧语义下 surprise 可负，
+        max(surprise, 0) 清零 → 回放权重全 0 → long_term_latent 不变；
+        新语义 surprise=准确性项恒≥0，回放生效。）
+        """
+        mem = MemoryManager(num_nodes=32, short_term_decay=0.8,
+                            transfer_rate=0.0)  # 关掉短时→长时迁移，隔离回放
+        pattern = torch.ones(32) * 0.5
+        for _ in range(10):
+            mem.update(make_activation(32, pattern), 1.0)
+        # 清空短时/长时潜变量，确保变化仅来自回放
+        mem.long_term_latent.zero_()
+        mem.short_term_latent.zero_()
+
+        mem.consolidate()
+
+        assert float(mem.long_term_latent.abs().sum().item()) > 0.0, (
+            "回放权重全 0，long_term_latent 无变化（旧负值缺陷回归）")
+
     def test_consolidate_preserves_information(self):
         """consolidate 不会丢失信息（迁移到长时）。"""
         mem = MemoryManager(num_nodes=32, short_term_decay=0.8, long_term_decay=0.999)

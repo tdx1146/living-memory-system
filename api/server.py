@@ -858,6 +858,9 @@ async def on_startup():
 # 启动看门狗线程，超时则 os._exit 强制退出，防止落盘卡死导致进程无限挂起。
 SHUTDOWN_GRACE_SECONDS = float(os.environ.get("LMS_SHUTDOWN_GRACE_SECONDS", "30"))
 
+# 停机看门狗取消事件（T1.4 修复：优雅停机成功后取消，防误杀同进程）
+_SHUTDOWN_WATCHDOG = {"event": None}
+
 
 def _start_shutdown_watchdog(grace_seconds: float = SHUTDOWN_GRACE_SECONDS) -> None:
     """启动停机看门狗：grace 秒后强制退出（兜底防挂死）。
@@ -865,15 +868,37 @@ def _start_shutdown_watchdog(grace_seconds: float = SHUTDOWN_GRACE_SECONDS) -> N
     uvicorn 收到 SIGTERM/SIGINT 后进入优雅停机并触发 on_shutdown；
     若 on_shutdown 内落盘卡死，看门狗线程到点 os._exit 强制退出，
     保证进程不会无限挂起（T1.4/P0-13）。
+
+    注意：看门狗必须在优雅停机**成功完成**后取消（_cancel_shutdown_watchdog），
+    否则守护线程会在宽限期满后无条件 os._exit(1)——生产环境 uvicorn 随即退出
+    无害，但同进程内继续存活的场景（如 pytest 全量套件的 TestClient）会被误杀。
     """
+    cancel_event = threading.Event()
+
     def _force_exit() -> None:
-        time.sleep(grace_seconds)
+        # Event.wait(timeout) 返回 True = 已收到取消信号 → 空转退出；
+        # 返回 False = 宽限期满仍未取消 → 强制退出。
+        if cancel_event.wait(grace_seconds):
+            return
         logger.critical(
             f"优雅停机超时（>{grace_seconds}s），强制退出（可能未完成全部落盘）")
         os._exit(1)
 
+    _SHUTDOWN_WATCHDOG["event"] = cancel_event
     threading.Thread(
         target=_force_exit, daemon=True, name="shutdown-watchdog").start()
+
+
+def _cancel_shutdown_watchdog() -> None:
+    """取消停机看门狗（优雅停机在宽限期内完成时调用）。
+
+    设置取消 Event 后，看门狗线程的 wait 立即返回 True 并空转退出，
+    不再触发 os._exit。
+    """
+    ev = _SHUTDOWN_WATCHDOG.get("event")
+    if ev is not None:
+        ev.set()
+        _SHUTDOWN_WATCHDOG["event"] = None
 
 
 @app.on_event("shutdown")
@@ -886,37 +911,43 @@ async def on_shutdown():
       3. clear 会话。
     若做梦进行中直接落盘，会读到半巩固状态；先停调度器再落盘可保证
     快照一致性，且同样满足"停机前保存最终快照"的目标。
+
+    T1.4 修复（2026-08-10）：优雅停机在宽限期内成功完成后，finally 中
+    取消看门狗——守护线程若不被取消，会在 30s 后无条件 os._exit(1)，
+    误杀同进程内继续存活的场景（如 pytest 全量套件中的 TestClient）。
     """
     logger.info("开始优雅停机：停止调度器 → 保存最终快照 → 清理会话")
     _start_shutdown_watchdog()  # 30s 兜底强退
+    try:
+        scheduler = get_dream_scheduler()
+        scheduler.stop()
+        # T2.6：调度器停止审计
+        audit("scheduler_stop")
+        logger.info("DreamScheduler 已停止")
 
-    scheduler = get_dream_scheduler()
-    scheduler.stop()
-    # T2.6：调度器停止审计
-    audit("scheduler_stop")
-    logger.info("DreamScheduler 已停止")
+        sm = get_session_manager()
+        saved_paths = []
+        for sid in sm.list_sessions():
+            loop = sm.get(sid)
+            if loop is None:
+                continue
+            try:
+                path = loop.save_session_state()
+                if path:
+                    saved_paths.append(path)
+                    logger.info(f"[{sid}] 停机最终快照已保存: {path}")
+                else:
+                    logger.warning(f"[{sid}] 停机最终快照因写锁超时被跳过")
+            except Exception as e:
+                logger.error(f"[{sid}] 停机最终快照保存失败: {e}")
+        logger.info(f"优雅停机：已保存 {len(saved_paths)} 个会话的最终快照")
 
-    sm = get_session_manager()
-    saved_paths = []
-    for sid in sm.list_sessions():
-        loop = sm.get(sid)
-        if loop is None:
-            continue
-        try:
-            path = loop.save_session_state()
-            if path:
-                saved_paths.append(path)
-                logger.info(f"[{sid}] 停机最终快照已保存: {path}")
-            else:
-                logger.warning(f"[{sid}] 停机最终快照因写锁超时被跳过")
-        except Exception as e:
-            logger.error(f"[{sid}] 停机最终快照保存失败: {e}")
-    logger.info(f"优雅停机：已保存 {len(saved_paths)} 个会话的最终快照")
-
-    n = sm.clear()
-    logger.info(f"服务关闭，已清理 {n} 个会话")
-    # T2.6：服务停机审计
-    audit("shutdown", saved_count=len(saved_paths), sessions_cleared=n)
+        n = sm.clear()
+        logger.info(f"服务关闭，已清理 {n} 个会话")
+        # T2.6：服务停机审计
+        audit("shutdown", saved_count=len(saved_paths), sessions_cleared=n)
+    finally:
+        _cancel_shutdown_watchdog()
 
 
 # 模块导入时确保项目根目录在 sys.path 中（支持 `python api/run.py` 启动）

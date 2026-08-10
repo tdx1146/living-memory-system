@@ -397,3 +397,65 @@ class TestGetPurpose:
 
         # 内部 precision 不受影响
         assert torch.allclose(layer.get_precision(), torch.ones(16))
+
+
+# ----------------------------------------------------------------------- #
+#  2026-08-10 惊讶度语义拆分新增测试（设计v1.1 §5.2）
+# ----------------------------------------------------------------------- #
+
+
+class TestSurpriseSemantics:
+    """准确性项语义下的目的层测试（C2 新增）。"""
+
+    def test_purpose_global_scaling_not_saturated(self):
+        """全局缩放 sigmoid(surprise/20) 在 surprise∈[1,100] 不饱和。
+
+        （惊讶度修复-01-设计方案.md §5.2 新增，v1.1 审计必须修改项 2：
+        旧式 sigmoid(surprise) 在 100 处恒≈1.0，全局缩放失效；除以
+        total_surprise_scale=20 后取值跨 [0.512, 0.993]，单调有效。）
+        """
+        layer = PurposeLayer(input_dim=16)
+        assert layer.total_surprise_scale == pytest.approx(20.0)
+        low = torch.sigmoid(torch.tensor(1.0) / layer.total_surprise_scale)
+        high = torch.sigmoid(torch.tensor(100.0) / layer.total_surprise_scale)
+        # sigmoid(1/20)=0.512, sigmoid(100/20)=0.993
+        assert float(low.item()) == pytest.approx(0.512, abs=1e-3)
+        assert float(high.item()) == pytest.approx(0.993, abs=1e-3)
+        # 对照旧式 sigmoid(surprise)：100 处恒 ≈ 1.0
+        old = torch.sigmoid(torch.tensor(100.0))
+        assert float(old.item()) == pytest.approx(1.0, abs=1e-6)
+        assert float(high.item()) < 0.999, "除以 20 后不应饱和到 1.0"
+
+    def test_per_dim_surprise_mapping(self):
+        """per_dim 映射：读 activation.per_dim_surprise 时输出有界且单调；
+        None 时回退不抛异常。
+
+        （惊讶度修复-01-设计方案.md §5.2 新增：tanh(raw/k) 映射到
+        [precision_min, precision_max]，随 raw 单调；None 走 |σ| 代理。）
+        """
+        layer = PurposeLayer(input_dim=16)
+        pmin, pmax = layer.precision_min, layer.precision_max
+
+        # 主分支：读 per_dim_surprise
+        pd = torch.zeros(16)
+        pd[:5] = torch.tensor([0.0, 0.1, 1.0, 5.0, 50.0])
+        act = Activation(
+            state=torch.zeros(32), entropy=0.5, surprise=1.0,
+            per_dim_surprise=pd)
+        out = layer._compute_per_dim_surprise(act)
+        assert out.shape == (16,)
+        assert torch.all(out >= pmin - 1e-6) and torch.all(out <= pmax + 1e-6)
+        # 单调性：raw 越大 → mapped 越大
+        mapped_vals = out[:5]
+        assert torch.all(mapped_vals[1:] >= mapped_vals[:-1] - 1e-6)
+        # 饱和映射：raw=0 → ≈precision_min；raw=50 → ≈precision_max
+        assert float(out[0].item()) == pytest.approx(pmin, abs=1e-3)
+        assert float(out[4].item()) == pytest.approx(pmax, abs=1e-2)
+
+        # 回退分支：per_dim_surprise=None 不抛异常
+        act_old = Activation(
+            state=torch.cat([torch.ones(16) * 0.5, torch.zeros(16)]),
+            entropy=0.5, surprise=1.0)
+        out_fb = layer._compute_per_dim_surprise(act_old)
+        assert out_fb.shape == (16,)
+        assert torch.all(out_fb >= pmin - 1e-6) and torch.all(out_fb <= pmax + 1e-6)

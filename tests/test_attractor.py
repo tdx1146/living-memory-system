@@ -99,6 +99,78 @@ class TestInfer:
         assert act.state.shape == (32,)
         assert isinstance(act.entropy, float)
         assert isinstance(act.surprise, float)
+        # 2026-08-10 惊讶度语义拆分：infer 产出完整四件套
+        assert isinstance(act.free_energy, float)
+        assert act.per_dim_surprise is not None
+        assert act.per_dim_surprise.shape == (16,)
+        assert act.mse is not None
+
+    def test_surprise_nonnegative(self):
+        """惊讶度（准确性项）恒 ≥ 0；precision=0 时为 0。
+
+        （惊讶度修复-01-设计方案.md §5.2 新增：任意 sensory/precision 组合
+        下 act.surprise >= 0，零精度下 == 0.0。）
+        """
+        net = AttractorNetwork(num_nodes=32, input_dim=16, seed=42)
+        for p_val in (0.1, 1.0, 10.0):
+            for _ in range(5):
+                sensory = torch.randn(16) * 0.8
+                precision = torch.full((16,), p_val)
+                act = net.infer(sensory, precision)
+                assert act.surprise >= 0.0, (
+                    f"precision={p_val} 下 surprise={act.surprise} < 0")
+        act_zero = net.infer(torch.randn(16), torch.zeros(16))
+        assert act_zero.surprise == 0.0
+
+    def test_surprise_vs_free_energy_decomposed(self):
+        """surprise（准确性项）与 free_energy 分解自洽。
+
+        free_energy == corr + bias + surprise + complexity（重算验证）；
+        surprise == 手算 0.5·Σπ(σ−s)²（allclose）。
+        （惊讶度修复-01-设计方案.md §5.2 新增。）
+        """
+        net = AttractorNetwork(num_nodes=32, input_dim=16, seed=42)
+        sensory = torch.randn(16) * 0.5
+        precision = torch.ones(16) * 2.0
+        act = net.infer(sensory, precision)
+        sigma = act.state
+
+        corr = -0.5 * (sigma @ net.J @ sigma)
+        bias = torch.dot(net.bias, sigma)
+        acc = 0.5 * torch.sum(precision * (sigma[:16] - sensory) ** 2)
+        comp = 0.5 * net.complexity_weight * torch.sum(net.J ** 2)
+
+        assert act.free_energy == pytest.approx(
+            float((corr + bias + acc + comp).item()), abs=1e-5)
+        assert act.surprise == pytest.approx(float(acc.item()), abs=1e-5)
+
+    def test_accuracy_vs_F_ordering_differs(self):
+        """能量污染剥离的直接证据：free_energy 排序与 surprise 排序相反。
+
+        构造两态：A=深陷吸引子但输入错位（能量项大负 → free_energy 低，但
+        感官误差大 → surprise 高）；B=游离但输入吻合（能量项≈0 →
+        free_energy 高，误差小 → surprise 低）。断言两者排序相反——
+        surprise 与 free_energy 不是同一物理量。
+        （惊讶度修复-01-设计方案.md §5.2 新增。）
+        """
+        net = AttractorNetwork(num_nodes=32, input_dim=16, seed=42)
+        net.bias = torch.full((32,), -1.0)  # 深吸引子偏置（低能量阱）
+        sensory = torch.randn(16) * 0.5
+        precision = torch.ones(16)
+
+        # A：全 0.9 强共激活（深陷吸引子），感官部分远离输入（大误差）
+        state_a = torch.full((32,), 0.9)
+        # B：感官部分贴近输入、其余近零（游离但吻合）
+        state_b = torch.zeros(32)
+        state_b[:16] = sensory * 0.99
+
+        fe_a = net._compute_free_energy(state_a, sensory, precision)
+        fe_b = net._compute_free_energy(state_b, sensory, precision)
+        su_a = net._compute_surprise(state_a, sensory, precision)
+        su_b = net._compute_surprise(state_b, sensory, precision)
+
+        assert fe_a < fe_b, f"深陷态自由能应更低: {fe_a} vs {fe_b}"
+        assert su_a > su_b, f"深陷态惊讶度应更高: {su_a} vs {su_b}"
 
     def test_infer_state_in_range(self):
         """推断后激活值在 (-1, 1) 范围内。"""
@@ -216,8 +288,29 @@ class TestLearn:
         diagonal = net.J.diagonal()
         assert torch.allclose(diagonal, torch.zeros_like(diagonal))
 
+    def test_j_clamp_unconditional(self):
+        """J 范数钳制不依赖 norm_surprise 开关（无条件生效）。
+
+        （惊讶度修复-01-设计方案.md §5.2 新增：钳制移出开关门后，
+        norm_surprise=False 时设置 j_target_norm=0.1 仍应把 ‖J‖_F 压住。）
+        """
+        net = AttractorNetwork(
+            num_nodes=32, input_dim=16, seed=42, norm_surprise=False)
+        net.j_target_norm = 0.1
+        for _ in range(5):
+            sensory = torch.randn(16) * 0.5
+            act = net.infer(sensory, torch.ones(16))
+            net.learn(act, sensory, learning_rate=0.1)
+        j_norm = float(torch.norm(net.J, p="fro").item())
+        assert j_norm <= 0.1 * (1 + 1e-3), f"‖J‖_F={j_norm} 未被钳制到 0.1"
+
     def test_repeated_learning_strengthens_attractor(self):
-        """重复学习同一模式后，该模式的吸引子变得更稳定（surprise 下降）。"""
+        """重复学习同一模式后，该模式的吸引子变得更稳定（surprise 下降）。
+
+        注（2026-08-10 惊讶度语义拆分）：surprise 现为准确性项
+        （0.5·Σπ(σ−s)²），学习后 σ 更贴近 s → 预测误差下降 → surprise 下降，
+        断言在新语义下依然成立，仅语义从"自由能"变为"预测误差"。
+        """
         net = AttractorNetwork(num_nodes=32, input_dim=16, seed=42)
         sensory = torch.randn(16) * 0.5
         precision = torch.ones(16) * 2.0
@@ -449,7 +542,7 @@ class TestFreeEnergy:
     """自由能与熵计算测试。"""
 
     def test_free_energy_is_finite(self):
-        """自由能是有限值。"""
+        """自由能与惊讶度都是有限值。"""
         net = AttractorNetwork(num_nodes=32, input_dim=16, seed=42)
         sensory = torch.randn(16) * 0.5
         precision = torch.ones(16) * 2.0
@@ -457,6 +550,27 @@ class TestFreeEnergy:
 
         assert not (act.surprise == float("inf") or act.surprise == float("-inf"))
         assert not (act.surprise != act.surprise)  # not NaN
+        # 2026-08-10 语义拆分：free_energy 为未规范化变分能量（可负），同样须有限
+        assert not (act.free_energy == float("inf") or act.free_energy == float("-inf"))
+        assert not (act.free_energy != act.free_energy)  # not NaN
+
+    def test_norm_surprise_noop(self):
+        """norm_surprise 开关已弃用为 no-op：开/关下 free_energy 数值一致。
+
+        （惊讶度修复-01-设计方案.md §5.2 新增：F/‖J‖ 已移除，开关不参与计算。）
+        """
+        sensory = torch.randn(16) * 0.5
+        precision = torch.ones(16) * 2.0
+        net_a = AttractorNetwork(
+            num_nodes=32, input_dim=16, seed=42, norm_surprise=True)
+        net_b = AttractorNetwork(
+            num_nodes=32, input_dim=16, seed=42, norm_surprise=False)
+        net_a.J = net_b.J.clone()
+        net_a.bias = net_b.bias.clone()
+        sigma = torch.randn(32) * 0.5
+        fe_a = net_a._compute_free_energy(sigma, sensory, precision)
+        fe_b = net_b._compute_free_energy(sigma, sensory, precision)
+        assert fe_a == pytest.approx(fe_b)
 
     def test_entropy_non_negative(self):
         """熵是非负值。"""
@@ -469,14 +583,19 @@ class TestFreeEnergy:
         assert act.entropy >= -1e-6
 
     def test_free_energy_decreases_with_learning(self):
-        """学习后自由能下降。"""
+        """学习后自由能下降。
+
+        （2026-08-10 惊讶度语义拆分：断言对象从 surprise 迁移到 free_energy——
+        surprise 现为准确性项，与"自由能下降"语义不符；free_energy 保留
+        现有 F 公式，仍是学习目标。）
+        """
         net = AttractorNetwork(num_nodes=32, input_dim=16, seed=42)
         sensory = torch.randn(16) * 0.5
         precision = torch.ones(16) * 2.0
 
         net.reset_state()
         act_before = net.infer(sensory, precision, num_steps=20)
-        fe_before = act_before.surprise
+        fe_before = act_before.free_energy
 
         for _ in range(20):
             net.reset_state()
@@ -485,6 +604,6 @@ class TestFreeEnergy:
 
         net.reset_state()
         act_after = net.infer(sensory, precision, num_steps=20)
-        fe_after = act_after.surprise
+        fe_after = act_after.free_energy
 
         assert fe_after < fe_before
