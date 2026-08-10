@@ -35,12 +35,12 @@ class RemoteEmbedder:
         
         参数:
             dim: 目标输出维度（投影后）
-            api_url: embed API地址，如 http://192.168.0.103:11435/v1/embeddings
+            api_url: embed API地址，如 <LAN_IP>:11435/v1/embeddings
             model: 模型名
             seed: 随机投影矩阵的种子
         """
         self._dim = dim
-        self._api_url = api_url or "http://192.168.0.103:11435/v1/embeddings"
+        self._api_url = api_url or "<LAN_IP>:11435/v1/embeddings"
         self._model = model
         self._seed = seed
         self._remote_dim = None

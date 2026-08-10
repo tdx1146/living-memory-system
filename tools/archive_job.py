@@ -24,7 +24,7 @@ T2.3 归档重建工具：手动/定时触发归档重建（扫描快照 -> 重�
 
 定时触发示例（cron 每日一次，重建 main 会话索引）::
 
-    0 3 * * * cd /vol2/1000/AI专用/living-memory-system-cloud && \\
+    0 3 * * * cd <LMS_ROOT> && \\
         .venv/bin/python tools/archive_job.py rebuild --session main >> logs/archive_job.log 2>&1
 
 安全说明：

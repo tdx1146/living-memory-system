@@ -1,7 +1,7 @@
 # LMS 快照损坏检测与恢复 SOP（lms-restore-sop）
 
 - 版本：v1.0（2026-08-10 运维收尾产出，T2.4 配套）
-- 适用范围：`/vol2/1000/AI专用/living-memory-system-cloud`（数据面 :8190，唯一快照写者）
+- 适用范围：`<LMS_ROOT>`（数据面 :8190，唯一快照写者）
 - 目标：任何「快照损坏 / 误删 / 状态回退」场景下，有明确、可演练、可校验的恢复路径
 - 频率：**季度恢复演练**（每 3 个月一次，步骤见 §6）；故障时随时按 §5 执行
 
@@ -46,7 +46,7 @@ snapshots/
 
 ### 2.2 手动检测命令（怀疑损坏时立即执行）
 ```bash
-cd /vol2/1000/AI专用/living-memory-system-cloud
+cd <LMS_ROOT>
 # 快速元数据探测（不加载完整状态；损坏/截断会抛异常）
 .venv/bin/python - <<'EOF'
 from persistence.snapshot import Snapshot
@@ -84,10 +84,10 @@ EOF
 curl -s -X POST http://127.0.0.1:8190/dream/main -H 'Content-Type: application/json' -d '{"steps":0}' >/dev/null 2>&1 || true
 
 # 2) 若需完全冻结（推荐用于演练/重大回退）：停 API（优雅停机先落盘再退出）
-bash /vol2/1000/AI专用/living-memory-system-cloud/scripts/lms_ctl.sh stop
+bash <LMS_ROOT>/scripts/lms_ctl.sh stop
 
 # 3) 冻结后先做一次只读快照备份（回退前的现场）
-bash /vol2/1000/AI专用/living-memory-system-cloud/scripts/lms_backup.sh --quick
+bash <LMS_ROOT>/scripts/lms_backup.sh --quick
 ```
 
 ---
@@ -117,11 +117,11 @@ bash scripts/lms_ctl.sh start
 ### 4.2 会话目录整体损坏 / 误删
 ```bash
 # 从 15min 镜像恢复（最近状态）：
-rsync -a --exclude='*.lock' /vol2/1000/AI专用/backups/lms/snapshots-15min/main/ snapshots/main/
+rsync -a --exclude='*.lock' <LMS_BACKUP_ROOT>/snapshots-15min/main/ snapshots/main/
 # 或从 hourly 归档解出单会话：
-tar --zstd -xf /vol2/1000/AI专用/backups/lms/hourly/lms-hourly-*.tar.zst -C /tmp/lms-restore snapshots/main
+tar --zstd -xf <LMS_BACKUP_ROOT>/hourly/lms-hourly-*.tar.zst -C /tmp/lms-restore snapshots/main
 # 或从 daily 全量解出（含 data/ 一起恢复时用这个）：
-tar --zstd -xf /vol2/1000/AI专用/backups/lms/daily/lms-YYYYMMDD.tar.zst -C /tmp/lms-restore
+tar --zstd -xf <LMS_BACKUP_ROOT>/daily/lms-YYYYMMDD.tar.zst -C /tmp/lms-restore
 # 解出后先 validate 再放回 snapshots/（见 §2.2），最后重启 API。
 ```
 
@@ -129,7 +129,7 @@ tar --zstd -xf /vol2/1000/AI专用/backups/lms/daily/lms-YYYYMMDD.tar.zst -C /tm
 ```bash
 # 1) 解包最近 daily 全量到临时区
 mkdir -p /tmp/lms-restore && tar --zstd -xf \
-  /vol2/1000/AI专用/backups/lms/daily/lms-$(date +%Y%m%d).tar.zst -C /tmp/lms-restore
+  <LMS_BACKUP_ROOT>/daily/lms-$(date +%Y%m%d).tar.zst -C /tmp/lms-restore
 # 2) 校验清单：sha256sum -c 对比 MANIFEST.jsonl 中对应条目
 # 3) 停止 API → 备份现有坏库 → 放回
 bash scripts/lms_ctl.sh stop
@@ -214,7 +214,7 @@ print('损坏检测:', RecoveryManager().validate('snapshots/drill-test/latest_d
 curl -s -X POST http://127.0.0.1:8190/recall -H 'Content-Type: application/json' \
   -d '{"session_id":"drill-test","query":"测试","k":3}' | head -c 300
 # 4) 备份链完好：MANIFEST 最新 3 条均为 ok
-tail -3 /vol2/1000/AI专用/backups/lms/MANIFEST.jsonl
+tail -3 <LMS_BACKUP_ROOT>/MANIFEST.jsonl
 ```
 
 ### 6.5 清理（5 分钟）

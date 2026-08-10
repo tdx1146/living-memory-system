@@ -20,8 +20,8 @@
 │  └───────────────────────────────────────────────┘  │      │
 └─────────────────────────────────────────────────────┘      │
         ▲ 嵌入/LLM（外网隧道或 LAN）                          │
-        └─ https://11435.tdx1146.cc/v1/embeddings（bge-m3）  │
-           （LAN: http://192.168.0.103:11435/v1/embeddings） ┘
+        └─ https://embed.example.com/v1/embeddings（bge-m3）  │
+           （LAN: http://<LAN_IP>:11435/v1/embeddings） ┘
 ```
 
 设计取舍（为什么是「容器 = 引擎，宿主机 = 控制面」）：
@@ -41,23 +41,23 @@
 
 - Docker Engine ≥ 24（含 compose v2）：`docker --version && docker compose version`
 - 网络要求（embedder，手机 Ollama bge-m3）：
-  - **外网/容器网络（推荐）**：`https://11435.tdx1146.cc/v1/embeddings`（隧道 443，已验证 200）
-    - ⚠️ 实测 `http://11435.tdx1146.cc:11435`（域名+端口形式）**不通**，隧道只放行 443
-  - **局域网直连**：`http://192.168.0.103:11435/v1/embeddings`（与手机同网络时更快，可作 fallback）
+  - **外网/容器网络（推荐）**：`https://embed.example.com/v1/embeddings`（隧道 443，已验证 200）
+    - ⚠️ 实测 `http://embed.example.com:11435`（域名+端口形式）**不通**，隧道只放行 443
+  - **局域网直连**：`http://<LAN_IP>:11435/v1/embeddings`（与手机同网络时更快，可作 fallback）
   - LLM：DeepSeek `https://api.deepseek.com/v1`（或任意 OpenAI 兼容服务）
 
 ## 2. 首次部署
 
 ```bash
-cd /vol2/1000/AI专用/living-memory-system-cloud
+cd <LMS_ROOT>
 
 # 1) 配置
 cp .env.docker.example .env
 $EDITOR .env          # 填 DEEPSEEK_API_KEY；生成并填 LMS_CONTROL_TOKEN:
                       #   openssl rand -hex 32
                       # 嵌入地址按网络环境选：
-                      #   LMS_CLOUD_EMBED_URL=https://11435.tdx1146.cc/v1/embeddings
-                      #   LMS_CLOUD_EMBED_FALLBACK_URL=http://192.168.0.103:11435/v1/embeddings
+                      #   LMS_CLOUD_EMBED_URL=https://embed.example.com/v1/embeddings
+                      #   LMS_CLOUD_EMBED_FALLBACK_URL=http://<LAN_IP>:11435/v1/embeddings
 
 # 2) 构建并启动（首次构建约 5-15 分钟：torch CPU ~190MB + 依赖）
 docker compose up -d --build
@@ -93,7 +93,7 @@ docker compose down                     # 停止（数据已持久化在卷中�
 容器与裸进程共用同一批数据目录，备份脚本**无需改动**：
 
 ```bash
-cd /vol2/1000/AI专用/living-memory-system-cloud
+cd <LMS_ROOT>
 ./scripts/lms_backup.sh inc     # 15 分钟级快照镜像（cron */15）
 ./scripts/lms_backup.sh daily   # 每日 02:30 全量 tar.zst（snapshots+data+logs）
 ./scripts/lms_backup.sh status  # 查看备份状态
@@ -104,7 +104,7 @@ cd /vol2/1000/AI专用/living-memory-system-cloud
 ```bash
 docker compose down                      # 1. 停容器（避免写者竞争）
 # 2. 恢复数据（示例：解每日全量；详见 docs/lms-restore-sop.md）
-tar --zstd -xf /vol2/1000/AI专用/backups/lms/daily/lms-YYYYMMDD.tar.zst -C /vol2/1000/AI专用/living-memory-system-cloud
+tar --zstd -xf <LMS_BACKUP_ROOT>/daily/lms-YYYYMMDD.tar.zst -C <LMS_ROOT>
 docker compose up -d                     # 3. 起容器
 ```
 
@@ -128,7 +128,7 @@ docker compose up -d                     # 3. 起容器
 
 - **`curl: (7) Failed to connect`**：容器内 healthcheck 用 curl（镜像已装），
   先查 `docker compose logs lms`；若 embed 相关报错，确认 11435 隧道/LAN 可达
-  （`curl -X POST https://11435.tdx1146.cc/v1/embeddings -d '{"model":"bge-m3","input":["hi"]}'`）。
+  （`curl -X POST https://embed.example.com/v1/embeddings -d '{"model":"bge-m3","input":["hi"]}'`）。
 - **管理面写端点 503**：`.env` 缺 `LMS_CONTROL_TOKEN` → 只读模式；
   补 token 后 `docker compose up -d lms-control` 重建容器。
 - **快照不落盘**：检查 `docker compose exec lms printenv LMS_SNAPSHOT_DIR`，
@@ -142,4 +142,4 @@ docker compose up -d                     # 3. 起容器
 - 端口：数据面 8190 / 管理面 8191（与裸进程一致，可平滑互切）
 - 环境变量全量说明：`.env.example`（算法开关 7 项 + 备份 + 审计）
 - 备份恢复 SOP：`docs/lms-restore-sop.md`
-- Agent OS 全系统容器化：`/vol2/1000/AI专用/Agent OS/docker/README.md`
+- Agent OS 全系统容器化：`<AGENTOS_DOCKER>/README.md`

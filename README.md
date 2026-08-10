@@ -129,7 +129,7 @@ DEEPSEEK_API_KEY=sk-your-deepseek-api-key-here
 # 嵌入器配置（三选一）
 LMS_EMBEDDER=cloud
 # cloud 模式（推荐，需远程 embed 服务）
-LMS_CLOUD_EMBED_URL=https://11435.tdx1146.cc/v1/embeddings
+LMS_CLOUD_EMBED_URL=https://embed.example.com/v1/embeddings
 LMS_CLOUD_EMBED_MODEL=bge-m3
 LMS_CLOUD_EMBED_DIM=1024
 # pretrained 模式（本地加载，无需远程服务）
@@ -248,7 +248,7 @@ loop_config = cfg.to_loop_config()         # 转 loop 配置
 | `LMS_LLM_BASE_URL` | `https://api.deepseek.com/v1` | LLM API 基础 URL |
 | `LMS_LLM_MODEL` | `deepseek-chat` | LLM 模型名 |
 | `LMS_EMBEDDER` | `pretrained` | 嵌入器类型：`cloud` / `pretrained` / `simple` |
-| `LMS_CLOUD_EMBED_URL` | `https://11435.tdx1146.cc/v1/embeddings` | 云端 embed 服务 URL（`cloud` 模式生效） |
+| `LMS_CLOUD_EMBED_URL` | `https://embed.example.com/v1/embeddings` | 云端 embed 服务 URL（`cloud` 模式生效） |
 | `LMS_CLOUD_EMBED_MODEL` | `bge-m3` | 云端 embed 模型名（`cloud` 模式生效） |
 | `LMS_CLOUD_EMBED_DIM` | `1024` | 云端 embed 输出维度（`cloud` 模式生效） |
 | `LMS_INPUT_DIM` | 64 | 输入维度 |
@@ -264,7 +264,7 @@ loop_config = cfg.to_loop_config()         # 转 loop 配置
 
 > **嵌入器三模式**：
 > - `cloud`（推荐）：通过 HTTP API 调用远程 embedding 服务（如 bge-m3，1024维），语义质量最高。
->   默认指向 `https://11435.tdx1146.cc/v1/embeddings`，可通过 `LMS_CLOUD_EMBED_*` 环境变量配置。
+>   默认指向 `https://embed.example.com/v1/embeddings`，可通过 `LMS_CLOUD_EMBED_*` 环境变量配置。
 > - `pretrained`：本地加载 `paraphrase-multilingual-MiniLM-L12-v2`（384维），无需远程服务，加载失败降级为 `simple`。
 > - `simple`：随机冻结 embedding，无语义先验，仅用于测试。
 >

@@ -39,7 +39,7 @@ class CloudEmbedder(Embedder):
     """
 
     def __init__(self,
-                 api_url: str = "https://11435.tdx1146.cc/v1/embeddings",
+                 api_url: str = "https://embed.example.com/v1/embeddings",
                  dim: int = 64,
                  remote_dim: int = 1024,
                  model: Optional[str] = None,

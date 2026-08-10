@@ -85,7 +85,7 @@ def build_embedder(embedder_type: str, input_dim: int):
             from core.sensory.cloud_embedder import CloudEmbedder
             api_url = _get_env(
                 "LMS_CLOUD_EMBED_URL",
-                "https://11435.tdx1146.cc/v1/embeddings")
+                "https://embed.example.com/v1/embeddings")
             model = _get_env("LMS_CLOUD_EMBED_MODEL", "bge-m3")
             remote_dim = int(_get_env("LMS_CLOUD_EMBED_DIM", "1024"))
             logger.info(
@@ -97,7 +97,7 @@ def build_embedder(embedder_type: str, input_dim: int):
                 dim=input_dim,
                 remote_dim=remote_dim,
                 model=model,
-                timeout=30.0,     # 公网环境（11435.tdx1146.cc 延迟波动 0.4-2.5s）
+                timeout=30.0,     # 公网环境（embed.example.com 延迟波动 0.4-2.5s）
                 retries=3,         # 公网环境（11435 间歇 reset，需重试）
                 cache_size=1024,   # 手机稳定，增大缓存
                 fallback_url=fallback_url,  # LAN 直连失败自动切隧道（仅本机注入）

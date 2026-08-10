@@ -3,7 +3,7 @@
 LMS MCP Bridge — 通过 stdin/stdout JSON-RPC 协议提供服务。
 
 运行方式（必须用 .venv 的 python 激活 PyTorch）：
-    cd /vol2/1000/AI专用/living-memory-system-cloud
+    cd <LMS_ROOT>
     .venv/bin/python3 bridge/mcp_server.py
 
 协议示例：
@@ -31,6 +31,7 @@ import json
 import logging
 import traceback
 import os
+from pathlib import Path
 
 logging.basicConfig(
     level=logging.INFO,
@@ -100,7 +101,7 @@ class LMSMCPServer:
             }
 
         # 导入必要的模块
-        lms_root = "/vol2/1000/AI专用/living-memory-system-cloud"
+        lms_root = str(Path(__file__).resolve().parent.parent)
         sys.path.insert(0, lms_root)
 
         from runtime.loop import LivingMemoryLoop
@@ -113,7 +114,7 @@ class LMSMCPServer:
         cfg.input_dim = params.get("input_dim", 1024)
 
         # 覆盖自定义嵌入器
-        api_root = params.get("embed_url", "http://192.168.0.103:11435/v1/embeddings")
+        api_root = params.get("embed_url", "<LAN_IP>:11435/v1/embeddings")
         embedder = CloudEmbedder(
             api_url=api_root,
             dim=cfg.input_dim,
@@ -209,7 +210,7 @@ class LMSMCPServer:
 
         path = params.get(
             "path",
-            "/vol2/1000/AI专用/living-memory-system-cloud/snapshots/lms_latest.pt",
+            str(Path(__file__).resolve().parent.parent / "snapshots" / "lms_latest.pt"),
         )
         # 确保目录存在
         os.makedirs(os.path.dirname(path), exist_ok=True)

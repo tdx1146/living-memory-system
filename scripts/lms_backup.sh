@@ -24,7 +24,7 @@
 #   lms_backup.sh status                     # 查看备份状态（MANIFEST 尾部 + 目录大小）
 #
 # 环境变量（均可覆盖，默认值见下）：
-#   LMS_BACKUP_DIR      备份根目录（默认 /vol2/1000/AI专用/backups/lms）
+#   LMS_BACKUP_DIR      备份根目录（默认 = LMS 上级/backups/lms，自动推导）
 #   REMOTE_BACKUP       rsync 跨机目标（如 user@host:/path，默认空=本机）
 #   BACKUP_KEEP_DAYS    每日归档保留天数（默认 30，总体方案 §3.8）
 #   BACKUP_KEEP_HOURS   每小时归档保留小时数（默认 168 = 7 天，总体方案 §3.8）
@@ -47,8 +47,11 @@ if [ -f "$LMS_HOME/.env" ]; then
     set +a
 fi
 
-# 备份根目录：默认 /vol2/1000/AI专用/backups/lms（与总体方案 §3.8 一致）
-BACKUP_ROOT="${LMS_BACKUP_DIR:-/vol2/1000/AI专用/backups/lms}"
+# 备份根目录：自动推导（与总体方案 §3.8 一致）
+# 备份根目录：优先环境变量；未设置时从脚本位置推导（开源友好，无硬编码路径）
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LMS_ROOT_DEFAULT="$(dirname "$SCRIPT_DIR")"
+BACKUP_ROOT="${LMS_BACKUP_DIR:-$(dirname "$LMS_ROOT_DEFAULT")/backups/lms}"
 INC_DIR="$BACKUP_ROOT/snapshots-15min"
 HOURLY_DIR="$BACKUP_ROOT/hourly"
 DAILY_DIR="$BACKUP_ROOT/daily"

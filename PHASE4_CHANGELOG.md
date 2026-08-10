@@ -9,7 +9,7 @@
 
 ## 0. 改动前基线
 
-- 备份：`/vol2/1000/AI专用/backups/phase4-lms-pre-20260804-174037/`（runtime/ + api/ 双保险，LMS 另有 git）
+- 备份：`<BACKUP_ROOT>/`（runtime/ + api/ 双保险，LMS 另有 git）
 - 测试基线：**672 passed**（`.venv/bin/python -m pytest -q`，2026-08-04 17:37 实测；此前记录的 158 为更早期阶段基线，当前全量套件为 672）
 - 部署状态：API 127.0.0.1:8190（PID 25858，旧代码）、MCP 已注册、glue_server 19000 运行中
 
@@ -19,7 +19,7 @@
 契约对齐 v1.1：`schema_version="1.1"` / `event_id=uuid4` / `trace_id` / `t`(BJT ISO8601) /
 `event_type` / `producer="lms"` / `result` / `payload`。
 
-目标文件：`/vol2/1000/AI专用/Agent OS/iso-sand/data/event_bus.jsonl`
+目标文件：`<AGENTOS_BUS_FILE>`
 （环境变量 `LMS_BUS_FILE` 可覆盖）。
 
 ### 熔断闸门（发布侧）
