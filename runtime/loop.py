@@ -644,16 +644,29 @@ class LivingMemoryLoop:
             logger.debug("Phase 4 self_ref 发布跳过（静默降级）: %s", e)
 
     def _maybe_publish_dream_complete(self, result: dict, duration: float) -> None:
-        """Phase 4 钩子：发布 lms.dream_complete（步数/耗时/结果，可观测性信号）。
+        """Phase 4 钩子：发布 lms.dream_complete（步数/耗时/结果/梦质量指标，可观测性信号）。
 
+        梦醒回路阶段1-A（断点 A① 修复）：把 dream_mvp/dream_cycle 已返回的梦质量指标
+        （avg_surprise/max_surprise/avg_entropy/collapse_count/j_change/buffer_size）
+        透传进 payload——此前这些信号从未上总线；status/mode 用于区分
+        'dreamed'（梦了）与 'no_memories_to_replay'（空缓冲没梦）。
+        纯透传、零算法改动；缺失字段留 null（如 no_memories 分支无 j_change）。
         任何异常静默降级，绝不影响做梦结果返回（熔断由 bus_events 内部管理）。
         """
         try:
             from runtime.bus_events import publish_dream_complete
             publish_dream_complete({
+                "status": result.get("status") or "dreamed",
+                "mode": result.get("mode") or "mvp",
                 "steps": int(result.get("steps", 0) or 0),
                 "duration_seconds": round(float(duration), 3),
                 "snapshot_saved": bool(result.get("snapshot_saved", False)),
+                "avg_surprise": result.get("avg_surprise"),
+                "max_surprise": result.get("max_surprise"),
+                "avg_entropy": result.get("avg_entropy"),
+                "collapse_count": result.get("collapse_count"),
+                "j_change": result.get("j_change"),
+                "buffer_size": result.get("buffer_size"),
             })
         except Exception as e:
             logger.debug("Phase 4 dream_complete 发布跳过（静默降级）: %s", e)
