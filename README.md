@@ -299,7 +299,7 @@ MCP 服务器（`mcp_memory_server.py`）通过 stdio 协议向 TRAE IDE 暴露�
 |------|------|
 | `recall_memory` | 语义检索与查询相关的历史对话记忆（top 3） |
 | `store_memory` | 将当前对话存储到记忆系统（执行完整记忆循环并保存快照） |
-| `get_memory_status` | 获取记忆系统运行状态（轮次、熵、惊讶度、precision 等） |
+| `get_memory_status` | 获取记忆系统运行状态（轮次、熵、surprise[准确性项≥0]、free_energy、precision 等） |
 | `dream_memory` | 触发记忆系统"做梦"（空闲态记忆巩固与整合，可选完整七阶段周期） |
 
 ## 测试

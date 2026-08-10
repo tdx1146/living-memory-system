@@ -32,7 +32,7 @@ LMS_CLOUD_EMBED_URL=https://embed.example.com/v1/embeddings   # 唯一可达
 ## 总线路径适配
 
 `runtime/bus_events.py` 默认 `_DEFAULT_BUS_FILE` 指向 `/vol2/...`（本机），
-本机改为 `/vol1/@team/qh团队/QH/AI专用/Agent OS/iso-sand/data/event_bus.jsonl`。
+本机改为 `<AGENTOS_BUS_FILE>`。
 （`LMS_BUS_FILE` 环境变量可覆盖，推荐用它而非改代码。）
 
 ## 完整启动命令（公网环境，新版功能全开）
@@ -45,7 +45,7 @@ export LMS_CLOUD_EMBED_MODEL=bge-m3
 export LMS_CLOUD_EMBED_DIM=1024
 export LMS_SELF_REF_ENABLED=1          # 开启自指（默认 off）
 export LMS_SELF_REF_PUBLISH=on         # 开启自指发布（默认 off）
-export LMS_BUS_FILE="/vol1/@team/qh团队/QH/AI专用/Agent OS/iso-sand/data/event_bus.jsonl"
+export LMS_BUS_FILE="<AGENTOS_BUS_FILE>"
 nohup .venv/bin/python -u api/run.py --port 8190 > lms.log 2>&1 &
 ```
 
@@ -57,9 +57,9 @@ curl http://localhost:8190/health
 # 2. 总线喂入塑形（双向反馈方向1）
 curl -X POST http://localhost:8190/feed -H "Content-Type: application/json" \
   -d '{"session_id":"main","text":"测试"}'
-# 应返回 {"status":"ok","entropy":...,"surprise":...}
+# 应返回 {"status":"ok","entropy":...,"surprise":...（≥0 准确性项）,"free_energy":...,"mse":...}（2026-08-10 语义拆分后）
 # 3. 总线发布（方向2：LMS → 总线）——等做梦周期后检查事件总线
-grep "producer.*lms" /vol1/@team/qh团队/QH/AI专用/Agent OS/iso-sand/data/event_bus.jsonl
+grep "producer.*lms" <AGENTOS_BUS_FILE>
 # 应有 lms.dream_complete 等事件
 # 4. 自指读取
 curl "http://localhost:8190/self-ref/voice?session_id=main"
