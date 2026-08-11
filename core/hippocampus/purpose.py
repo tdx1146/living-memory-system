@@ -21,7 +21,8 @@
   Layer 3 - Meta-Purpose（元目的）:
       对"自己的 precision 是否合适"的元层面评估
       允许目的的"方向翻转"——不是渐进调整，是质变
-      当 coherence 持续低时，切换到最未被探索的维度
+      当 coherence 持续低时，强化历史平均 precision 最高的维度
+      （越关注越深入，回初版语义 01e6482）
 
 对应 dandan 的概念:
   - "目的是随对话共生" → precision 在每轮对话中被调整
@@ -277,24 +278,31 @@ class PurposeLayer:
     def _meta_adjust(self) -> None:
         """元目的方向翻转：当 coherence 持续低时触发。
 
-        真正的"方向翻转"——不是加倍下注强化已有方向，而是切换到
-        **最未被探索**的维度（encounter_count 最低的维度），
-        探索全新的关注方向。这对应"突然对某个新方向产生兴趣"。
-
-        翻转策略（方向翻转）:
-          1. 找出 encounter_count 最低的维度（最未被探索）
-          2. 将该维度 precision 设为最大值（大幅强化新方向）
+        翻转策略（强化已关注方向，回初版语义 01e6482；
+        dandan 拍板 1：元目的翻转 = 强化已关注方向，越关注越专注；
+        8/3 起"切换最未探索维度"作废）：
+          1. 取历史窗口内平均 precision 最高的维度（已关注方向）
+          2. 将该维度 precision 设为最大值（大幅强化）
           3. 适当衰减其他维度（腾出注意力空间）
           4. 标记翻转发生
 
+        依据：high precision deepens attractor basins（母本附录7）——
+        越关注越深入；怀疑质检在更深的盆地里做（阶段 D 语义闭环）。
+
         注意：方法名保持 _meta_adjust 以兼容外部调用，
-        但语义上是"方向翻转"（meta-flip），而非"加倍下注"。
+        语义是"强化已关注方向"（meta-flip，回初版）。
         """
         if len(self.history) < 1:
             return
 
-        # 找最未被探索的维度（encounter_count 最低）
-        target_dim = int(self.encounter_count.argmin().item())
+        # 强化已关注方向：历史窗口内平均 precision 最高的维度
+        # （初版 01e6482 语义；precision 三层结构零触碰，单函数内 1 行替换
+        # 5 行，git revert 单 commit 可回滚）
+        window = min(self.meta_window, len(self.history))
+        recent = self.history[-window:]
+        history_tensor = torch.stack(recent)          # [window, input_dim]
+        avg_precision = history_tensor.mean(dim=0)    # [input_dim]
+        target_dim = int(avg_precision.argmax().item())
 
         # 强化目标维度：设为最大值（探索新方向）
         self.sensory_precision[target_dim] = self.precision_max
