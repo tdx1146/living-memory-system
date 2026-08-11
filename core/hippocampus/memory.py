@@ -27,6 +27,16 @@ _GARBAGE_TEXT_RE = [
     re.compile(r"System \(untrusted\)", re.I),
     re.compile(r"^System:", re.I),
     re.compile(r"端口探测"),
+    # 2026-08-11 体验层 B（设计 v1.1 §4.2）：子代理调度样板/心跳回执过滤。
+    # 本次会话实证 [记忆注入] 8 条里 7 条为子代理样板（含无 [Subagent Context]
+    # 前缀的 [Subagent Task] 变体）——main 脑被子代理调度文本挤占，真实对话
+    # 被挤出 top-k。只滤明确样板串/系统噪音，不滤真实对话（同 8/10 垃圾过滤哲学）。
+    re.compile(r"\[Subagent Context\]", re.I),                      # 子代理调度样板
+    re.compile(r"You are running as a subagent", re.I),             # 子代理指令样板
+    re.compile(r"Results auto-announce to your requester", re.I),   # 子代理结果通知样板
+    re.compile(r"^HEARTBEAT_OK\b", re.I),                           # 心跳回执
+    re.compile(r"Your assigned task is in the sy", re.I),           # 任务派发样板（防截断变体）
+    re.compile(r"\[Subagent Task\]", re.I),                        # 子代理任务样板（无前缀变体实证）
 ]
 _GARBAGE_FILTERED = 0  # 计数器（进程内，可被 status 读取）
 
