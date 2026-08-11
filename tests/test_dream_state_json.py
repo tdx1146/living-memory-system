@@ -29,6 +29,8 @@ def make_loop(tmp_path) -> LivingMemoryLoop:
     config['consolidation_interval'] = 3
     config['seed'] = 42
     config['snapshot_dir'] = str(tmp_path)
+    # 归档隔离到 tmp（防测试导出污染仓库 data/archive/）
+    config['archive_dir'] = str(tmp_path / 'archive')
     loop = LivingMemoryLoop(config)
     # 填充记忆使做梦可跑（buffer + episodic）
     from core.types import Activation

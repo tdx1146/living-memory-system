@@ -157,6 +157,9 @@ def client(monkeypatch, tmp_path):
     monkeypatch.setenv("LMS_EMBEDDER", "simple")
     monkeypatch.setenv("LMS_NUM_NODES", "32")
     monkeypatch.setenv("LMS_INPUT_DIM", "16")
+    # 做梦观测文件隔离到 tmp（防测试写脏仓库 runtime/dream_state.json，S1-9）
+    monkeypatch.setenv("LMS_DREAM_STATE_PATH",
+                       str(tmp_path / "dream_state.json"))
     # 确保未设置 API key，禁用 LLM
     monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
     monkeypatch.delenv("LMS_LLM_API_KEY", raising=False)
@@ -186,6 +189,8 @@ def client_with_bridge(monkeypatch, tmp_path):
     monkeypatch.setenv("LMS_EMBEDDER", "simple")
     monkeypatch.setenv("LMS_NUM_NODES", "32")
     monkeypatch.setenv("LMS_INPUT_DIM", "16")
+    monkeypatch.setenv("LMS_DREAM_STATE_PATH",
+                       str(tmp_path / "dream_state.json"))
     monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
     monkeypatch.delenv("LMS_LLM_API_KEY", raising=False)
 
