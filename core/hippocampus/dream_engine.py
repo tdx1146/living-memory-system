@@ -296,6 +296,10 @@ class DreamEngine:
 
             self.step_count += 1
 
+        # 提取层 v1.4（S1-13）：价值重放——PER 概率采样 → 加固 → 聚类
+        # （fail-open）→ 代表幸存加固（§2.6 流程；观测进 dream 结果）
+        value_replay = self._value_replay()
+
         # 记忆巩固（短时 -> 长时迁移）
         self.memory.consolidate()
 
@@ -331,6 +335,8 @@ class DreamEngine:
             'snapshot_path': snapshot_path,
             'buffer_size': self.memory.buffer_size(),
             'doubt_review': dict(self.last_doubt_review),
+            # 提取层 v1.4（S1-13）：价值重放观测（S1-9 汇总进 dream_state.json）
+            'value_replay': value_replay,
         }
 
     def dream_cycle(self, max_steps: int = 100) -> dict:
@@ -375,6 +381,10 @@ class DreamEngine:
         # 体验层 D：一轮做梦开始重置复核统计（跨阶段累积，防跨梦膨胀）
         self.last_doubt_review = {'reviewed': 0, 'downgraded': 0,
                                   'rewritten': 0, 'kept': 0, 'flagged': 0}
+
+        # 提取层 v1.4（S1-13）：价值重放——PER 概率采样 → 加固 → 聚类
+        # （fail-open）→ 代表幸存加固（每周期一次，§2.6）
+        value_replay = self._value_replay()
 
         for step in range(max_steps):
             # 按权重随机选择阶段
@@ -423,6 +433,8 @@ class DreamEngine:
             'snapshot_path': snapshot_path,
             'buffer_size': self.memory.buffer_size(),
             'doubt_review': dict(self.last_doubt_review),
+            # 提取层 v1.4（S1-13）：价值重放观测（S1-9 汇总进 dream_state.json）
+            'value_replay': value_replay,
         }
 
     def get_status(self) -> dict:
@@ -736,17 +748,185 @@ class DreamEngine:
         # --- 清理过旧的情景记忆条目 ---
         epi = list(self.memory.iter_episodic())
         if len(epi) > 0:
-            max_age = self.forget_max_age
             current_turn = max(e.turn for e in epi)
+            # 提取层 v1.4（S1-13，D1 丰碑哲学）：surviving 判据从"按轮数"
+            # 改为"按磨损量"——effective_wear(e,t) < wear_threshold，初期
+            # wear_threshold=∞（永不触发删除）；forget_max_age 保留为远期
+            # 参数（承载力到上限后调小）。
+            # 注：latent 弱化（本方法前半段，L707-717）与 SHY 保留为系统固有
+            # 磨损、不改（S1-13 申报标注，理由见设计 §P1-B：作用对象=经验缓冲
+            # 区 activation 状态无条目 ID 映射；SHY 是 J 矩阵稳定性归一化；
+            # 条目文本/语义向量不被触及，D1"不删除"在条目层成立）。
+            wear_threshold = float('inf')
             surviving = [
-                e for e in epi if (current_turn - e.turn) <= max_age
+                e for e in epi
+                if self._effective_wear(e, current_turn) < wear_threshold
             ]
             pruned = len(epi) - len(surviving)
             if pruned > 0:
                 self.memory.replace_episodic_buffer(surviving)
                 logger.debug(
                     f"遗忘修剪: 清理 {pruned} 条过期情景记忆 "
-                    f"(max_age={max_age})")
+                    f"(wear_threshold={wear_threshold})")
+
+    # ------------------------------------------------------------------ #
+    #  提取层 v1.4（S1-13）：磨损观测与价值重放
+    # ------------------------------------------------------------------ #
+
+    def _effective_wear(self, entry, current_turn: int) -> float:
+        """条目磨损量（D1 §2.3 公式；v1.4：只观测与排序，不用于删除）。
+
+        effective_wear(i, t) = base_decay × (1 − min(0.9, 0.1×reference_count(i)))
+                               × (t − last_reinforced_turn(i))
+
+        链接（reference_count）越多磨损越慢；被加固（last_reinforced_turn
+        刷新）后重新计时。base_decay=1.0（相对磨损量，无绝对时间尺度）。
+        旧快照条目缺 last_reinforced_turn 时回退到 turn（写入即计时起点）。
+        """
+        base_decay = 1.0
+        ref = int(getattr(entry, 'reference_count', 0) or 0)
+        reinforced = getattr(entry, 'last_reinforced_turn', None)
+        if reinforced is None:
+            reinforced = getattr(entry, 'turn', current_turn)
+        elapsed = max(0, int(current_turn) - int(reinforced or current_turn))
+        return base_decay * (1.0 - min(0.9, 0.1 * ref)) * elapsed
+
+    @staticmethod
+    def _entry_id(entry):
+        """条目标识（id 优先，无 id 时用 turn 兜底；观测用）。"""
+        eid = getattr(entry, 'id', None)
+        if eid is None:
+            eid = getattr(entry, 'turn', None)
+        return eid
+
+    def _reinforce_entry(self, entry, current_turn: int) -> None:
+        """加固写点（P2-B 事件 1/3）：reference_count+1＋last_reinforced_turn
+        刷新（复用 record_reference，P2-A：reference_count 为加固计数唯一
+        权威，不新增 link_count）。fail-open：异常静默不阻断做梦。
+        """
+        try:
+            from core.doubt.confidence_field import record_reference
+            record_reference(entry)
+            entry.last_reinforced_turn = int(current_turn)
+        except Exception:  # pylint: disable=broad-except
+            pass
+
+    def _wear_stats(self, entries) -> dict:
+        """wear 分布观测（D1 §2.2：只观测不触发动作；远期淘汰分级预埋）。"""
+        if not entries:
+            return {'count': 0, 'mean': 0.0, 'max': 0.0, 'min': 0.0}
+        current_turn = max(
+            int(getattr(e, 'turn', 0) or 0) for e in entries)
+        wears = [self._effective_wear(e, current_turn) for e in entries]
+        return {
+            'count': len(wears),
+            'mean': round(sum(wears) / len(wears), 4),
+            'max': round(max(wears), 4),
+            'min': round(min(wears), 4),
+        }
+
+    def _cluster_replay_set(self, entries) -> list:
+        """对采样集做聚类归组（H-6：fail-open）。
+
+        工程常规（设计附录 B 标注：K-means/层次聚类为经典工程常规，无独立
+        论文）：贪心分组——两两余弦相似度 ≥0.7 归一组。直接用条目已存
+        语义向量（零额外 embed、无网络调用，与写侧引用匹配同哲学）；
+        向量缺失/异常 → fail-open 每条目自成一组＋告警（做梦不瘫）。
+        """
+        self._last_cluster_failed = False
+        try:
+            if len(entries) <= 1:
+                return [[e] for e in entries]
+            vectors = []
+            for e in entries:
+                vec = getattr(e, 'semantic_vector', None)
+                if vec is None:
+                    raise RuntimeError("条目无语义向量")
+                vectors.append(vec.detach().cpu().float())
+            norms = torch.nn.functional.normalize(
+                torch.stack(vectors), dim=-1)  # [n, d]
+            sims = norms @ norms.T  # 余弦相似度矩阵
+            used = [False] * len(entries)
+            groups = []
+            for i in range(len(entries)):
+                if used[i]:
+                    continue
+                group = [entries[i]]
+                used[i] = True
+                for j in range(i + 1, len(entries)):
+                    if used[j]:
+                        continue
+                    if float(sims[i, j].item()) >= 0.7:
+                        group.append(entries[j])
+                        used[j] = True
+                groups.append(group)
+            return groups
+        except Exception as e:  # pylint: disable=broad-except
+            logger.warning(
+                "价值重放聚类失败（fail-open，跳过聚类直接整合）: %s", e)
+            self._last_cluster_failed = True
+            return [[e] for e in entries]
+
+    def _value_replay(self, k=None) -> dict:
+        """价值重放（S1-13 写点；§2.6 流程）：PER 概率采样 → 加固 →
+        聚类归组（fail-open）→ 代表幸存加固。
+
+        PER 采样调用 dream_replay.sample_replay_set（S1-6 纯函数采样子模块，
+        §附 #5 调用关系定案）；候选集排除 gray（三重冻结①）；被采中条目
+        reference_count+1＋last_reinforced_turn 刷新（加固事件 1）；聚类后
+        代表幸存条目再加固（加固事件 3）。
+
+        返回:
+            观测字典（replay_set_ids/scores/reinforced_ids/merged_count/
+            superseded_count/wear_stats/cluster_failed，进 dream 结果与
+            dream_state.json）。异常 fail-open 返回部分统计，不阻断做梦。
+        """
+        result = {
+            'replay_set_ids': [], 'scores': [], 'sampled_via_prob': True,
+            'reinforced_ids': [], 'merged_count': 0, 'superseded_count': 0,
+            'wear_stats': self._wear_stats([]), 'cluster_failed': False,
+        }
+        try:
+            from runtime.dream_replay import (
+                sample_replay_set, replay_k, replay_alpha,
+            )
+            entries = list(self.memory.iter_episodic())
+            if not entries:
+                return result
+            result['wear_stats'] = self._wear_stats(entries)
+            replay_set = sample_replay_set(
+                entries, k=(k or replay_k()), alpha=replay_alpha())
+            if not replay_set:
+                return result
+            current_turn = max(
+                int(getattr(e, 'turn', 0) or 0) for e in entries)
+            score_map = {self._entry_id(e): s for e, s, _p in replay_set}
+            # 加固事件 1：被采中条目 reference_count+1＋last_reinforced_turn 刷新
+            for entry, score, _prob in replay_set:
+                self._reinforce_entry(entry, current_turn)
+                result['scores'].append(round(float(score), 6))
+                result['reinforced_ids'].append(self._entry_id(entry))
+                result['replay_set_ids'].append(self._entry_id(entry))
+            # 聚类归组（fail-open）：embed 不可达/异常 → 每条目自成一组
+            groups = self._cluster_replay_set([e for e, _s, _p in replay_set])
+            result['cluster_failed'] = bool(
+                getattr(self, '_last_cluster_failed', False))
+            # 加固事件 3：≥2 条的组选代表（分数最高）幸存 → 加固
+            reps = 0
+            for group in groups:
+                if len(group) >= 2:
+                    rep = max(
+                        group, key=lambda e: score_map.get(
+                            self._entry_id(e), 0.0))
+                    self._reinforce_entry(rep, current_turn)
+                    result['reinforced_ids'].append(self._entry_id(rep))
+                    reps += 1
+            result['merged_count'] = reps
+            # 被 superseded 的旧条目不加固（本阶段不做文本合并，标记 0）
+            result['superseded_count'] = 0
+        except Exception as e:  # pylint: disable=broad-except
+            logger.warning("价值重放异常（fail-open）: %s", e)
+        return result
 
     # ================================================================== #
     #  阶段4: 景观漂移
