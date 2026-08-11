@@ -48,6 +48,9 @@ def _is_garbage_text(text: str) -> bool:
     return any(p.search(text) for p in _GARBAGE_TEXT_RE)
 
 from core.types import Activation, resolve_device
+from core.doubt.confidence_field import (
+    get_source_trust, get_rebuttal_rate, record_reference,
+)
 
 
 @dataclass
@@ -75,6 +78,20 @@ class EpisodicEntry:
     surprise: float
     turn: int
     source: str = 'external'  # 'external' | 'self_ref'
+    # 体验层 D（设计 v1.1 §6.1）：置信度场字段（全部带默认值 → C1 零破坏
+    # 先例，旧构造点/旧快照向后兼容）。置信度挂在**条目**上（监控-控制内生
+    # 于提取，Koriat & Goldsmith 1996 A1），作用域是"这条已关注记忆值不值得
+    # 信"，与 purpose.precision（管"关注哪"，Pouget 2016：confidence≠
+    # precision）正交。
+    confidence: float = 1.0               # 置信度 = clamp01((1−rebuttal_rate)×source_trust)
+    rebuttal_count: int = 0               # 被反驳次数（去稳定化/证伪时 +1）
+    reference_count: int = 0              # 被召回引用次数（正向佐证，record_reference 钩子）
+    source_trust: float = 1.0             # 来源可信度（按来源定，Sperber 2010 D3）
+    labile: bool = False                  # 去稳定化标记（高惊讶 z>2 时置 True）
+    labile_since: Optional[float] = None  # 去稳定化时间戳（做梦窗口裁决用）
+    violated_by: Optional[str] = None     # 违反它的输入文本摘要（证伪证据）
+    last_recalled_at: Optional[float] = None  # 最近一次被召回时间（遗忘曲线用）
+    recall_count: int = 0                 # 累计召回次数（反教条抽查/遗忘曲线用）
 
 
 class MemoryManager:
@@ -164,7 +181,8 @@ class MemoryManager:
         # 用于将记忆逆向解码为 LLM 可理解的语义文本
         self._episodic_buffer: deque = deque(maxlen=episodic_capacity)
 
-    def update(self, activation: Activation, surprise: float = 0.0) -> None:
+    def update(self, activation: Activation, surprise: float = 0.0,
+               turn: Optional[int] = None) -> None:
         """更新短时/长时记忆潜变量。
 
         使用指数移动平均（EMA）:
@@ -178,6 +196,8 @@ class MemoryManager:
             activation: 当前激活态。
             surprise: 当前激活态的惊讶度（自由能），用于后续 consolidation
                 的重要性加权回放。从 activation.surprise 获取。
+            turn: 当前轮次（体验层 D：反流畅回放因子按 turn 关联 episodic
+                条目的反驳率/来源信任）。None 时回退 2-tuple 旧格式。
         """
         state = activation.state
         # E-P2-1: 迁移到正确 device，防止潜变量与输入张量设备不一致
@@ -192,8 +212,11 @@ class MemoryManager:
             self.long_term_decay * self.long_term_latent + alpha_l * state
         )
 
-        # 缓冲 (state, surprise) 用于回放（deque 自动处理容量限制）
-        self._buffer.append((state.clone(), surprise))
+        # 缓冲 (state, surprise[, turn]) 用于回放（deque 自动处理容量限制）
+        if turn is not None:
+            self._buffer.append((state.clone(), surprise, turn))
+        else:
+            self._buffer.append((state.clone(), surprise))
 
     def consolidate(self) -> None:
         """记忆巩固：短时 -> 长时迁移，回放重要经验。
@@ -220,13 +243,40 @@ class MemoryManager:
             # 按 surprise 降序排列，优先回放高 surprise 条目
             sorted_buffer = sorted(self._buffer, key=lambda x: x[1], reverse=True)
             replay_count = min(self.replay_count, len(sorted_buffer))
-            for state, surprise in sorted_buffer[:replay_count]:
-                # 回放权重也按 surprise 加权（高 surprise = 重要经验）
+            # 体验层 D（设计 v1.1 §6.4）：反流畅性偏误——回放权重乘
+            # (1−rebuttal_rate)×source_trust，抑制"已关注方向内的虚假强化"
+            # （高频被反驳记忆的重复放大，Hasher 1977 D2 / Fazio 2015）；
+            # 低置信（<0.3）条目不进放大回放池（改由做梦 doubt_review 复核）。
+            # 只乘在回放权重层，不碰 surprise 公式/采样 softmax/purpose.precision。
+            turn_context = {}
+            try:
+                for e in self._episodic_buffer:
+                    turn_context[getattr(e, 'turn', None)] = e
+            except Exception:
+                turn_context = {}
+            for item in sorted_buffer[:replay_count]:
+                # 3-tuple 向后兼容：旧快照/旧调用为 (state, surprise)
+                if len(item) >= 3:
+                    state, surprise, turn = item[0], item[1], item[2]
+                else:
+                    state, surprise = item[0], item[1]
+                    turn = None
                 # T2.8/P2-1：replay_surprise_cap > 0 时钳制 surprise 上限，
                 # 防止个别超大 surprise（数值缺陷）垄断回放权重。
                 if self.replay_surprise_cap > 0:
                     surprise = min(surprise, self.replay_surprise_cap)
-                weight = self.replay_weight * max(surprise, 0.0)
+                # 反流畅因子：按 turn 关联 episodic 条目的反驳率/来源信任
+                rebuttal_rate, source_trust = 0.0, 1.0
+                entry = turn_context.get(turn) if turn is not None else None
+                if entry is not None:
+                    rebuttal_rate = get_rebuttal_rate(entry)
+                    source_trust = float(getattr(entry, 'source_trust', 1.0) or 1.0)
+                    # 低置信条目不进放大回放池（由 doubt_review 复核）
+                    conf = 1.0 * (1.0 - rebuttal_rate) * source_trust
+                    if conf < 0.3:
+                        continue
+                weight = (self.replay_weight * max(surprise, 0.0)
+                          * (1.0 - rebuttal_rate) * source_trust)
                 self.long_term_latent = (
                     self.long_term_latent + weight * state
                 )
@@ -320,6 +370,9 @@ class MemoryManager:
             surprise=surprise,
             turn=turn,
             source=source,
+            # 体验层 D（设计 v1.1 §6.1）：摄入时初始化置信度场——
+            # source_trust 按来源定（三路汇入①）
+            source_trust=get_source_trust(source),
         )
         self._episodic_buffer.append(entry)
 
@@ -327,7 +380,8 @@ class MemoryManager:
             self, query_vector: torch.Tensor,
             top_k: int = 3,
             fallback_query: Optional[torch.Tensor] = None,
-            source_filter: Optional[str] = 'external'
+            source_filter: Optional[str] = 'external',
+            count_reference: bool = True,
             ) -> List[Tuple[float, EpisodicEntry]]:
         """基于语义相似度检索情景记忆，返回 (相似度, 条目) 列表。
 
@@ -358,6 +412,10 @@ class MemoryManager:
                 中 64 维条目的兼容检索。
             source_filter: 来源过滤。``'external'`` 只检索外部条目（默认），
                 ``'self_ref'`` 只检索自指条目，``None`` 不过滤。
+            count_reference: 体验层 D（设计 v1.1 §6.1）——命中时是否计入
+                reference_count（正向佐证，置信度三路汇入③）。默认 True
+                （内部召回 = 记忆被使用）；/react、/recall 等外部只读探针
+                传 False 保持零持久化（P0-12）。fail-open：计数异常静默。
 
         返回:
             [(score, EpisodicEntry), ...]（按相似度降序，最多 top_k 条）；
@@ -420,6 +478,12 @@ class MemoryManager:
         if not scored:
             return []
 
+        # 体验层 D（设计 v1.1 §6.1）：record_reference 钩子——命中条目
+        # reference_count +1（正向佐证，置信度重算链路③）。fail-open。
+        if count_reference:
+            for _score, entry in scored:
+                record_reference(entry)
+
         # 按相似度降序取 top_k
         k = min(top_k, len(scored))
         scored.sort(key=lambda x: x[0], reverse=True)
@@ -447,19 +511,28 @@ class MemoryManager:
             self, query_vector: torch.Tensor,
             top_k: int = 3,
             fallback_query: Optional[torch.Tensor] = None,
-            source_filter: Optional[str] = 'external'
+            source_filter: Optional[str] = 'external',
+            count_reference: bool = True,
             ) -> List[Tuple[float, EpisodicEntry]]:
         """带相似度分数的情景检索（只读，0.5.0/T1.3 /recall 端点使用）。
 
         与 recall_episodic 共用同一实现，额外返回每条目与查询向量的
         余弦相似度分数。
 
+        参数:
+            query_vector: 查询的原始语义向量。
+            top_k: 返回的最大条目数。
+            fallback_query: 可选，投影后的查询向量（旧 64 维条目兼容）。
+            source_filter: 来源过滤（默认 'external'）。
+            count_reference: 体验层 D——命中是否计入 reference_count
+                （默认 True；外部只读探针传 False 保持零持久化）。
+
         返回:
             [(score, EpisodicEntry), ...]（按相似度降序，最多 top_k 条）。
         """
         return self._recall_episodic_scored(
             query_vector, top_k=top_k, fallback_query=fallback_query,
-            source_filter=source_filter)
+            source_filter=source_filter, count_reference=count_reference)
 
     # ------------------------------------------------------------------ #
     #  公开缓冲区访问接口
@@ -488,7 +561,7 @@ class MemoryManager:
     def iter_buffer(self):
         """返回回放缓冲区的只读迭代器。
 
-        返回 ``iter(self._buffer)``，调用方可用于遍历 ``(state, surprise)``
+        返回 ``iter(self._buffer)``，调用方可用于遍历 ``(state, surprise[, turn])``
         元组进行采样或回放。deque 迭代器是只读的，调用方不应原地修改。
         """
         return iter(self._buffer)
@@ -555,14 +628,21 @@ class MemoryManager:
         self.short_term_latent = state["short_term_latent"].clone().to(self.device)
         self.long_term_latent = state["long_term_latent"].clone().to(self.device)
         self.num_nodes = state["num_nodes"]
-        # 回放缓冲区恢复（向后兼容：旧快照无此字段时跳过）
+        # 回放缓冲区恢复（向后兼容：旧快照无此字段时跳过；
+        # 体验层 D：兼容 2-tuple 旧格式与 3-tuple (state, surprise, turn)）
         if "buffer" in state:
             maxlen = self._buffer.maxlen or 100
             # E-P2-1: 缓冲区中的 state 张量迁移到当前 device
-            migrated_buffer = [
-                (s.clone().to(self.device), surp)
-                for s, surp in state["buffer"]
-            ]
+            migrated_buffer = []
+            for item in state["buffer"]:
+                if len(item) >= 3:
+                    s, surp, turn = item[0], item[1], item[2]
+                    migrated_buffer.append(
+                        (s.clone().to(self.device), surp, turn))
+                else:
+                    s, surp = item[0], item[1]
+                    migrated_buffer.append(
+                        (s.clone().to(self.device), surp))
             self._buffer = deque(migrated_buffer, maxlen=maxlen)
         # 情景记忆缓冲区恢复（向后兼容：旧快照无此字段时跳过）
         if "episodic_buffer" in state:
@@ -591,7 +671,14 @@ class MemoryManager:
         self.long_term_latent = self.long_term_latent.to(self.device)
         # 迁移回放缓冲区中的 state 张量
         if self._buffer:
-            migrated = [(s.to(self.device), surp) for s, surp in self._buffer]
+            migrated = []
+            for item in self._buffer:
+                if len(item) >= 3:
+                    s, surp, turn = item[0], item[1], item[2]
+                    migrated.append((s.to(self.device), surp, turn))
+                else:
+                    s, surp = item[0], item[1]
+                    migrated.append((s.to(self.device), surp))
             maxlen = self._buffer.maxlen or 100
             self._buffer = deque(migrated, maxlen=maxlen)
         # 迁移情景缓冲区中的语义向量

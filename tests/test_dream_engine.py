@@ -156,7 +156,7 @@ class TestDreamEngine:
         assert set(dream_engine.phase_weights.keys()) == {
             'nrem_consolidation', 'synaptic_homeostasis', 'forgetting_pruning',
             'landscape_drift', 'purpose_evolution', 'rem_integration',
-            'snapshot',
+            'snapshot', 'doubt_review',  # 体验层 D：怀疑复核阶段（nrem 让渡 0.10）
         }
 
         # 组件引用正确

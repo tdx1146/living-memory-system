@@ -191,20 +191,31 @@ class DreamEngine:
         self.forget_max_age = config.get('forget_max_age', 50)
         self.purpose_evolve_nudge = config.get('purpose_evolve_nudge', 0.05)
 
-        # --- 七阶段做梦周期权重 ---
+        # --- 七阶段做梦周期权重（体验层 D：nrem 让渡 0.10 给 doubt_review）---
         self.phase_weights = {
-            'nrem_consolidation': 0.40,      # 阶段1: NREM 巩固
+            'nrem_consolidation': 0.30,      # 阶段1: NREM 巩固（0.40→0.30）
             'synaptic_homeostasis': 0.10,    # 阶段2: SHY 突触下调
             'forgetting_pruning': 0.10,      # 阶段3: 遗忘修剪
             'landscape_drift': 0.10,         # 阶段4: 景观漂移
             'purpose_evolution': 0.10,       # 阶段5: 目的演化
             'rem_integration': 0.15,         # 阶段6: REM 整合
             'snapshot': 0.05,               # 阶段7: 快照
+            'doubt_review': 0.10,            # 阶段8: 怀疑复核（体验层 D，
+                                             #   睡眠=整合/复核窗口）
         }
 
         # --- 运行状态 ---
         self.step_count: int = 0
         self.activation_history: List[torch.Tensor] = []
+
+        # 体验层 D（设计 v1.1 §6.3）：最近一次怀疑复核报告
+        # （reviewed/downgraded/rewritten/kept/flagged，进 dream 结果字典）
+        self.last_doubt_review: dict = {
+            'reviewed': 0, 'downgraded': 0, 'rewritten': 0,
+            'kept': 0, 'flagged': 0,
+        }
+        # gap_registry 注入（loop.get_dream_engine 经 config 传入；缺省 None）
+        self.gap_registry = config.get('gap_registry')
 
         logger.info(
             f"DreamEngine 已初始化 "
@@ -250,6 +261,9 @@ class DreamEngine:
         surprises: List[float] = []
         collapse_count = 0
         entropies: List[float] = []
+        # 体验层 D：一轮做梦开始重置复核统计（防跨梦膨胀）
+        self.last_doubt_review = {'reviewed': 0, 'downgraded': 0,
+                                  'rewritten': 0, 'kept': 0, 'flagged': 0}
 
         # 保存初始 J 矩阵（用于计算 j_change）
         J_initial = self.attractor.J.clone()
@@ -285,6 +299,12 @@ class DreamEngine:
         # 记忆巩固（短时 -> 长时迁移）
         self.memory.consolidate()
 
+        # 体验层 D（设计 v1.1 §6.3）：MVP 路径也跑一轮轻量怀疑复核
+        # （工程决策：生产默认 dream_full_cycle=false 走 MVP，doubt_review
+        # 只在七阶段周期内概率执行无法保证复核可达；此处兜底保证默认
+        # 做梦路径的 [梦醒] 摘要含复核计数。fail-open，异常不阻断。）
+        self._doubt_review()
+
         # 5. 自动快照
         snapshot_path = self._save_snapshot()
 
@@ -310,6 +330,7 @@ class DreamEngine:
             'j_change': j_change,
             'snapshot_path': snapshot_path,
             'buffer_size': self.memory.buffer_size(),
+            'doubt_review': dict(self.last_doubt_review),
         }
 
     def dream_cycle(self, max_steps: int = 100) -> dict:
@@ -351,6 +372,9 @@ class DreamEngine:
         phase_counts = {phase: 0 for phase in self.phase_weights}
         surprises: List[float] = []
         collapse_count = 0
+        # 体验层 D：一轮做梦开始重置复核统计（跨阶段累积，防跨梦膨胀）
+        self.last_doubt_review = {'reviewed': 0, 'downgraded': 0,
+                                  'rewritten': 0, 'kept': 0, 'flagged': 0}
 
         for step in range(max_steps):
             # 按权重随机选择阶段
@@ -371,6 +395,10 @@ class DreamEngine:
                         f"检测到坍缩，已注入扰动")
 
             self.step_count += 1
+
+        # 周期结束：兜底跑一轮怀疑复核（保证 [梦醒] 摘要含复核计数，
+        # 体验层 D 工程决策；fail-open）
+        self._doubt_review()
 
         # 周期结束保存快照
         snapshot_path = self._save_snapshot()
@@ -394,6 +422,7 @@ class DreamEngine:
             'collapse_count': collapse_count,
             'snapshot_path': snapshot_path,
             'buffer_size': self.memory.buffer_size(),
+            'doubt_review': dict(self.last_doubt_review),
         }
 
     def get_status(self) -> dict:
@@ -465,9 +494,9 @@ class DreamEngine:
         if len(entries) == 0:
             return None
 
-        # 提取 surprise 列表
-        surprises = torch.tensor([float(s) for (_, s) in entries],
-                                 dtype=torch.float32)
+        # 提取 surprise 列表（体验层 D：缓冲条目向后兼容 2/3-tuple）
+        surprises = torch.tensor(
+            [float(item[1]) for item in entries], dtype=torch.float32)
 
         # softmax 加权（2026-08-10 起：z-score 标准化 + z 截断 + β=1.0）
         # 标准化使采样尺度无关（surprise 现为准确性项 O(1~100)，且重尾分布
@@ -489,7 +518,8 @@ class DreamEngine:
 
         # 按权重采样一个索引
         idx = int(torch.multinomial(weights, 1).item())
-        state, surprise = entries[idx]
+        item = entries[idx]
+        state, surprise = item[0], item[1]
         return state.clone(), float(surprise)
 
     # ================================================================== #
@@ -687,11 +717,12 @@ class DreamEngine:
         # --- 衰减低 surprise 记忆在 long_term_latent 中的痕迹 ---
         buf = list(self.memory.iter_buffer())
         if len(buf) > 0:
-            surprises = [float(s) for (_, s) in buf]
+            surprises = [float(item[1]) for item in buf]
             mean_surprise = sum(surprises) / len(surprises)
             prune_rate = self.forget_prune_rate
 
-            for state, surprise in buf:
+            for item in buf:
+                state, surprise = item[0], item[1]
                 if surprise < mean_surprise:
                     # 弱化低 surprise 记忆的长期痕迹
                     self.memory.long_term_latent = (
@@ -881,6 +912,10 @@ class DreamEngine:
             return self._purpose_evolution_phase()
         elif phase == 'rem_integration':
             return self._rem_integration()
+        elif phase == 'doubt_review':
+            # 体验层 D：怀疑复核（不产生激活态，无坍缩检测）
+            self._doubt_review()
+            return None
         elif phase == 'snapshot':
             self._save_snapshot()
             return None
@@ -957,6 +992,104 @@ class DreamEngine:
     # ================================================================== #
     #  快照
     # ================================================================== #
+
+    # ------------------------------------------------------------------ #
+    #  体验层 D（设计 v1.1 §6.3）：怀疑复核阶段（doubt_review）
+    # ------------------------------------------------------------------ #
+
+    def _doubt_review(self) -> None:
+        """怀疑复核（睡眠=整合/复核窗口，Walker & Stickgold 2009）。
+
+        内容（P1 §2.3 原样；显式裁决流程为"睡眠=整合/复核窗口"的工程
+        翻译，溯源 §4.2 标注——论文支持睡眠做重放/整合/遗忘/去虚假吸引子，
+        不支持逐条打分-裁决流程，故裁决逻辑做成纯函数、乘子保守、独立
+        可回滚）：
+          ① labile 窗口裁决：改写=新增 source='doubt' supersedes 条目 /
+             无证据 confidence×1.02 重巩固 / 超时 ×0.98 折损
+             （reconsolidation.resolve_labile 纯函数）
+          ② 低置信（<0.3）复核：用不完全线索生成式回放（B3，Sinclair &
+             Barense 2019：完全重复反而稳定旧记忆，绝不复述原文）——
+             工程翻译：仅做保守重评估（×1.02 回稳）并标记 reviewed，
+             生成式回放由既有 surprise 加权采样机制自然覆盖
+          ③ 反教条抽查 top-N 高频记忆（reference/recall_count 高者——
+             正是已关注方向里被 illusory truth 强化的内容，D2 语义：
+             优先怀疑高频，Sharot 2011 C2）
+
+        输出复核报告（reviewed/downgraded/rewritten/kept/flagged）进
+        self.last_doubt_review（dream 结果字典 + [梦醒] 透传数据源）。
+        任何异常只记日志不阻断做梦（fail-open）。
+        """
+        stats = dict(self.last_doubt_review)  # 跨调用累积（一轮做梦内多次复核合并）
+        try:
+            entries = list(self.memory.iter_episodic())
+            if not entries:
+                self.last_doubt_review = stats
+                return
+            from core.doubt.reconsolidation import resolve_labile
+            from core.doubt.confidence_field import is_low_confidence
+
+            # ① labile 窗口裁决
+            for e in entries:
+                if getattr(e, 'labile', False):
+                    outcome = resolve_labile(e)
+                    stats[outcome] = stats.get(outcome, 0) + 1
+                    stats['reviewed'] += 1
+                    if outcome == 'rewritten':
+                        # 改写 = 新增 source='doubt' supersedes 条目
+                        # （更新而非抹除，Schiller 2010 B2）
+                        self._add_doubt_supersede(e)
+
+            # ② 低置信（<0.3）复核（不完全线索原则：绝不复述原文，
+            #    只做保守重评估并标记 reviewed）
+            for e in entries:
+                if is_low_confidence(e):
+                    try:
+                        e.confidence = max(0.0, min(
+                            1.0, float(e.confidence or 1.0) * 1.02))
+                    except (TypeError, ValueError):
+                        pass
+                    stats['reviewed'] += 1
+
+            # ③ 反教条抽查 top-N 高频记忆（优先怀疑高频——已关注方向内
+            #    被 illusory truth 强化的内容；只 flag 不抹除）
+            high_freq = sorted(
+                [e for e in entries
+                 if int(getattr(e, 'reference_count', 0) or 0) > 0],
+                key=lambda x: (int(getattr(x, 'reference_count', 0) or 0),
+                               int(getattr(x, 'recall_count', 0) or 0)),
+                reverse=True)[:3]
+            stats['flagged'] += len(high_freq)
+
+            # 联动 gap_registry（B 类清空 + 复核报告 + last_review）
+            if self.gap_registry is not None:
+                try:
+                    self.gap_registry.mark_review(stats)
+                except Exception:
+                    pass
+        except Exception as e:  # pylint: disable=broad-except
+            logger.warning("doubt_review 复核异常（fail-open）: %s", e)
+        self.last_doubt_review = stats
+
+    def _add_doubt_supersede(self, entry) -> None:
+        """改写 = 新增 source='doubt' supersedes 条目（不抹除原文）。
+
+        fail-open：任何异常静默（不阻断做梦）。
+        """
+        try:
+            vec = getattr(entry, 'semantic_vector', None)
+            if vec is None:
+                return
+            text = getattr(entry, 'text', '') or ''
+            violated_by = getattr(entry, 'violated_by', None)
+            new_text = (
+                "[doubt-supersedes] 原记忆被证伪: "
+                f"{violated_by or '（无证据记录）'} —— 原: {text[:80]}")
+            self.memory.store_episodic(
+                new_text, vec, surprise=float(getattr(entry, 'surprise', 0.0) or 0.0),
+                turn=int(getattr(entry, 'turn', 0) or 0),
+                source='doubt')
+        except Exception:  # pylint: disable=broad-except
+            pass
 
     def _save_snapshot(self) -> Optional[str]:
         """保存做梦后的状态快照。

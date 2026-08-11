@@ -222,6 +222,13 @@ class LivingMemoryLoop:
         # /react 解读零污染 /chat 路径（惊讶度修复 P0-12 零回归）。
         self.react_surprise_history: deque = deque(maxlen=200)
 
+        # 体验层 D（设计 v1.1 §6.2）：去稳定化的近 200 轮 surprise 窗口
+        # （G1 思路，LMS 内自有 deque；与 /react 窗口独立）
+        self.destab_surprise_window: deque = deque(maxlen=200)
+        # 体验层 D：信息缺口登记（怀疑灯数据源，A/B 类进灯、C 类仅诊断）
+        from core.doubt.gap_registry import GapRegistry
+        self.gap_registry = GapRegistry()
+
         # 元可塑性控制器（可选，根据 config 决定是否启用）
         self.meta = None
         if config.get('meta_enabled', True):
@@ -313,6 +320,14 @@ class LivingMemoryLoop:
         text = f"用户: {user_input}\n助手: {llm_output}" if llm_output else user_input
         sensory_input = self.encoder.encode(text, self.tokenizer, self.embedder)
 
+        # 体验层 D（设计 v1.1 §6.6）：结构化怀疑摄入（[doubt] 前缀解析，
+        # fail-open）。无前缀/解析失败 = 普通塑形，逐字节不变（红线）。
+        try:
+            from core.doubt.doubt_ingest import ingest as doubt_ingest
+            doubt_ingest(self, text)
+        except Exception:
+            pass
+
         # ★ 插入点 A：自指回注（提取为 _inject_self_ref）
         # 在编码后、推断前，将上一轮蒸馏的自述以自适应权重回注到感官向量。
         # 默认关闭（self_ref is None）时此块完全跳过，sensory_input 保持原样。
@@ -388,7 +403,8 @@ class LivingMemoryLoop:
                 "(自指主导轮次, surprise=%.4f)", activation.surprise)
 
         # 5. 记忆更新与巩固
-        self.memory.update(activation, activation.surprise)
+        self.memory.update(activation, activation.surprise,
+                           turn=self.turn_count)
         if self.turn_count > 0 and \
            self.turn_count % self.consolidation_interval == 0:
             self.memory.consolidate()
@@ -402,6 +418,13 @@ class LivingMemoryLoop:
         # 5.6 情景记忆检索（用语义向量找最相关的历史文本）
         # 先检索后存储：避免当前轮文本出现在检索结果中
         episodic_texts = self._retrieve_episodic(text)
+
+        # 5.7 体验层 D（设计 v1.1 §6.2）：惊讶度双角色-角色2 去稳定化
+        # 高惊讶（z>2）→ 标记被当前输入违反的旧记忆为 labile
+        # （已关注方向内的证伪，Schiller 2010 B2）；插在 store_episodic 前。
+        # 角色 1（学习信号）不动（红线）。fail-open。
+        self._destabilize_if_high_surprise(
+            activation, semantic_vector, raw_semantic_vector, text)
 
         # 6. 解码context（传入检索到的记忆和情景文本，使长期记忆+语义文本参与输出）
         # A-P1-2: 传入 purpose.coherence，使解码器能输出"关注方向"解读
@@ -674,6 +697,9 @@ class LivingMemoryLoop:
                 "collapse_count": result.get("collapse_count"),
                 "j_change": result.get("j_change"),
                 "buffer_size": result.get("buffer_size"),
+                # 体验层 D（设计 v1.1 §6.3）：怀疑复核报告透传
+                # （reviewed/downgraded/rewritten/kept/flagged，[梦醒] 数据源）
+                "doubt_review": result.get("doubt_review"),
             })
         except Exception as e:
             logger.debug("Phase 4 dream_complete 发布跳过（静默降级）: %s", e)
@@ -714,6 +740,52 @@ class LivingMemoryLoop:
                 return None, sem_vec
         return raw_vec, sem_vec
 
+    def _destabilize_if_high_surprise(
+        self, activation, semantic_vector, raw_semantic_vector, text
+    ) -> None:
+        """体验层 D（设计 v1.1 §6.2）：高惊讶去稳定化（角色 2）。
+
+        近 200 轮 surprise 窗口，surprise > mean + 2·std → 定位本轮检索
+        命中条目中**置信度最高**者（最 established 的旧记忆，工程近似：
+        语义矛盾检测无 LLM 依赖）→ mark_labile(violated_by=当前输入)。
+
+        专注化强调：被标记的是"被当前输入违反的旧记忆"（已关注方向里的
+        证伪内容），不是"值得探索的新方向"。任何异常静默（fail-open）。
+        """
+        try:
+            self.destab_surprise_window.append(activation.surprise)
+            window = list(self.destab_surprise_window)
+            if len(window) < 20:
+                return
+            mean = sum(window) / len(window)
+            std = (sum((v - mean) ** 2 for v in window) / len(window)) ** 0.5
+            if std < 1e-8:
+                return
+            z = (activation.surprise - mean) / std
+            if z <= 2.0:
+                return
+            query_vec = (raw_semantic_vector if raw_semantic_vector is not None
+                         else semantic_vector)
+            if query_vec is None:
+                return
+            from core.doubt.reconsolidation import (
+                find_violated_entry, mark_labile)
+            scored = self.memory.recall_episodic_scored(
+                query_vec, top_k=3, fallback_query=semantic_vector,
+                source_filter='external', count_reference=False)
+            if not scored:
+                return
+            entry = find_violated_entry(scored)
+            if entry is not None:
+                snippet = (text or '')[:80]
+                if mark_labile(entry, violated_by=snippet):
+                    logger.info(
+                        f"体验层D: 高惊讶 z={z:.2f} → 去稳定化旧记忆 "
+                        f"(turn={getattr(entry, 'turn', '?')}, "
+                        f"rebuttal={getattr(entry, 'rebuttal_count', 0)})")
+        except Exception as e:  # pylint: disable=broad-except
+            logger.warning("去稳定化标记失败（fail-open）: %s", e)
+
     def _retrieve_episodic(self, text: str) -> list[str] | None:
         """情景记忆检索：用语义向量找最相关的历史文本。
 
@@ -743,16 +815,22 @@ class LivingMemoryLoop:
           - 不调 LLM
           - 不写缓冲（不 store_episodic）
           - 不落盘（不保存快照）
+          - record_reference=False（体验层 D：外部只读探针不计数引用，
+            P0-12 零持久化保持）
 
         与 process_turn 内的检索共用同一套编码/检索逻辑
         （_encode_query_vector + memory.recall_episodic_scored）。
+
+        体验层 D（设计 v1.1 §6.5）：检索结果应用**低置信复核配额**
+        （relevance-gated：只有 cue_sim ≥ top1×0.5 的待复核条目才占
+        1 个配额席位，否则宁缺毋滥——怀疑不变成跑偏源）。
 
         参数:
             query: 查询文本
             k: 返回条数（调用方已钳制到 [1,20]）
 
         返回:
-            [{'text': str, 'score': float}, ...]（按相关度降序）；
+            [{'text': str, 'score': float, ...}, ...]（按相关度降序）；
             embedder 不支持语义编码或缓冲区为空时返回空列表（fail-open）。
         """
         if not query or not query.strip():
@@ -762,12 +840,31 @@ class LivingMemoryLoop:
             return []  # embedder 无 embed_text：无可检索的语义空间（fail-open）
         query_vec = raw_vec if raw_vec is not None else sem_vec
         scored = self.memory.recall_episodic_scored(
-            query_vec, top_k=k, fallback_query=sem_vec)
+            query_vec, top_k=k, fallback_query=sem_vec,
+            count_reference=False)
+        # 体验层 D：低置信复核配额（relevance-gated，只读选择）
+        try:
+            from core.doubt.recall_scheduler import (
+                select_with_low_confidence_quota)
+            scored = select_with_low_confidence_quota(scored, k)
+        except Exception:
+            pass
         results = []
         for score, entry in scored:
             text = getattr(entry, 'text', None)
             if text:
-                results.append({'text': text, 'score': float(score)})
+                item = {'text': text, 'score': float(score)}
+                # 体验层 D（设计 v1.1 §8.1/§8.3）：置信度场字段注解
+                item['confidence'] = round(
+                    float(getattr(entry, 'confidence', 1.0) or 1.0), 3)
+                item['rebuttal_count'] = int(
+                    getattr(entry, 'rebuttal_count', 0) or 0)
+                item['labile'] = bool(getattr(entry, 'labile', False))
+                item['source_trust'] = round(
+                    float(getattr(entry, 'source_trust', 1.0) or 1.0), 3)
+                item['last_recalled_at'] = getattr(
+                    entry, 'last_recalled_at', None)
+                results.append(item)
         return results
 
     # ================================================================== #
@@ -832,7 +929,7 @@ class LivingMemoryLoop:
                 try:
                     scored = self.memory.recall_episodic_scored(
                         query_vec, top_k=k, fallback_query=semantic_vector,
-                        source_filter='external')
+                        source_filter='external', count_reference=False)
                     for score, entry in scored:
                         if getattr(entry, 'text', None):
                             recalled.append({
@@ -1271,6 +1368,32 @@ class LivingMemoryLoop:
         if self.meta is not None:
             status['meta'] = self.meta.get_status()
 
+        # 体验层 D（设计 v1.1 §6.6/§8.1）：doubt 增量字段
+        #   gaps: 信息缺口（A/B 类进怀疑灯，C 类仅诊断——专注化修订）
+        #   labile_count / low_confidence_count: 置信度场体检
+        #   last_review: 最近一次做梦怀疑复核时间
+        # 纯增量字段：C-01 required（entropy_ratio/purpose_coherence/
+        # turn_count）不变 → 绿。fail-open：任何异常只缺省该字段。
+        try:
+            labile_count = 0
+            low_conf_count = 0
+            for e in self.memory.iter_episodic():
+                if bool(getattr(e, 'labile', False)):
+                    labile_count += 1
+                try:
+                    if float(getattr(e, 'confidence', 1.0) or 1.0) < 0.3:
+                        low_conf_count += 1
+                except (TypeError, ValueError):
+                    pass
+            status['doubt'] = {
+                'gaps': self.gap_registry.snapshot(),
+                'labile_count': labile_count,
+                'low_confidence_count': low_conf_count,
+                'last_review': self.gap_registry.last_review(),
+            }
+        except Exception as e:  # pylint: disable=broad-except
+            logger.debug("get_status doubt 字段组装失败（fail-open）: %s", e)
+
         # 自指回路状态（可选）
         if self.self_ref is not None:
             status['self_ref_enabled'] = True
@@ -1312,6 +1435,8 @@ class LivingMemoryLoop:
             dream_config.setdefault(
                 'snapshot_dir',
                 self.config.get('snapshot_dir', 'snapshots'))
+            # 体验层 D：怀疑复核联动 gap_registry（B 类清空 + 复核报告）
+            dream_config['gap_registry'] = self.gap_registry
             self.dream_engine = DreamEngine(
                 attractor=self.attractor,
                 purpose=self.purpose,
