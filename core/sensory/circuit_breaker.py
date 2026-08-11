@@ -31,6 +31,26 @@ class CircuitOpenError(RuntimeError):
     """熔断器处于 OPEN 状态时的快速失败异常。"""
 
 
+# ------------------------------------------------------------------ #
+#  默认熔断器单例（提取层 v1.4 S1-7：写侧三处 embed 共用同一熔断状态）
+# ------------------------------------------------------------------ #
+# Encoder.encode（sensory 编码）与 loop 写侧 embed 分处不同模块，
+# 共用同一实例保证熔断状态一致（一处连续失败 → 三处同时快速失败）。
+# 懒创建：首次调用时读 LMS_EMBED_CIRCUIT（S1-12 起默认 1=开）。
+_DEFAULT_EMBED_CIRCUIT: Optional["EmbedCircuitBreaker"] = None
+_DEFAULT_EMBED_CIRCUIT_LOCK = threading.Lock()
+
+
+def get_default_embed_circuit() -> "EmbedCircuitBreaker":
+    """返回模块级默认 embed 熔断器单例（线程安全懒创建）。"""
+    global _DEFAULT_EMBED_CIRCUIT
+    if _DEFAULT_EMBED_CIRCUIT is None:
+        with _DEFAULT_EMBED_CIRCUIT_LOCK:
+            if _DEFAULT_EMBED_CIRCUIT is None:
+                _DEFAULT_EMBED_CIRCUIT = EmbedCircuitBreaker()
+    return _DEFAULT_EMBED_CIRCUIT
+
+
 class EmbedCircuitBreaker:
     """embed 调用熔断器。
 

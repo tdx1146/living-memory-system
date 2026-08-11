@@ -12,11 +12,23 @@
 依赖core的接口但不依赖具体实现（低耦合）。
 """
 
+import logging
 import time
 import torch
 from core.types import SensoryInput
 from core.sensory.tokenizer import Tokenizer
 from core.sensory.embedder import Embedder
+
+logger = logging.getLogger("bridge.encoder")
+
+# 提取层 v1.4（S1-7，P3 降级路径①）：sensory 编码的 embed 调用走默认熔断器
+# （与 loop 写侧共用同一熔断状态）。熔断 OPEN 时 encode 快速失败：返回零向量
+# SensoryInput ＋ degraded 标记——FEP 推断照常（零向量 Hebbian 学习
+# outer(0,0)=0，J 不变，安全），turn_count 照常增量（B3 顶层提取一致），
+# 本轮由调用方（loop）根据 degraded 标记决定不写 episodic。
+from core.sensory.circuit_breaker import (
+    CircuitOpenError, get_default_embed_circuit,
+)
 
 
 class Encoder:
@@ -43,14 +55,28 @@ class Encoder:
         返回:
             SensoryInput对象，包含感官向量和元数据
         """
+        degraded = False  # 提取层 v1.4（S1-7）：embed 熔断降级标记（默认非降级）
         if hasattr(embedder, "embed_text"):
             # ---- 文本路径：预训练语义 embedder（如 PretrainedEmbedder）----
             # 预训练模型按原始文本编码，自带分词，故绕过系统 token id。
             stripped = text.strip()
             if stripped:
-                vector = embedder.embed_text(stripped)
+                # 提取层 v1.4（S1-7/P3 ①）：embed 走熔断器；熔断 OPEN 时
+                # 快速失败 → 零向量 + degraded 标记（fail-open，不触网死等）
+                try:
+                    vector = get_default_embed_circuit().call(
+                        embedder.embed_text, stripped)
+                except CircuitOpenError:
+                    logger.warning(
+                        "embed 熔断中：encode 降级为零向量 SensoryInput"
+                        "（degraded；本轮不写 episodic，FEP 照常安全）")
+                    vector = torch.zeros(embedder.dim)
+                    degraded = True
+                else:
+                    degraded = False
             else:
                 vector = torch.zeros(embedder.dim)
+                degraded = False
             # 文本路径下系统 token id 不参与编码，记为 0
             num_tokens = 0
         else:
@@ -77,7 +103,7 @@ class Encoder:
 
             num_tokens = len(tokens)
 
-        # 3. 构造SensoryInput
+        # 3. 构造SensoryInput（degraded 标记进 metadata，调用方读取）
         return SensoryInput(
             vector=vector,
             metadata={
@@ -85,5 +111,8 @@ class Encoder:
                 'source': 'encoder',
                 'num_tokens': num_tokens,
                 'text_length': len(text),
+                # 提取层 v1.4（S1-7）：embed 熔断降级标记（True=本轮 sensory
+                # 编码为零向量；调用方据此不写 episodic）
+                'degraded': degraded,
             }
         )

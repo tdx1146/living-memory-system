@@ -289,6 +289,13 @@ class LivingMemoryLoop:
         self._embed_circuit = EmbedCircuitBreaker(
             enabled=config.get('embed_circuit'))
 
+        # 提取层 v1.4（S1-7/P3）：写侧熔断降级观测——
+        # degraded_events：写侧语义向量 embed 熔断降级累计次数（本轮不落
+        #   episodic）；last_turn_degraded：最近一轮 process_turn 是否降级
+        #   （/store 据此返回 503；/chat 塑形降级但响应照常）。
+        self.degraded_events: int = 0
+        self.last_turn_degraded: bool = False
+
         logger.info(
             f"LivingMemoryLoop已初始化 "
             f"(nodes={self.attractor.num_nodes}, dim={self.attractor.input_dim})"
@@ -318,7 +325,15 @@ class LivingMemoryLoop:
         """
         # 1. 编码输入
         text = f"用户: {user_input}\n助手: {llm_output}" if llm_output else user_input
+        # 提取层 v1.4（S1-7/P3）：每轮开始重置降级标记（观测粒度=单轮）
+        self.last_turn_degraded = False
         sensory_input = self.encoder.encode(text, self.tokenizer, self.embedder)
+        # 编码降级（embed 熔断 → 零向量 SensoryInput）：FEP 照常（零向量
+        # Hebbian 学习 outer(0,0)=0，J 不变，安全）；本轮不写 episodic
+        # （语义向量同样会熔断失败 → None）。
+        if sensory_input.metadata.get('degraded'):
+            self.last_turn_degraded = True
+            self.degraded_events += 1
 
         # 体验层 D（设计 v1.1 §6.6）：结构化怀疑摄入（[doubt] 前缀解析，
         # fail-open）。无前缀/解析失败 = 普通塑形，逐字节不变（红线）。
@@ -336,15 +351,42 @@ class LivingMemoryLoop:
 
         # 1.5 获取语义向量（用于情景记忆存储与检索）
         # PretrainedEmbedder 提供 embed_text；SimpleEmbedder 无此方法时跳过
+        # 提取层 v1.4（S1-7/P3 ②③）：写侧两处 embed 包熔断——
+        #   ② semantic_vector 失败 → None＋degraded（本轮不写 episodic，
+        #     sem 是必需向量；不落僵尸：无向量条目=检索不可达）；
+        #   ③ raw_semantic_vector 失败 → None（退化为投影向量，与读侧
+        #     同语义；②成功时照常落库）。
         semantic_vector = None
         raw_semantic_vector = None
         if hasattr(self.embedder, 'embed_text'):
-            semantic_vector = self.embedder.embed_text(text)
+            # 写侧与 encode 共用默认熔断器单例（S1-7：同一 embed 服务、同一
+            # 熔断状态——否则 encode 熔断后此处仍 CLOSED 会裸抛原始异常）。
+            from core.sensory.circuit_breaker import (
+                CircuitOpenError, get_default_embed_circuit,
+            )
+            try:
+                semantic_vector = get_default_embed_circuit().call(
+                    self.embedder.embed_text, text)
+            except CircuitOpenError:
+                logger.warning(
+                    "embed 熔断中：写侧语义向量降级为 None"
+                    "（本轮不写 episodic，/store 将 503）")
+                semantic_vector = None
+                self.last_turn_degraded = True
+                self.degraded_events += 1
             # 384 维原始语义向量（投影前），用于 episodic buffer 高精度检索
             # PretrainedEmbedder 提供 embed_text_raw；无此方法时退化为 None
             # （如自定义 embedder 仅有 embed_text），此时退化为用投影向量
-            if hasattr(self.embedder, 'embed_text_raw'):
-                raw_semantic_vector = self.embedder.embed_text_raw(text)
+            if semantic_vector is not None and hasattr(
+                    self.embedder, 'embed_text_raw'):
+                try:
+                    raw_semantic_vector = get_default_embed_circuit().call(
+                        self.embedder.embed_text_raw, text)
+                except CircuitOpenError:
+                    logger.warning(
+                        "embed 熔断中：raw 语义向量降级为 None"
+                        "（退化为投影向量）")
+                    raw_semantic_vector = None
 
         # --- 元可塑性：计算调整后的参数（E-P2-5: 不修改实例属性）---
         _effective_lr, _meta_temp, _meta_orth, _meta_cw = \
@@ -801,8 +843,16 @@ class LivingMemoryLoop:
         if raw_vec is None and sem_vec is None:
             return None
         episodic_query = raw_vec if raw_vec is not None else sem_vec
+        # 提取层 v1.4（P2-B 写侧引用加固）：内部检索即"写侧引用匹配"——
+        # 用本轮新条目向量（零额外 embed）对 episodic 引用匹配 top-k=3，
+        # count_reference=True 默认路径（record_reference，复用 reference_count
+        # 为加固计数唯一权威），并传入 reinforce_turn 刷新命中条目
+        # last_reinforced_turn（wear 重新计时，丰碑"引用自动加固"）；
+        # source_filter='external' 天然跳过 gray（source='store_gray'）——
+        # 灰度三重冻结③。
         entries = self.memory.recall_episodic(
-            episodic_query, top_k=3, fallback_query=sem_vec)
+            episodic_query, top_k=3, fallback_query=sem_vec,
+            reinforce_turn=self.turn_count)
         if entries:
             return [e.text for e in entries]
         return None
@@ -1358,6 +1408,23 @@ class LivingMemoryLoop:
         status['entropy_ratio'] = self.last_entropy_ratio
         status['entropy_high_threshold'] = self.config.get('entropy_high_threshold', 0.9)
         status['entropy_low_threshold'] = self.config.get('entropy_low_threshold', 0.5)
+
+        # 提取层 v1.4（S1-7/S1-9/S1-14）：熔断降级与容量观测（纯增量字段，
+        # 旧客户端忽略；进灰度仪表与 dream_state.json）
+        status['degraded_events'] = int(getattr(self, 'degraded_events', 0) or 0)
+        status['last_turn_degraded'] = bool(
+            getattr(self, 'last_turn_degraded', False))
+        try:
+            status['capacity_usage'] = self.memory.episodic_size()
+            status['capacity_soft_limit'] = self.memory.get_episodic_maxlen()
+            status['capacity_full_events'] = int(getattr(
+                self.memory, 'capacity_full_events', 0) or 0)
+            status['capacity_hard_drops'] = int(getattr(
+                self.memory, 'capacity_hard_drops', 0) or 0)
+            status['capacity_warning_events'] = int(getattr(
+                self.memory, 'capacity_warning_events', 0) or 0)
+        except Exception:
+            pass
 
         purpose = self.purpose.get_purpose()
         status['purpose_coherence'] = purpose.coherence
