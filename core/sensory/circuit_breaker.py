@@ -10,7 +10,8 @@
 快速失败（不触网），冷却结束自动半开（放行一次探测）。
 
 设计约束（与总体方案 T2.8 一致）:
-  - 开关：LMS_EMBED_CIRCUIT=1 启用（默认 0 = 关闭，行为与原来完全一致）；
+  - 开关：LMS_EMBED_CIRCUIT=1 启用（v1.4 S1-12：默认 1 = 开，拍板②"熔断默认开"；
+    行为变更：embed 服务连续失败时快速失败而非死等重试——这正是目的）；
   - 线程安全：内部 threading.Lock 保护状态；
   - fail-open：熔断期快速失败（抛 CircuitOpenError），调用方（loop 的
     _encode_query_vector）捕获后返回空检索结果，绝不卡请求；
@@ -42,7 +43,7 @@ class EmbedCircuitBreaker:
 
     参数:
         enabled: 是否启用熔断（None 时读环境变量 LMS_EMBED_CIRCUIT，
-            默认 0 = 关闭）。
+            默认 1 = 开启，v1.4 S1-12：熔断默认开，防新部署忘配）。
         max_failures: 连续失败多少次后熔断（默认 3）。
         cooldown: 熔断冷却秒数（默认 300 = 5 分钟）。
         clock: 时间源（测试注入；默认 time.time）。
@@ -53,7 +54,7 @@ class EmbedCircuitBreaker:
                  cooldown: float = 300.0,
                  clock: Optional[Callable[[], float]] = None) -> None:
         if enabled is None:
-            enabled = os.environ.get("LMS_EMBED_CIRCUIT", "0") == "1"
+            enabled = os.environ.get("LMS_EMBED_CIRCUIT", "1") == "1"
         self.enabled: bool = bool(enabled)
         self.max_failures: int = int(max_failures)
         self.cooldown: float = float(cooldown)
