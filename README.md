@@ -3,11 +3,11 @@
 > 一个基于海马体模型的"活体"记忆痕迹维护器：通过自由能原理（FEP）学习规则，
 > 让记忆在与对话的持续交互中**涌现**、**巩固**与**演化**，而不是静态的键值存取。
 
-> 🔗 **系统定位**（2026-08-10）：本模块是「LMS 活体记忆」。
+> 🔗 **系统定位**（2026-08-11）：本模块是「LMS 活体记忆」+ 体验层（实时反应/怀疑融入）。
 > 上游依赖：无（被胶水层/self_pulse/OpenClaw 调用）｜ 下游消费者：胶水层(:19000)、self_pulse、OpenClaw 插件
-> 外部接口：`:8190` /health、`/status/{sid}`、`/feed`、`/recall`；`:8191` 控制口
-> 仓库：`https://github.com/tdx1146/living-memory-system`（master，私有）
-> 系统全图：**见 `tdx1146/agent-os` 仓库的 `TOPOLOGY.md`**（https://github.com/tdx1146/agent-os/blob/main/TOPOLOGY.md）
+> 外部接口：`:8190` /health、`/status/{sid}`、`/feed`、`/recall`、`/chat`、**`/react`（体验层A：infer-only 实时反应+解读段）**；`:8191` 控制口
+> 仓库：`https://github.com/tdx1146/living-memory-system`（**main，公开**）
+> 系统全图：**见 `tdx1146/agent-os` 仓库的 `TOPOLOGY.md`**（https://github.com/tdx1146/agent-os/blob/main/TOPOLOGY.md）｜ **部署中心/数据流/踩坑：`SYSTEM.md`**（https://github.com/tdx1146/agent-os/blob/main/SYSTEM.md）
 
 ## 目录
 
@@ -40,6 +40,14 @@ LMS 把记忆建模为一组相互竞争的**吸引子**（attractor），其连
 3. **睡眠中的活体巩固** —— 当对话空闲时，常驻的 `DreamScheduler` 后台线程自动触发
    做梦引擎，进行记忆回放、SHY 衰减、吸引子景观漂移与目的演化。这让系统即使无人说话，
    也在持续"做梦"，从冷工具变为**活体**。
+4. **体验层（2026-08-11，v1.1 设计）** —— 让主 AI 每轮"看见大脑此刻的感受"，且这份感受是干净的、方向明确的、被质检过的：
+   - **实时反应找回**：新端点 `POST /react`（infer-only 零持久化：不 learn/不落库/不写 sigma/turn_count 不变），
+     输出 `reaction`（熵/惊讶/coherence 后验读出）+ `interpretation`（自然语言解读段，进 [回魂] 三段式）；
+   - **子代理污染过滤**：`_GARBAGE_TEXT_RE` 纯增量 +6 条调度样板正则（`[Subagent Context]`/`[Subagent Task]`/`HEARTBEAT_OK` 等），
+     main 脑不被调度噪音挤占 top-k；
+   - **元目的翻转回初版**：coherence 低时**强化已关注维度**（`_meta_adjust` 改回 `avg_precision.argmax()`，越关注越专注）；
+   - **怀疑融入（置信度场）**：记忆条目带 `confidence/rebuttal_count/labile/source_trust`，被证伪降权、做梦 `doubt_review` 阶段复核、
+     反流畅项抑制虚假强化、唤起 salience 低置信配额相关性门控——**怀疑修正"信多少"，不改变"关注哪"**（confidence≠precision）。
 
 简言之：**LMS 不存储记忆，而是维护一个能产生记忆的大脑状态。**
 
@@ -130,6 +138,8 @@ DEEPSEEK_API_KEY=sk-your-deepseek-api-key-here
 LMS_EMBEDDER=cloud
 # cloud 模式（推荐，需远程 embed 服务）
 LMS_CLOUD_EMBED_URL=https://embed.example.com/v1/embeddings
+# 备用 embed 端点（主 URL 失败自动切换；本机 LAN→隧道 https://11435.tdx1146.cc/v1/embeddings）
+# LMS_CLOUD_EMBED_FALLBACK_URL=
 LMS_CLOUD_EMBED_MODEL=bge-m3
 LMS_CLOUD_EMBED_DIM=1024
 # pretrained 模式（本地加载，无需远程服务）
@@ -147,6 +157,15 @@ python -m api.run
 服务默认监听 `http://127.0.0.1:8190`，交互式文档位于 `http://127.0.0.1:8190/docs`。
 验证是否真的加载了配置：`curl http://127.0.0.1:8190/status/main` 应返回非空 turn_count，
 且启动日志不应出现 "降级" 字样。
+
+验证体验层（2026-08-11 新功能）是否生效：
+
+```bash
+curl -X POST http://127.0.0.1:8190/react -H 'Content-Type: application/json' \
+  -d '{"user_input":"你好","k":0}'
+# → 200，含 reaction（熵/惊讶/coherence）+ interpretation（解读段）；连续两次 turn_count 不变（零持久化）
+curl http://127.0.0.1:8190/status/main | grep -o '"doubt"'   # 体验层D：怀疑融入字段存在
+```
 
 ### 3b. 启动 MCP 服务器（供 TRAE IDE 调用）
 
@@ -249,6 +268,7 @@ loop_config = cfg.to_loop_config()         # 转 loop 配置
 | `LMS_LLM_MODEL` | `deepseek-chat` | LLM 模型名 |
 | `LMS_EMBEDDER` | `pretrained` | 嵌入器类型：`cloud` / `pretrained` / `simple` |
 | `LMS_CLOUD_EMBED_URL` | `https://embed.example.com/v1/embeddings` | 云端 embed 服务 URL（`cloud` 模式生效） |
+| `LMS_CLOUD_EMBED_FALLBACK_URL` | （空） | 备用 embed 端点（主 URL 失败自动切换，如 LAN→隧道） |
 | `LMS_CLOUD_EMBED_MODEL` | `bge-m3` | 云端 embed 模型名（`cloud` 模式生效） |
 | `LMS_CLOUD_EMBED_DIM` | `1024` | 云端 embed 输出维度（`cloud` 模式生效） |
 | `LMS_INPUT_DIM` | 64 | 输入维度 |
@@ -260,6 +280,8 @@ loop_config = cfg.to_loop_config()         # 转 loop 配置
 | `DREAM_STEPS` | `20` | 自动做梦步数 |
 | `DREAM_FULL_CYCLE` | `false` | 是否使用完整七阶段做梦周期 |
 | `DREAM_CHECK_INTERVAL` | `5` | 调度器检查间隔（秒） |
+| `LMS_FEED_RATE_LIMIT` | `10` | /feed 限流（次/分钟，超限 429，防总线风暴） |
+| `LMS_SNAPSHOT_DIR` | `./snapshots` | 快照目录（.pt 状态文件） |
 | `LMS_*`（其余） | — | 任意 CoreConfig 字段大写加 `LMS_` 前缀，如 `LMS_TEMPERATURE` |
 
 > **嵌入器三模式**：
@@ -278,6 +300,7 @@ API 服务由 `api/server.py` 提供，共 10 个端点。简要列表如下，�
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
+| POST | `/react` | 实时反应只读（体验层A：infer-only 零持久化，返回 reaction+interpretation+可选 recalled；k=0 只要反应+解读） |
 | POST | `/chat` | 完整对话（手动控制 LLM 注入时机） |
 | POST | `/chat/simple` | 简化对话（自动处理记忆 + LLM 查询） |
 | GET | `/status/{sid}` | 查询会话记忆状态 |
@@ -345,7 +368,14 @@ CI 配置位于 `.github/workflows/`：`ci.yml`（Python 3.10/3.11/3.12 矩阵 +
 │   ├── __init__.py
 │   ├── config.py               # CoreConfig 统一配置（含 validate/from_env）
 │   ├── paths.py                # 跨平台路径管理（pathlib，缓存目录探测）
-│   ├── types.py                # 核心数据类型（SensoryInput/Activation/PurposeState）
+│   ├── types.py                # 核心数据类型（SensoryInput/Activation/PurposeState；体验层D：EpisodicEntry 置信度场字段）
+│   ├── doubt/                  # 体验层D：怀疑融入（置信度场/去稳定化/召回调度/doubt_ingest/gap_registry）
+│   │   ├── __init__.py
+│   │   ├── confidence_field.py # 置信度场（confidence = 1×(1−rebuttal_rate)×source_trust）
+│   │   ├── reconsolidation.py  # 惊讶度双角色：去稳定化（mark_labile）
+│   │   ├── recall_scheduler.py # 唤起 salience（相关性门控配额）
+│   │   ├── doubt_ingest.py     # /feed 结构化 doubt 摄入（fail-open）
+│   │   └── gap_registry.py     # /status doubt.gaps 登记（C 类仅诊断）
 │   ├── hippocampus/            # 海马体子模块
 │   │   ├── __init__.py
 │   │   ├── attractor.py        # 吸引子网络（FEP 推断与学习）
@@ -364,7 +394,8 @@ CI 配置位于 `.github/workflows/`：`ci.yml`（Python 3.10/3.11/3.12 矩阵 +
 │   ├── API.md                  # HTTP API 详细文档
 │   ├── MCP_TOOLS.md            # MCP 工具文档
 │   ├── ARCHITECTURE.md         # 架构文档
-│   └── EXECUTION_TRACKER.md    # 执行跟踪
+│   ├── EXECUTION_TRACKER.md    # 执行跟踪
+│   └── 体验层实施-20260811.md   # 体验层 A-D 实施记录（提交/验证/遗留/部署待办）
 ├── persistence/                # 持久化层
 │   ├── __init__.py
 │   ├── recovery.py             # 恢复管理（异常链 + 回滚）
@@ -378,6 +409,10 @@ CI 配置位于 `.github/workflows/`：`ci.yml`（Python 3.10/3.11/3.12 矩阵 +
 ├── tests/                      # 测试套件
 │   ├── test_api_server.py      # API 层测试（27 个，覆盖全部端点）
 │   ├── test_config.py          # 配置测试（88 个）
+│   ├── test_react_readonly.py  # 体验层A：/react 零持久化断言（J/sigma/episodic/turn_count 四不变）
+│   ├── test_garbage_filter.py  # 体验层B：子代理样板过滤
+│   ├── test_purpose_meta_flip.py # 体验层C：元目的翻转（强化已关注）
+│   ├── test_doubt_integration.py # 体验层D：怀疑链（conflict→证伪→做梦→doubt_review）
 │   └── ...                     # 其余模块测试
 ├── snapshots/                  # 快照目录（.pt 状态文件）
 ├── conftest.py                 # pytest 根配置（sys.path）
