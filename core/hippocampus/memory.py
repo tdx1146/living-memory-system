@@ -15,6 +15,7 @@ consolidation（巩固）机制将短时记忆迁移到长时记忆，
 
 import os
 import re
+import time
 import torch
 from collections import deque
 from dataclasses import dataclass
@@ -94,6 +95,16 @@ class EpisodicEntry:
     violated_by: Optional[str] = None     # 违反它的输入文本摘要（证伪证据）
     last_recalled_at: Optional[float] = None  # 最近一次被召回时间（遗忘曲线用）
     recall_count: int = 0                 # 累计召回次数（反教条抽查/遗忘曲线用）
+    # 提取层 v1.4（S1-11，P2-A 字段定案：不新增 link_count，复用 reference_count
+    # 为加固计数唯一权威；全部带默认值 → 旧构造点/旧快照向后兼容，加载统一
+    # getattr(e, field, default) 兜底）：
+    last_reinforced_turn: Optional[int] = None  # 最近加固轮次（wear 计时起点，初始=写入 turn；
+                                                #   轮次制，与 last_recalled_at 墙钟时间戳正交，不互转）
+    info_value: float = 0.0               # 价值 = 0.7×surprise_norm + 0.3×recall_hit_score
+                                          #   （v1.4 按论文重做，§6.2；冷启动垫片非承重）
+    core: Optional[str] = None            # 提取式压缩核心（≤300 字，TextRank 两段式产物）
+    ts: Optional[float] = None            # 写入时间戳（初始=store 时刻）
+    gray: bool = False                    # 灰度标记（LMS_STORE_GRAY=1 期间 /store 条目）
 
 
 class MemoryManager:
@@ -320,7 +331,10 @@ class MemoryManager:
     def store_episodic(self, text: str, semantic_vector: torch.Tensor,
                        surprise: float, turn: int,
                        raw_semantic_vector: Optional[torch.Tensor] = None,
-                       source: str = 'external'
+                       source: str = 'external',
+                       info_value: Optional[float] = None,
+                       core: Optional[str] = None,
+                       gray: bool = False
                        ) -> None:
         """存入情景记忆条目（原始文本 + 语义向量）。
 
@@ -353,6 +367,11 @@ class MemoryManager:
                 L2 归一化）。提供时优先存入 episodic 缓冲区用于高精度检索。
             source: 条目来源标记。``'external'`` 表示来自外部对话，
                 ``'self_ref'`` 表示来自自指回路。默认 ``'external'``。
+            info_value: 提取层 v1.4 价值分数（0.7×surprise_norm + 0.3×recall_hit）。
+                None 时用 0.0（冷启动，调用方后续可补写）。
+            core: 提取式压缩核心（≤300 字）。None 时不设。
+            gray: 灰度标记（LMS_STORE_GRAY=1 期间 /store 条目；source 应为
+                ``'store_gray'``，三重冻结：不参与重放/聚类/引用加固）。
         """
         # 优先存储原始高维向量；无原始向量时退化为投影向量（向后兼容）
         store_vector = (raw_semantic_vector if raw_semantic_vector is not None
@@ -375,6 +394,13 @@ class MemoryManager:
             # 体验层 D（设计 v1.1 §6.1）：摄入时初始化置信度场——
             # source_trust 按来源定（三路汇入①）
             source_trust=get_source_trust(source),
+            # 提取层 v1.4（S1-11）：wear 计时起点 = 写入 turn（丰碑 D1 §2.2）；
+            # ts = 写入墙钟时间戳（与轮次制正交）
+            last_reinforced_turn=turn,
+            ts=time.time(),
+            info_value=float(info_value if info_value is not None else 0.0),
+            core=core,
+            gray=bool(gray),
         )
         self._episodic_buffer.append(entry)
 
@@ -384,6 +410,7 @@ class MemoryManager:
             fallback_query: Optional[torch.Tensor] = None,
             source_filter: Optional[str] = 'external',
             count_reference: bool = True,
+            reinforce_turn: Optional[int] = None,
             ) -> List[Tuple[float, EpisodicEntry]]:
         """基于语义相似度检索情景记忆，返回 (相似度, 条目) 列表。
 
@@ -418,6 +445,10 @@ class MemoryManager:
                 reference_count（正向佐证，置信度三路汇入③）。默认 True
                 （内部召回 = 记忆被使用）；/react、/recall 等外部只读探针
                 传 False 保持零持久化（P0-12）。fail-open：计数异常静默。
+            reinforce_turn: 提取层 v1.4（P2-A/P2-B）——写侧引用加固：非 None 时
+                命中条目的 last_reinforced_turn 刷新为该轮次（wear 重新计时，
+                丰碑"引用自动加固"）。默认 None（不刷新，向后兼容）。
+                仅与 count_reference=True 联用（只读探针不加固）。
 
         返回:
             [(score, EpisodicEntry), ...]（按相似度降序，最多 top_k 条）；
@@ -482,9 +513,18 @@ class MemoryManager:
 
         # 体验层 D（设计 v1.1 §6.1）：record_reference 钩子——命中条目
         # reference_count +1（正向佐证，置信度重算链路③）。fail-open。
+        # 提取层 v1.4（P2-B）：写侧引用加固——count_reference=True 且传入
+        # reinforce_turn 时，同步刷新 last_reinforced_turn（wear 重新计时）。
+        # 命中条目的 reference_count 已由 count_reference 覆盖（P2-A：复用
+        # 现有字段为加固计数唯一权威，不新增 link_count）。
         if count_reference:
             for _score, entry in scored:
                 record_reference(entry)
+                if reinforce_turn is not None:
+                    try:
+                        entry.last_reinforced_turn = reinforce_turn
+                    except Exception:
+                        pass
 
         # 按相似度降序取 top_k
         k = min(top_k, len(scored))
@@ -494,11 +534,16 @@ class MemoryManager:
     def recall_episodic(self, query_vector: torch.Tensor,
                         top_k: int = 3,
                         fallback_query: Optional[torch.Tensor] = None,
-                        source_filter: Optional[str] = 'external'
+                        source_filter: Optional[str] = 'external',
+                        reinforce_turn: Optional[int] = None
                         ) -> List[EpisodicEntry]:
         """基于语义相似度检索情景记忆，返回最相关的文本条目。
 
         （0.5.0/T1.3 支撑：委托 _recall_episodic_scored()，行为与旧版一致。）
+
+        参数:
+            reinforce_turn: 提取层 v1.4——非 None 时命中条目刷新
+                last_reinforced_turn（写侧引用加固；默认 None 不刷新）。
 
         返回:
             最相关的 EpisodicEntry 列表（按相似度降序）。
@@ -506,7 +551,7 @@ class MemoryManager:
         """
         scored = self._recall_episodic_scored(
             query_vector, top_k=top_k, fallback_query=fallback_query,
-            source_filter=source_filter)
+            source_filter=source_filter, reinforce_turn=reinforce_turn)
         return [entry for _, entry in scored]
 
     def recall_episodic_scored(
@@ -515,6 +560,7 @@ class MemoryManager:
             fallback_query: Optional[torch.Tensor] = None,
             source_filter: Optional[str] = 'external',
             count_reference: bool = True,
+            reinforce_turn: Optional[int] = None,
             ) -> List[Tuple[float, EpisodicEntry]]:
         """带相似度分数的情景检索（只读，0.5.0/T1.3 /recall 端点使用）。
 
@@ -528,13 +574,16 @@ class MemoryManager:
             source_filter: 来源过滤（默认 'external'）。
             count_reference: 体验层 D——命中是否计入 reference_count
                 （默认 True；外部只读探针传 False 保持零持久化）。
+            reinforce_turn: 提取层 v1.4——非 None 时命中条目刷新
+                last_reinforced_turn（写侧引用加固；默认 None 不刷新）。
 
         返回:
             [(score, EpisodicEntry), ...]（按相似度降序，最多 top_k 条）。
         """
         return self._recall_episodic_scored(
             query_vector, top_k=top_k, fallback_query=fallback_query,
-            source_filter=source_filter, count_reference=count_reference)
+            source_filter=source_filter, count_reference=count_reference,
+            reinforce_turn=reinforce_turn)
 
     # ------------------------------------------------------------------ #
     #  公开缓冲区访问接口
