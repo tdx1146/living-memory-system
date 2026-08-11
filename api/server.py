@@ -211,6 +211,10 @@ class FeedRequest(BaseModel):
     text: str = Field(..., description="总线事件文本摘要（喂入塑形输入侧）")
     session_id: str = Field("bus", description="会话标识（默认 bus，与总线隔离）")
     source: str = Field("event_bus", description="事件来源标记")
+    # 提取层 v1.4（S1-2，纯增量）：llm_output（可选，塑形带上一轮回复）
+    # 与 sender（可选，来源标识，仅日志/观测用）
+    llm_output: str = Field("", description="上一轮LLM输出（可选，塑形输入）")
+    sender: str = Field("", description="事件发送方标识（可选，观测用）")
 
 
 class FeedResponse(BaseModel):
@@ -524,12 +528,16 @@ async def feed(req: FeedRequest):
             detail="系统正在做梦（记忆巩固中），请稍后重试。")
     try:
         # 塑形但不产 LLM 回复：返回值是记忆 context，直接丢弃
+        # 提取层 v1.4（S1-2）：llm_output 透传进塑形（可选；sender 仅日志）
         await asyncio.get_event_loop().run_in_executor(
-            None, lambda: loop.process_turn(req.text, llm_output=""))
+            None, lambda: loop.process_turn(
+                req.text, llm_output=req.llm_output))
         status = loop.get_status()
         logger.info(
             f"[{req.session_id}] /feed 塑形完成 "
-            f"(source={req.source}, text_len={len(req.text)})")
+            f"(source={req.source}, sender={req.sender or '-'}, "
+            f"text_len={len(req.text)}, "
+            f"llm_output_len={len(req.llm_output)})")
     finally:
         scheduler.release_conversation(req.session_id)
 
