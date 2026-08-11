@@ -7,6 +7,7 @@
 端点概览:
     POST   /chat              完整对话（手动控制 LLM 注入时机）
     POST   /chat/simple       简化对话（自动处理记忆+LLM查询）
+    POST   /react             实时反应只读（体验层 A：infer-only 零持久化）
     POST   /recall            只读情景检索（T1.3/P0-9：不 process_turn、不调 LLM）
     GET    /status/{sid}      查询会话记忆状态
     POST   /snapshot/{sid}    保存快照
@@ -149,6 +150,34 @@ class RestoreRequest(BaseModel):
 class DreamRequest(BaseModel):
     steps: int = Field(20, description="做梦步数")
     full_cycle: bool = Field(False, description="是否启用完整七阶段周期")
+
+
+class ReactRequest(BaseModel):
+    """体验层 A（设计 v1.1 §3.1）：/react 实时反应只读请求。
+
+    infer-only 零持久化：不 learn / 不 adjust / 不落 episodic /
+    不写回 sigma / turn_count 不变（P0-12 防查询回声零回归）。
+    """
+    user_input: str = Field(..., description="当前用户输入文本（必填，非空）")
+    session_id: str = Field("main", description="会话标识")
+    k: int = Field(0, description="检索条数 [0,10]，0=只要反应+解读（插件用，轻量）")
+    # 兼容旧客户端 sid 字段（与 ChatRequest 同策略，防静默丢弃）
+    sid: Optional[str] = Field(None, description="session_id 兼容别名（旧客户端）")
+
+    @model_validator(mode="after")
+    def _apply_sid_alias(self) -> "ReactRequest":
+        """旧客户端 sid → session_id 映射（与 RecallRequest 的 P0-3 兼容同款）。"""
+        if self.sid is not None:
+            if self.session_id == "main":
+                self.session_id = self.sid
+                logger.warning(
+                    f"[ReactRequest] 兼容字段 sid='{self.sid}' 已映射为 session_id"
+                    "（P0-3 兼容；新客户端请直接使用 session_id）")
+            elif self.session_id != self.sid:
+                logger.warning(
+                    f"[ReactRequest] 同时收到 session_id='{self.session_id}' 与 "
+                    f"sid='{self.sid}'，以 session_id 为准（P0-3 兼容告警）")
+        return self
 
 
 class RecallRequest(BaseModel):
@@ -513,6 +542,45 @@ async def feed(req: FeedRequest):
         turn_count=int(status.get("turn_count", 0) or 0),
         session_id=req.session_id,
     )
+
+
+@app.post("/react")
+async def react(req: ReactRequest):
+    """实时反应只读端点（体验层 A，设计 v1.1 §3.1-3.2）。
+
+    编码 → infer(update_internal_state=False) → 解读 → 返回。
+    **零持久化**（P0-12 防查询回声零回归）：不 learn / 不 purpose.adjust /
+    不 memory.update / 不落 episodic / 不写回 sigma / turn_count 不变；
+    唯一新状态是 loop.react_surprise_history（内存 deque，不落盘不进快照）。
+
+    - 会话不存在时惰性创建空脑（与 /recall 一致，创建本身不产生记忆写入）
+    - 不做长时潜变量 recall / 不 acquire_conversation（对齐 /recall
+      无锁只读先例；做梦写 J 期间瞬时读不一致可接受，fail-open）
+    - 任何内部异常 → 500（调用方 fail-open 降级，不阻塞主循环）
+    """
+    if not req.user_input or not req.user_input.strip():
+        raise HTTPException(status_code=400, detail="user_input 不能为空")
+    k = max(0, min(int(req.k), 10))  # 钳制到 [0,10]
+
+    sm = get_session_manager()
+    loop = sm.get_or_create(req.session_id)
+
+    t0 = time.time()
+    try:
+        data = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: loop.react_readonly(req.user_input, k=k))
+    except Exception as e:
+        # 只读路径异常：500（调用方 fail-open 降级，不阻塞主循环）
+        logger.error(f"[{req.session_id}] /react 实时反应失败: {e}")
+        raise HTTPException(
+            status_code=500, detail=f"实时反应失败: {e}")
+    duration_ms = round((time.time() - t0) * 1000, 1)
+
+    return {
+        "session_id": req.session_id,
+        **data,
+        "duration_ms": duration_ms,
+    }
 
 
 @app.post("/recall")

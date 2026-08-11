@@ -238,6 +238,73 @@ class Decoder:
             del self.surprise_history[:len(self.surprise_history) -
                                       self.max_surprise_history]
 
+    # ------------------------------------------------------------------
+    # 体验层 A（设计 v1.1 §3.3）：/react 实时反应的解读段组装
+    # ------------------------------------------------------------------
+
+    def build_react_interpretation(
+        self, activation: Activation, coherence: Optional[float] = None,
+        surprise_window: Optional[List[float]] = None) -> str:
+        """组装 /react 实时反应的自然语言解读段（体验层 A）。
+
+        复用熵解读（_interpret_entropy）与 coherence 解读
+        （_interpret_coherence）模板（本体不动、逐字复用）；惊讶解读用
+        传入的 /react 自有窗口（surprise_window）做等价实现
+        （_interpret_surprise_window）——**不触碰 self.surprise_history**
+        （/chat 路径共享窗口，零回归，惊讶度修复成果不动）。
+
+        参数:
+            activation: 海马体激活态。
+            coherence: 目的层一致性（可选，None 时跳过该项解读）。
+            surprise_window: /react 自有惊讶度窗口（不含当前值；
+                None 或不足 3 条时跳过惊讶解读）。
+
+        返回:
+            "｜".join(非空解读)；全空 → 回退 "记忆状态平稳"。
+        """
+        parts: List[str] = []
+        # 熵解读（恒有：熵是核心状态指标）
+        parts.append(self._interpret_entropy(activation))
+        # 惊讶解读（/react 自有窗口等价实现）
+        si = self._interpret_surprise_window(surprise_window,
+                                             activation.surprise)
+        if si:
+            parts.append(si)
+        # coherence 解读（未传入时跳过，向后兼容）
+        ci = self._interpret_coherence(coherence)
+        if ci:
+            parts.append(ci)
+        joined = "｜".join(p for p in parts if p)
+        return joined if joined else "记忆状态平稳"
+
+    def _interpret_surprise_window(
+        self, window: Optional[List[float]], surprise: float
+    ) -> Optional[str]:
+        """惊讶解读的 /react 自有窗口等价实现（不读 self.surprise_history）。
+
+        与 _interpret_surprise 相同的相对差判据（±0.2、<3 条跳过），
+        只是窗口由调用方传入（/react 用 loop.react_surprise_history），
+        保证 /chat 路径（decoder 共享窗口）零回归。
+
+        参数:
+            window: 历史惊讶度窗口（不含当前值）。
+            surprise: 当前轮次的惊讶度（准确性项，恒≥0）。
+
+        返回:
+            惊讶度解读文本，或 None（历史数据不足/无明显偏离时）。
+        """
+        if not window or len(window) < 3:
+            return None
+        mean_surprise = sum(window) / len(window)
+        # 用均值的绝对值作为尺度，避免负数均值下乘法比较的符号翻转
+        scale = abs(mean_surprise) if abs(mean_surprise) > 1e-6 else 1.0
+        relative_diff = (surprise - mean_surprise) / scale
+        if relative_diff > 0.2:
+            return "这个输入让我感到意外，正在学习新内容"
+        elif relative_diff < -0.2:
+            return "这个输入与已有记忆高度吻合"
+        return None
+
     def _build_detail(self, activation: Activation) -> str:
         """构建"详细数据"段落：熵、惊讶度与强激活节点（保留旧格式）。
 

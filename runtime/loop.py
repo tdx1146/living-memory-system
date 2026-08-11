@@ -13,6 +13,7 @@ import os
 import math
 import time
 import logging
+from collections import deque
 from pathlib import Path
 from typing import Optional
 from concurrent.futures import ThreadPoolExecutor
@@ -214,6 +215,12 @@ class LivingMemoryLoop:
         self.consolidation_interval = consolidation_interval
         # 在线熵管理：记录最后一轮的 entropy_ratio（entropy / max_entropy）
         self.last_entropy_ratio = 0.0
+
+        # 体验层 A（设计 v1.1 §3.2）：/react 实时反应的惊讶度自有窗口。
+        # 纯内存 deque（maxlen=200），不落盘、不进快照、重启即失；
+        # 与 decoder 共享窗口（self.surprise_history，/chat 路径在用）隔离，
+        # /react 解读零污染 /chat 路径（惊讶度修复 P0-12 零回归）。
+        self.react_surprise_history: deque = deque(maxlen=200)
 
         # 元可塑性控制器（可选，根据 config 决定是否启用）
         self.meta = None
@@ -762,6 +769,127 @@ class LivingMemoryLoop:
             if text:
                 results.append({'text': text, 'score': float(score)})
         return results
+
+    # ================================================================== #
+    #  体验层 A（设计 v1.1 §3）：/react 实时反应只读接口（纯 infer 不 store）
+    # ================================================================== #
+
+    def react_readonly(self, user_input: str, k: int = 3) -> dict:
+        """实时反应只读接口（/react 端点后端，infer-only）。
+
+        编码 → FEP 推断 → 解读 → 返回。零持久化（设计 v1.1 §3.2 定案，
+        P0-12 防查询回声零回归）：
+          - 不 learn（不调 attractor.learn，不碰 J）
+          - 不 purpose.adjust（只读 get_precision() + 元调整只读应用）
+          - 不 memory.update / 不落 episodic（不调 store_episodic）
+          - 不写回 sigma（update_internal_state=False，E-P2-5 现成机制）
+          - turn_count 不变（只读锚点，对齐 /recall 惯例）
+          - 不做长时潜变量 recall / 不 acquire_conversation（对齐 /recall
+            无锁只读先例；做梦写 J 期间的瞬时读不一致可接受）
+        唯一可变状态：self.react_surprise_history（内存 deque，不落盘
+        不进快照）——/react 是"读"，反应不是大脑轮次。
+
+        参数:
+            user_input: 当前用户输入文本。
+            k: 检索条数 [0,10]；0 = 只要反应+解读（插件用，轻量）。
+
+        返回:
+            {turn_count, reaction, interpretation, recalled, detail} 字典。
+        """
+        text = user_input
+        # 1. 编码（与 process_turn 相同：只对当前输入反应，不带 llm_output）
+        sensory_input = self.encoder.encode(
+            text, self.tokenizer, self.embedder)
+
+        # 1.5 语义向量（用于检索，同 process_turn 1.5）
+        semantic_vector = None
+        raw_semantic_vector = None
+        if hasattr(self.embedder, 'embed_text'):
+            semantic_vector = self.embedder.embed_text(text)
+            if hasattr(self.embedder, 'embed_text_raw'):
+                raw_semantic_vector = self.embedder.embed_text_raw(text)
+
+        # --- 元可塑性：调整后参数只读应用（不更新 meta）---
+        _effective_lr, _meta_temp, _meta_orth, _meta_cw = \
+            self._get_meta_adjusted_params()
+
+        # 2. FEP 推断（★ update_internal_state=False：不写回 self.sigma）
+        precision = self.purpose.get_precision()
+        activation = self.attractor.infer(
+            sensory_input.vector, precision,
+            num_steps=self.config.get('num_infer_steps', 10),
+            temperature_override=_meta_temp,
+            update_internal_state=False,
+        )
+
+        # 5. 只读情景检索（k>0 时；体验层 A 阶段无 record_reference 钩子，
+        #    不产生任何引用计数副作用）
+        recalled = []
+        if k > 0:
+            query_vec = (raw_semantic_vector if raw_semantic_vector is not None
+                         else semantic_vector)
+            if query_vec is not None:
+                try:
+                    scored = self.memory.recall_episodic_scored(
+                        query_vec, top_k=k, fallback_query=semantic_vector,
+                        source_filter='external')
+                    for score, entry in scored:
+                        if getattr(entry, 'text', None):
+                            recalled.append({
+                                'text': entry.text,
+                                'score': float(score),
+                                'origin': 'memory',
+                            })
+                except Exception as e:  # pylint: disable=broad-except
+                    # fail-open：只读检索异常不阻塞反应返回
+                    logger.warning(
+                        "react_readonly 只读检索失败（fail-open）: %s", e)
+
+        # 6. 记忆状态解读（decoder 组装函数：复用熵/coherence 模板，
+        #    惊讶解读用 /react 自有窗口的等价实现，_interpret_surprise 本体不动）
+        surprise_window = list(self.react_surprise_history)
+        interpretation = self.decoder.build_react_interpretation(
+            activation, self.purpose.coherence, surprise_window)
+
+        # 7. 唯一可变状态：记录惊讶度到 /react 自有窗口
+        #    （在解读之后记录，避免当前值参与自身均值比较）
+        self.react_surprise_history.append(activation.surprise)
+
+        # 详细数据（向后兼容格式，复用 decoder._build_detail）
+        detail = self.decoder._build_detail(activation)
+
+        # 反应指标（surprise/free_energy 语义一字不动：准确性项恒≥0）
+        max_entropy = (math.log(self.attractor.num_nodes)
+                       if self.attractor.num_nodes > 1 else 1.0)
+        entropy_ratio = (activation.entropy / max_entropy
+                         if max_entropy > 0 else 0.0)
+        surprise_z = None
+        if len(surprise_window) >= 3:
+            mean_s = sum(surprise_window) / len(surprise_window)
+            std_s = (sum((v - mean_s) ** 2 for v in surprise_window)
+                     / len(surprise_window)) ** 0.5
+            if std_s > 1e-8:
+                surprise_z = round(
+                    (activation.surprise - mean_s) / std_s, 3)
+
+        reaction = {
+            'entropy': round(float(activation.entropy), 4),
+            'entropy_ratio': round(float(entropy_ratio), 4),
+            'surprise': round(float(activation.surprise), 4),
+            'free_energy': round(float(activation.free_energy), 4),
+            'mse': (round(float(activation.mse), 4)
+                    if activation.mse is not None else None),
+            'coherence': round(float(self.purpose.coherence), 4),
+            'precision_mean': round(float(precision.mean()), 4),
+            'surprise_z': surprise_z,
+        }
+        return {
+            'turn_count': self.turn_count,
+            'reaction': reaction,
+            'interpretation': interpretation,
+            'recalled': recalled,
+            'detail': detail,
+        }
 
     # ================================================================== #
     #  T2.3 检索扩容：归档导出 + 合并检索（内存活体优先、归档补充）
