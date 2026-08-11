@@ -1052,7 +1052,12 @@ class LivingMemoryLoop:
             本次新增的归档条目数。
         """
         from core.archive.archive_store import export_episodic
-        entries = list(self.memory.iter_episodic())
+        # 提取层 v1.4（S1-1，灰度三重冻结闭环）：store_gray 条目不进归档——
+        # 内存路径由 source_filter='external' 过滤，归档若导出 gray 则 /recall
+        # 的归档补充检索会绕过内存过滤泄漏 gray（L1 不可见被破坏）。灰度
+        # 观察通道 = status/episodic 尾部直接抽查（非 /recall）。
+        entries = [e for e in self.memory.iter_episodic()
+                   if getattr(e, 'source', 'external') != 'store_gray']
         if not entries:
             return 0
         return export_episodic(

@@ -227,11 +227,162 @@ class FeedResponse(BaseModel):
     session_id: str = Field(..., description="会话标识")
 
 
+# ---------------------------------------------------------------------------
+# 提取层 v1.4（S1-1）：/store 请求/响应模型
+# ---------------------------------------------------------------------------
+class StoreRequest(BaseModel):
+    """提取层写侧入口：{session_id, user_input, llm_output}。
+
+    流程（§7.1）：幂等去重（60s）→ 提取核心（≤300 字，S1-5）→ 分段标记
+    （S1-3，观测）→ process_turn(user_input, 核心)（embed 3 处全包熔断）
+    → 条目 meta（info_value/core/ts/gray，S1-11 字段）→ 写侧引用加固
+    （process_turn 内部检索即匹配，P2-B）。
+    """
+    user_input: str = Field(..., description="用户输入文本")
+    session_id: str = Field("main", description="会话标识（白名单，默认 main）")
+    llm_output: str = Field("", description="AI 长回复（提取核心 ≤300 字后塑形）")
+    # 兼容旧客户端 sid 字段（与 ChatRequest 同策略，防静默丢弃）
+    sid: Optional[str] = Field(None, description="session_id 兼容别名（旧客户端）")
+
+    @model_validator(mode="after")
+    def _apply_sid_alias(self) -> "StoreRequest":
+        """旧客户端 sid → session_id 映射（与 RecallRequest 的 P0-3 兼容同款）。"""
+        if self.sid is not None:
+            if self.session_id == "main":
+                self.session_id = self.sid
+                logger.warning(
+                    f"[StoreRequest] 兼容字段 sid='{self.sid}' 已映射为 session_id"
+                    "（P0-3 兼容；新客户端请直接使用 session_id）")
+            elif self.session_id != self.sid:
+                logger.warning(
+                    f"[StoreRequest] 同时收到 session_id='{self.session_id}' 与 "
+                    f"sid='{self.sid}'，以 session_id 为准（P0-3 兼容告警）")
+        return self
+
+
+class StoreResponse(BaseModel):
+    """/store 响应（H-7：required_fields 补 value_filtered/core_chars）。"""
+    session_id: str = Field(..., description="会话标识")
+    turn_count: int = Field(0, description="该会话累计轮次")
+    stored: bool = Field(False, description="是否已落 episodic")
+    dedup_hit: bool = Field(False, description="幂等去重命中（窗口内同 payload）")
+    value_filtered: bool = Field(True, description="通过价值过滤（论文判据 info_value≥阈值）")
+    core_chars: int = Field(0, description="提取核心字符数（≤300）")
+    gray: bool = Field(False, description="灰度标记（LMS_STORE_GRAY=1 期间为 true）")
+    surprise: float = Field(0.0, description="本轮惊讶度（FEP 预测误差）")
+    info_value: float = Field(0.0, description="价值分数（0.7×surprise_norm+0.3×recall_hit）")
+    reason: Optional[str] = Field(None, description="未存储原因（filtered_garbage 等）")
+
+
+# ---------------------------------------------------------------------------
 # /feed 限流状态（默认 ≤10 次/分钟，防总线风暴；LMS_FEED_RATE_LIMIT 可覆盖）
 _feed_rate = {"window_start": 0.0, "count": 0}
 _feed_rate_lock = asyncio.Lock()
 _FEED_RATE_LIMIT = int(os.environ.get("LMS_FEED_RATE_LIMIT", "10"))
 _FEED_RATE_WINDOW = 60.0
+
+
+# ---------------------------------------------------------------------------
+# 提取层 v1.4（S1-1）：/store 状态——幂等去重 + 每会话限流 + 503 计数
+# ---------------------------------------------------------------------------
+_store_dedup: dict = {}          # {session_id: {dedup_key: ts}}
+_store_dedup_lock = threading.Lock()
+
+_store_rate: dict = {}           # {session_id: (window_start, count)}
+_store_rate_lock = asyncio.Lock()
+STORE_RATE_WINDOW = 60.0
+# 503 计数（P3：degraded 观测；进灰度仪表）
+_store_503_count = 0
+_store_503_lock = threading.Lock()
+
+
+# 提取层 v1.4（S1-1）：运行时可调参数——请求时读取 env（灰度"随时可关"语义：
+# LMS_STORE_GRAY/LMS_STORE_RATE_LIMIT/LMS_STORE_DEDUP_WINDOW/
+# LMS_STORE_SESSION_ALLOWLIST 改动即时生效，无需重启）
+def _store_gray_enabled() -> bool:
+    """灰度标记开关（LMS_STORE_GRAY=1 期间 /store 条目带 gray 标记）。"""
+    return os.environ.get("LMS_STORE_GRAY", "0") == "1"
+
+
+def _store_rate_limit() -> int:
+    """每会话限流上限（默认 30/分；灰度期建议 10）。"""
+    try:
+        return max(1, int(os.environ.get("LMS_STORE_RATE_LIMIT", "30") or 30))
+    except (TypeError, ValueError):
+        return 30
+
+
+def _store_dedup_window() -> float:
+    """幂等去重窗口秒数（默认 60）。"""
+    try:
+        return max(1.0, float(
+            os.environ.get("LMS_STORE_DEDUP_WINDOW", "60") or 60))
+    except (TypeError, ValueError):
+        return 60.0
+
+
+def _store_session_allowlist() -> set:
+    """会话白名单（默认 {main}；M6：验收全用 main）。"""
+    raw = os.environ.get("LMS_STORE_SESSION_ALLOWLIST", "main").strip()
+    allow = {s.strip() for s in raw.split(",") if s.strip()}
+    return allow or {"main"}
+
+
+def _store_dedup_key(user_input: str, llm_output: str) -> str:
+    """幂等键：sha256(user_input, llm_output)（工程惯例，设计附录 B 标注）。"""
+    return hashlib.sha256(
+        f"{user_input}\x00{llm_output}".encode("utf-8")).hexdigest()
+
+
+def _store_dedup_hit(session_id: str, key: str,
+                     window: Optional[float] = None) -> bool:
+    """滑动窗口幂等去重：窗口内同 payload → True（不重复处理）。"""
+    window = _store_dedup_window() if window is None else window
+    now = time.time()
+    with _store_dedup_lock:
+        bucket = _store_dedup.setdefault(session_id, {})
+        expired = [k for k, ts in bucket.items() if now - ts > window]
+        for k in expired:
+            bucket.pop(k, None)
+        if key in bucket:
+            return True
+        bucket[key] = now
+        return False
+
+
+async def _store_rate_check(session_id: str) -> Optional[float]:
+    """每会话滑动窗口限流（B7：限流每会话桶）；超限返回剩余等待秒数。"""
+    limit = _store_rate_limit()
+    now = time.time()
+    async with _store_rate_lock:
+        ws, count = _store_rate.get(session_id, (0.0, 0))
+        if now - ws >= STORE_RATE_WINDOW:
+            ws, count = now, 0
+        count += 1
+        _store_rate[session_id] = (ws, count)
+        if count > limit:
+            return max(1.0, STORE_RATE_WINDOW - (now - ws))
+        return None
+
+
+def _store_count_503() -> int:
+    """store_503_count += 1（线程安全）；返回累计值。"""
+    global _store_503_count
+    with _store_503_lock:
+        _store_503_count += 1
+        return _store_503_count
+
+
+def store_503_count() -> int:
+    """读取 store_503_count（观测用）。"""
+    global _store_503_count
+    with _store_503_lock:
+        return _store_503_count
+
+
+def _store_session_allowed(session_id: str) -> bool:
+    """会话白名单判据（默认 {main}；M6：验收全用 main）。"""
+    return session_id in _store_session_allowlist()
 
 
 async def _feed_rate_check() -> Optional[float]:
@@ -550,6 +701,195 @@ async def feed(req: FeedRequest):
         turn_count=int(status.get("turn_count", 0) or 0),
         session_id=req.session_id,
     )
+
+
+# ---------------------------------------------------------------------------
+# 提取层 v1.4（S1-1）：/store 端点——提取层写侧入口
+# ---------------------------------------------------------------------------
+@app.post("/store", response_model=StoreResponse)
+async def store(req: StoreRequest):
+    """提取层写侧入口（腿 1，S1-1）。
+
+    流程（§7.1）：
+      1. 会话白名单（LMS_STORE_SESSION_ALLOWLIST，默认 main）→ 非白名单 422
+      2. 每会话限流（B7：限流每会话桶；默认 30/分，灰度期建议 10）
+      3. 幂等去重（sha256(user_input,llm_output)，60s 窗口）→ 命中不重复处理
+      4. 提取核心（≤300 字，两段式，S1-5）＋分段标记（S1-3，观测）
+      5. process_turn(user_input, 核心)（embed 3 处全包熔断，S1-7）——
+         内部检索即写侧引用加固（P2-B：count_reference=True 默认路径＋
+         reinforce_turn 刷新，跳过 gray 天然满足）
+      6. 后处理新条目 meta：core/info_value/ts/gray/source（S1-11 字段）
+
+    熔断降级（P3）：写侧 embed 熔断 → 503＋Retry-After:30＋degraded 响应体
+    （插件 fail-open 不重试）；store_503_count 计数（进灰度仪表）。
+
+    M5 语义：永不整轮丢——低价值条目仍存储，value_filtered 只做标记。
+    """
+    if not req.user_input or not req.user_input.strip():
+        raise HTTPException(status_code=400, detail="user_input 不能为空")
+
+    # 1. 会话白名单（M6：验收全用 main，白名单默认行为被测到）
+    if not _store_session_allowed(req.session_id):
+        raise HTTPException(
+            status_code=422,
+            detail=(f"会话 '{req.session_id}' 不在 /store 白名单"
+                    "（LMS_STORE_SESSION_ALLOWLIST，默认 main）"))
+
+    # 2. 每会话限流
+    retry_after = await _store_rate_check(req.session_id)
+    if retry_after is not None:
+        raise HTTPException(
+            status_code=429,
+            detail=(f"store 限流：超过 {_store_rate_limit()} 次/分钟，"
+                    "请稍后重试"),
+            headers={"Retry-After": str(int(math.ceil(retry_after)))},
+        )
+
+    sm = get_session_manager()
+    loop = sm.get_or_create(req.session_id)
+
+    # 3. 幂等去重（60s 窗口）
+    dedup_key = _store_dedup_key(req.user_input, req.llm_output)
+    if _store_dedup_hit(req.session_id, dedup_key):
+        logger.info(
+            f"[{req.session_id}] /store 幂等命中（窗口内同 payload，不重复处理）")
+        return StoreResponse(
+            session_id=req.session_id,
+            turn_count=loop.turn_count,
+            stored=True,          # 该内容此前已落库
+            dedup_hit=True,
+            value_filtered=True,
+            core_chars=0,
+            gray=False,
+            surprise=0.0,
+            info_value=0.0,
+        )
+
+    # 4. 提取核心（≤300 字）+ 分段标记（观测）
+    from api.extract_core import extract_core
+    from api.segment_reply import segment_reply
+    core = extract_core(req.llm_output)
+    try:
+        segments = segment_reply(core or req.llm_output)
+    except Exception:  # pylint: disable=broad-except
+        segments = []
+
+    # 5. 做梦协调（与 /chat//feed 同等对待，防并发写记忆状态）
+    scheduler = get_dream_scheduler()
+    scheduler.register_session(req.session_id)
+    acquired = scheduler.acquire_conversation(req.session_id)
+    scheduler.touch(req.session_id)
+    if not acquired:
+        raise HTTPException(
+            status_code=503,
+            detail="系统正在做梦（记忆巩固中），请稍后重试。")
+
+    epi_before = loop.memory.episodic_size()
+    gray = _store_gray_enabled()
+    try:
+        # 5a. process_turn（embed 3 处全包熔断；核心 ≤300 字塑形）
+        try:
+            await asyncio.get_event_loop().run_in_executor(
+                None, lambda: loop.process_turn(req.user_input, core))
+        except Exception as e:  # pylint: disable=broad-except
+            # 熔断 CLOSED 窗口 embed 裸抛（既有行为）→ 503 fail-open
+            # （C-05 先例：503 属预期失败，插件不重试不进死信）
+            _store_count_503()
+            logger.error(f"[{req.session_id}] /store 塑形失败（503）: {e}")
+            from fastapi.responses import JSONResponse
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "status": "degraded",
+                    "reason": "embed_unavailable",
+                    "turn": loop.turn_count,
+                },
+                headers={"Retry-After": "30"},
+            )
+
+        # 5b. 熔断降级检测（P3 ②）：写侧语义向量失败 → 本轮不落库 → 503
+        if loop.memory.episodic_size() == epi_before and getattr(
+                loop, 'last_turn_degraded', False):
+            _store_count_503()
+            logger.warning(
+                f"[{req.session_id}] /store embed 熔断降级 → 503"
+                "（不落僵尸：无向量条目=检索不可达）")
+            from fastapi.responses import JSONResponse
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "status": "degraded",
+                    "reason": "embed_circuit_open",
+                    "turn": loop.turn_count,
+                },
+                headers={"Retry-After": "30"},
+            )
+
+        # 6. 后处理新条目 meta（S1-11 字段：core/info_value/ts/gray/source）
+        entries = list(loop.memory.iter_episodic())
+        new_entry = entries[-1] if entries else None
+        stored = False
+        reason = None
+        info_value = 0.0
+        if new_entry is not None and \
+                loop.memory.episodic_size() > epi_before:
+            new_entry.core = core or None
+            new_entry.ts = time.time()
+            if gray:
+                # 灰度标记：三重冻结（不参与重放/聚类/引用加固；
+                # L1 天然不可见：source_filter='external' 过滤 store_gray）
+                new_entry.gray = True
+                new_entry.source = 'store_gray'
+            # 价值分数（论文判据 §6.2；条目已带 process_turn 原生 surprise）
+            try:
+                from api.value_filter import (
+                    compute_info_value, value_filtered,
+                )
+                surprises = [float(getattr(e, 'surprise', 0.0) or 0.0)
+                             for e in entries]
+                refs = [float(getattr(e, 'reference_count', 0) or 0)
+                        for e in entries]
+                info_value = compute_info_value(
+                    surprise=float(getattr(new_entry, 'surprise', 0.0) or 0.0),
+                    reference_count=int(
+                        getattr(new_entry, 'reference_count', 0) or 0),
+                    surprise_max=max(surprises) if surprises else None,
+                    ref_count_max=max(refs) if refs else None,
+                    text=core or req.llm_output,
+                )
+                new_entry.info_value = info_value
+            except Exception as e:  # pylint: disable=broad-except
+                logger.warning(
+                    f"[{req.session_id}] /store info_value 计算失败（fail-open）: {e}")
+            stored = True
+        else:
+            # 未落库：垃圾过滤命中 / embedder 无语义编码（非熔断降级）
+            stored = False
+            reason = "filtered_garbage" if not getattr(
+                loop, 'last_turn_degraded', False) else "embed_circuit_open"
+
+        vf = True
+        try:
+            from api.value_filter import value_filtered
+            vf = value_filtered(info_value)
+        except Exception:  # pylint: disable=broad-except
+            pass
+
+        status = loop.get_status()
+        return StoreResponse(
+            session_id=req.session_id,
+            turn_count=loop.turn_count,
+            stored=stored,
+            dedup_hit=False,
+            value_filtered=vf,
+            core_chars=len(core),
+            gray=gray and stored,
+            surprise=float(status.get("last_surprise", 0.0) or 0.0),
+            info_value=round(info_value, 4),
+            reason=reason,
+        )
+    finally:
+        scheduler.release_conversation(req.session_id)
 
 
 @app.post("/react")
