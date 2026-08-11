@@ -37,6 +37,8 @@ _GARBAGE_TEXT_RE = [
     re.compile(r"^HEARTBEAT_OK\b", re.I),                           # 心跳回执
     re.compile(r"Your assigned task is in the sy", re.I),           # 任务派发样板（防截断变体）
     re.compile(r"\[Subagent Task\]", re.I),                        # 子代理任务样板（无前缀变体实证）
+    re.compile(r"\[Inter-session message\]", re.I),                # 跨会话转发样板（v1.4 S1-8）
+    re.compile(r"\[梦醒\]", re.I),                                 # 梦醒回路注入样板（v1.4 S1-8）
 ]
 _GARBAGE_FILTERED = 0  # 计数器（进程内，可被 status 读取）
 
