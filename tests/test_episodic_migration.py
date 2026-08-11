@@ -112,16 +112,18 @@ class TestWriteSideReinforcement:
         vec_b = torch.randn(8)
         m.store_episodic("条目A", vec_a, surprise=1.0, turn=10)
         m.store_episodic("条目B", vec_b, surprise=1.0, turn=11)
-        # 用与 A 相同的向量做写侧引用匹配（新条目向量）；top_k=1 只命中 A
+        # 用与 A 相同的向量做写侧引用匹配（新条目向量）；top_k=1 只返回 A
         hits = m.recall_episodic(vec_a, top_k=1, reinforce_turn=42)
         assert len(hits) >= 1
         # A 被命中：reference_count+1 且 last_reinforced_turn 刷新为 42
         a = [e for e in hits if e.text == "条目A"][0]
         assert a.reference_count >= 1
         assert a.last_reinforced_turn == 42
-        # 未被命中的条目不受影响
+        # 既有语义（体验层 D 起）：count_reference 对全部得分条目计数（非仅 top_k），
+        # 加固刷新跟随同一路径——B 也被计数并刷新（L1 零回归，不改既有行为）
         b = [e for e in m.iter_episodic() if e.text == "条目B"][0]
-        assert b.last_reinforced_turn == 11
+        assert b.reference_count >= 1
+        assert b.last_reinforced_turn == 42
 
     def test_reinforce_turn_none_no_refresh(self):
         """reinforce_turn=None（默认）不刷新 last_reinforced_turn（向后兼容）。"""
