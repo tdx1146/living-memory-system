@@ -107,8 +107,9 @@ class TestLegacyGarbageUnchanged:
             assert _is_garbage_text(t), f"旧垃圾规则失效: {t[:40]}"
 
     def test_garbage_re_count(self):
-        """正则条数 = 4 旧 + 6 新 = 10（纯增量，无删改）。"""
-        assert len(_GARBAGE_TEXT_RE) == 10
+        """正则条数 = 4 旧 + 6 新 + 2（v1.4 S1-8: [Inter-session message]/[梦醒]）
+        = 12（纯增量，无删改）。"""
+        assert len(_GARBAGE_TEXT_RE) == 12
 
     def test_garbage_filtered_counter(self):
         """_GARBAGE_FILTERED 计数可用（进程内，可被 status 读取）。"""
