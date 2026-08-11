@@ -16,10 +16,13 @@ consolidation（巩固）机制将短时记忆迁移到长时记忆，
 import os
 import re
 import time
+import logging
 import torch
 from collections import deque
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
+
+logger = logging.getLogger("core.hippocampus.memory")
 
 # 2026-08-10 设计回归：记忆入口垃圾过滤（dandan：回到首版精神）
 # 消息元数据包装/系统事件不是对话，不该进入海马体（此前误存污染召回）。
@@ -127,7 +130,8 @@ class MemoryManager:
                  replay_weight: float = 0.01,
                  consolidation_decay: float = 0.5,
                  buffer_capacity: int = 100,
-                 episodic_capacity: int = 200,
+                 episodic_capacity: int = 2000,
+                 episodic_hard_cap: Optional[int] = None,
                  device: Union[str, torch.device] = "auto",
                  replay_surprise_cap: Optional[float] = None,
                  norm_latent: Optional[bool] = None) -> None:
@@ -144,7 +148,12 @@ class MemoryManager:
             replay_weight: 巩固时回放的权重。
             consolidation_decay: 巩固后短时记忆的衰减系数。
             buffer_capacity: 经验缓冲区容量（用于回放）。
-            episodic_capacity: 情景记忆缓冲区容量（保存原始文本+语义向量）。
+            episodic_capacity: 情景记忆**软容量**（提取层 v1.4 S1-14：deque 无界化后
+                的显式容量守卫线，默认 2000；满员【不丢】＋告警（丰碑哲学：资源
+                丰富先不淘汰）；硬顶兜底（默认 5000）为工程兜底（超顶丢最旧＋
+                ERROR，标注非 D1 淘汰语义）。
+            episodic_hard_cap: 硬顶兜底条数（None 时读环境变量
+                LMS_EPISODIC_HARD_CAP，默认 5000）。测试可注入小值。
             device: 计算设备（E-P2-1）。支持 "auto"/"cpu"/"cuda"/"cuda:0"
                 或 torch.device。短时/长时潜变量将创建在该设备上。
                 存入缓冲区的激活态和语义向量也会迁移到该设备。
@@ -165,6 +174,21 @@ class MemoryManager:
         self.replay_weight = replay_weight
         self.consolidation_decay = consolidation_decay
         self._buffer_capacity = buffer_capacity
+
+        # 提取层 v1.4（S1-14，P1-A 定案）：episodic 满员策略——deque 无界化
+        # （移除 maxlen，时间序 FIFO 淘汰不复存在）；显式容量守卫在
+        # store_episodic 内执行：软容量（默认 2000，满员不丢＋告警）、
+        # 硬顶兜底（5000，工程兜底非 D1 淘汰）、90% 预警线（软容量×0.9）。
+        self.episodic_capacity: int = int(episodic_capacity)
+        if episodic_hard_cap is None:
+            episodic_hard_cap = os.environ.get(
+                "LMS_EPISODIC_HARD_CAP", "5000")
+        self.episodic_hard_cap: int = int(episodic_hard_cap)
+        self._capacity_warning_raised: bool = False
+        # 容量守卫观测计数（S1-9 进 dream_state.json）
+        self.capacity_warning_events: int = 0
+        self.capacity_full_events: int = 0
+        self.capacity_hard_drops: int = 0
 
         # T2.8/P2-1：回放权重钳制（LMS_REPLAY_SURPRISE_CAP，默认 0=不钳制）
         if replay_surprise_cap is None:
@@ -192,7 +216,9 @@ class MemoryManager:
 
         # 情景记忆缓冲区：保存 (text, semantic_vector, surprise, turn)
         # 用于将记忆逆向解码为 LLM 可理解的语义文本
-        self._episodic_buffer: deque = deque(maxlen=episodic_capacity)
+        # 提取层 v1.4（S1-14）：deque(maxlen) → deque()（无界化，移除时间序
+        # FIFO 淘汰；容量由显式守卫 _enforce_episodic_capacity 管理）
+        self._episodic_buffer: deque = deque()
 
     def update(self, activation: Activation, surprise: float = 0.0,
                turn: Optional[int] = None) -> None:
@@ -403,6 +429,55 @@ class MemoryManager:
             gray=bool(gray),
         )
         self._episodic_buffer.append(entry)
+        # 提取层 v1.4（S1-14）：显式容量守卫（软容量不丢＋告警；硬顶兜底）
+        self._enforce_episodic_capacity()
+
+    def _enforce_episodic_capacity(self) -> None:
+        """提取层 v1.4（S1-14，P1-A）：episodic 显式容量守卫。
+
+        丰碑哲学：资源丰富先不淘汰，满了再说——deque 无界化后不再有
+        时间序 FIFO 自动淘汰，改由本守卫显式管理：
+          - 软容量（默认 2000）：满员【不丢】，告警＋capacity_full_events+1；
+          - 90% 预警线：logger.warning「episodic 接近容量，评估远期淘汰」
+            （濒危加速思想，无出处，工程决策）＋计数（仅跨线首次告警防刷屏）；
+          - 硬顶兜底（默认 5000）：超顶丢最旧＋logger.ERROR——标注：工程兜底，
+            非 D1 淘汰语义（资源失控保护；≈150 万字量级）。
+        观测计数（capacity_warning_events / capacity_full_events /
+        capacity_hard_drops）由 S1-9 汇总进 dream_state.json。
+        """
+        n = len(self._episodic_buffer)
+        soft = self.episodic_capacity
+        hard = self.episodic_hard_cap
+        warning_line = max(1, int(soft * 0.9))
+        try:
+            if n > hard:
+                # 硬顶兜底：丢最旧（工程兜底，非 D1 淘汰）
+                for _ in range(n - hard):
+                    self._episodic_buffer.popleft()
+                self.capacity_hard_drops += (n - hard)
+                logger.error(
+                    "episodic 超过硬顶 %d（当前 %d），丢弃最旧 %d 条"
+                    "（工程兜底，非 D1 淘汰语义）",
+                    hard, n, n - hard)
+                n = len(self._episodic_buffer)
+            elif n >= soft:
+                # 软容量满员：不丢（丰碑哲学），告警＋计数
+                self.capacity_full_events += 1
+                logger.warning(
+                    "episodic 容量已满 %d/%d，不淘汰（丰碑哲学）；"
+                    "满员持续 N 轮后评估远期 prune_when_full（归档非删除）",
+                    n, soft)
+            elif n >= warning_line and not self._capacity_warning_raised:
+                self._capacity_warning_raised = True
+                self.capacity_warning_events += 1
+                logger.warning(
+                    "episodic 接近容量 %d/%d（90%% 预警线），评估远期淘汰",
+                    n, soft)
+            elif n < warning_line:
+                self._capacity_warning_raised = False
+        except Exception as e:  # pylint: disable=broad-except
+            # fail-open：容量守卫异常不阻断存储主流程
+            logger.warning("episodic 容量守卫异常（fail-open）: %s", e)
 
     def _recall_episodic_scored(
             self, query_vector: torch.Tensor,
@@ -627,31 +702,32 @@ class MemoryManager:
         return iter(self._episodic_buffer)
 
     def get_episodic_maxlen(self) -> int:
-        """返回情景记忆缓冲区的最大容量。
+        """返回情景记忆缓冲区的有效容量上限。
 
-        返回 ``self._episodic_buffer.maxlen``，若为 None（无界）则回退到
-        默认值 200。用于上层模块在重建缓冲区时获取正确的容量上限。
+        提取层 v1.4（S1-14）：deque 已无界化（maxlen=None），返回软容量
+        （episodic_capacity，默认 2000）作为有效容量参考——满员不丢，
+        仅告警；硬顶兜底见 _enforce_episodic_capacity。
         """
-        return self._episodic_buffer.maxlen or 200
+        return int(getattr(self, 'episodic_capacity', 2000) or 2000)
 
     def replace_episodic_buffer(self, entries) -> int:
         """用 entries 重建情景记忆缓冲区，返回被剔除的条目数。
 
-        在保留原缓冲区容量上限（maxlen）的前提下，用新的条目序列替换
-        当前缓冲区内容。当 entries 长度超过 maxlen 时，deque 会自动
-        保留最新的条目（丢弃头部旧条目）。
+        提取层 v1.4（S1-14）：不再以 maxlen 做 FIFO 淘汰——重建为无界 deque，
+        仅当超过硬顶兜底（默认 5000）时才丢最旧（工程兜底）；软容量内
+        （≤2000）全部保留（丰碑哲学：满员不丢）。
 
         参数:
             entries: 可迭代的 EpisodicEntry 序列，用于重建缓冲区。
 
         返回:
             被剔除的条目数 = 旧缓冲区长度 - 新缓冲区长度。
-            （注意：若 entries 超过 maxlen，deque 内部淘汰的部分也计入
-            新缓冲区长度，因此返回值反映的是净变化量。）
+            （注意：若 entries 超过硬顶，守卫淘汰的部分计入新缓冲区长度，
+            返回值反映的是净变化量。）
         """
-        maxlen = self._episodic_buffer.maxlen or 200
         old_len = len(self._episodic_buffer)
-        self._episodic_buffer = deque(entries, maxlen=maxlen)
+        self._episodic_buffer = deque(entries)
+        self._enforce_episodic_capacity()
         return old_len - len(self._episodic_buffer)
 
     def get_state(self) -> dict:
@@ -697,13 +773,15 @@ class MemoryManager:
             self._buffer = deque(migrated_buffer, maxlen=maxlen)
         # 情景记忆缓冲区恢复（向后兼容：旧快照无此字段时跳过）
         if "episodic_buffer" in state:
-            maxlen = self._episodic_buffer.maxlen or 200
             # E-P2-1: episodic 向量迁移到当前 device
             migrated_episodic = []
             for entry in state["episodic_buffer"]:
                 entry.semantic_vector = entry.semantic_vector.to(self.device)
                 migrated_episodic.append(entry)
-            self._episodic_buffer = deque(migrated_episodic, maxlen=maxlen)
+            # 提取层 v1.4（S1-14）：恢复为无界 deque（不再带 maxlen 引入
+            # 时间序 FIFO 淘汰）；超硬顶由容量守卫兜底
+            self._episodic_buffer = deque(migrated_episodic)
+            self._enforce_episodic_capacity()
 
     def to(self, device: Union[str, torch.device]) -> 'MemoryManager':
         """将记忆管理器所有张量迁移到指定设备（E-P2-1）。
