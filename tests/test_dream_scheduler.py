@@ -163,9 +163,13 @@ def empty_mock_loop():
 
 
 @pytest.fixture(autouse=True)
-def _seed():
+def _seed(tmp_path, monkeypatch):
     """每个测试前固定随机种子，保证可复现。"""
     torch.manual_seed(42)
+    # 做梦观测文件隔离到 tmp（防真实 Loop 集成测试写脏仓库
+    # runtime/dream_state.json，S1-9）
+    monkeypatch.setenv("LMS_DREAM_STATE_PATH",
+                       str(tmp_path / "dream_state.json"))
 
 
 # ============================================================
