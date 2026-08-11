@@ -19,6 +19,7 @@
   - _busy_lock: 做梦期间锁定，对话请求通过 acquire_conversation() 等待
 """
 
+import json
 import os
 import time
 import logging
@@ -351,6 +352,9 @@ class DreamScheduler:
                 )
                 duration = time.time() - start_time
 
+                # 提取层 v1.4（S1-9）：做梦观测写入 LMS 仓 runtime/dream_state.json
+                self._write_dream_state(activity.session_id, result, loop)
+
                 # 更新活动记录
                 with self._lock:
                     act = self._activities.get(activity.session_id)
@@ -416,6 +420,9 @@ class DreamScheduler:
 
             result = loop.dream(n_steps=steps, full_cycle=full_cycle)
 
+            # 提取层 v1.4（S1-9）：做梦观测写入 LMS 仓 runtime/dream_state.json
+            self._write_dream_state(session_id, result, loop)
+
             with self._lock:
                 act = self._activities.get(session_id)
                 if act is not None:
@@ -436,6 +443,68 @@ class DreamScheduler:
     # ------------------------------------------------------------------ #
     #  状态查询
     # ------------------------------------------------------------------ #
+
+    def _write_dream_state(self, session_id: str, result: dict, loop) -> None:
+        """S1-9（M8 定案）：做梦观测写入 LMS 仓 runtime/dream_state.json。
+
+        记录 value_replay（replay_set_ids/scores/sampled_via_prob/
+        reinforced_ids/merged_count/superseded_count/wear_stats/
+        cluster_failed）＋容量观测（capacity_usage/full_events/hard_drops/
+        warning_events）＋熔断降级观测（degraded_events/last_turn_degraded）。
+
+        语义分离：沙漏仓那份 dream_state.json 记录"沙漏观测到的 LMS 做梦"，
+        本文件记录"LMS 做梦引擎自己的重放明细"，两文件不跨仓写。
+        fail-open：任何异常只记日志，不阻断做梦主流程。
+        """
+        try:
+            # M8 定案：LMS 仓 runtime/dream_state.json；LMS_DREAM_STATE_PATH
+            # 可覆盖（测试/部署隔离用，默认不设）
+            state_path = os.environ.get(
+                "LMS_DREAM_STATE_PATH") or os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                'dream_state.json')
+            vr = result.get('value_replay') or {}
+            state = {
+                'latest': {
+                    'session_id': session_id,
+                    'timestamp': time.time(),
+                    'status': result.get('status'),
+                    'mode': result.get('mode'),
+                    'steps': result.get('steps', 0),
+                    'replay_set_ids': vr.get('replay_set_ids', []),
+                    'scores': vr.get('scores', []),
+                    'sampled_via_prob': vr.get('sampled_via_prob', True),
+                    'reinforced_ids': vr.get('reinforced_ids', []),
+                    'merged_count': vr.get('merged_count', 0),
+                    'superseded_count': vr.get('superseded_count', 0),
+                    'wear_stats': vr.get('wear_stats', {}),
+                    'cluster_failed': vr.get('cluster_failed', False),
+                    'doubt_review': result.get('doubt_review'),
+                },
+                'capacity': {
+                    'usage': loop.memory.episodic_size(),
+                    'soft_limit': loop.memory.get_episodic_maxlen(),
+                    'full_events': int(getattr(
+                        loop.memory, 'capacity_full_events', 0) or 0),
+                    'hard_drops': int(getattr(
+                        loop.memory, 'capacity_hard_drops', 0) or 0),
+                    'warning_events': int(getattr(
+                        loop.memory, 'capacity_warning_events', 0) or 0),
+                },
+                'degraded': {
+                    'events': int(getattr(loop, 'degraded_events', 0) or 0),
+                    'last_turn_degraded': bool(
+                        getattr(loop, 'last_turn_degraded', False)),
+                },
+                'updated_at': time.time(),
+            }
+            os.makedirs(os.path.dirname(state_path), exist_ok=True)
+            tmp = state_path + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(state, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, state_path)
+        except Exception as e:  # pylint: disable=broad-except
+            logger.warning("dream_state.json 写入失败（fail-open）: %s", e)
 
     def get_status(self) -> dict:
         """返回调度器状态摘要。"""
