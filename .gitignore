@@ -44,3 +44,4 @@ snapshots/
 logs/
 *.lock
 *.bak-*
+runtime/dream_state.json
