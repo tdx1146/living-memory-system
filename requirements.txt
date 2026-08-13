@@ -1,27 +1,36 @@
 # 活体记忆系统 - 依赖
-# Python 3.10+, PyTorch 2.0+
+# Python 3.10+（生产实测 3.11.2）
+#
+# 版本策略（R-6，2026-08-13）：全部锁定为生产实测版本（本机 .venv 2026-08-13
+# 快照），保证新机器行为与生产一致、可复现。
+# torch 锁 CPU 版：避免新机器误拉 ~5GB CUDA 栈（nvidia-cudnn/cublas 等），
+# 下载体积 ~5GB → ~1.4GB；行为与生产 torch 2.5.1+cpu 一致。
+# 注：torch 2.5.1+cpu 的 linux wheel 同时存在于 PyPI 与 pytorch CPU index，
+# extra-index-url 为兜底（覆盖 PyPI 缺变体的情况）。
 
-# 深度学习框架
-torch>=2.0
+--extra-index-url https://download.pytorch.org/whl/cpu
 
-# 数值计算
-numpy>=1.21
+# 深度学习框架（CPU 版，防 CUDA 栈误拉）
+torch==2.5.1+cpu
+
+# 数值计算（numpy 2.4 起要求 Python≥3.11，放宽下限保 3.10 兼容；3.11+ 解析到 2.4.x 与生产一致）
+numpy>=2.0,<3
 
 # LLM API客户端（OpenAI兼容格式）
-openai>=1.0
+openai==2.51.0
 
 # HTTP 客户端（core/sensory/cloud_embedder.py 依赖；Phase 7 Docker 化修复）
-requests>=2.31
+requests==2.34.2
 
 # 预训练语义嵌入（感官层，可选但推荐）
-sentence-transformers>=2.2
+sentence-transformers==5.6.1
 
 # FastAPI 服务层（api 包）
-fastapi>=0.100
-uvicorn[standard]>=0.23
+fastapi==0.141.1
+uvicorn[standard]==0.52.0
 
 # MCP 协议层（mcp_memory_server 依赖）
-mcp>=1.0
+mcp==2.0.0
 
 # 测试框架（开发依赖）
-pytest>=7.0
+pytest==9.1.1
