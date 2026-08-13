@@ -25,7 +25,7 @@ P0 为安全与数据完整性红线问题，必须在任何新功能合入前�
 
 ```python
 os.environ.setdefault(
-    "DEEPSEEK_API_KEY", "sk-d91a6339112040a98c6f0617e6142307")
+    "DEEPSEEK_API_KEY", "sk-REPLACE_ME")
 ```
 
 同一 Key 还出现在 `mcp.json` 中，且已经进入 git 提交历史。
@@ -64,7 +64,7 @@ if not _DEEPSEEK_API_KEY:
 ```bash
 # 使用 git filter-repo 清理历史中的 Key（比 filter-branch 更安全高效）
 pip install git-filter-repo
-git filter-repo --replace-text <(echo "sk-d91a6339112040a98c6f0617e6142307==>***REDACTED***")
+git filter-repo --replace-text <(echo "sk-REPLACE_ME==>***REDACTED***")
 git push origin --force --all
 ```
 

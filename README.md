@@ -130,7 +130,7 @@ set -a; . ./.env; set +a
 `.env` 关键项：
 
 ```ini
-DEEPSEEK_API_KEY=sk-your-deepseek-api-key-here
+DEEPSEEK_API_KEY=sk-REPLACE_ME
 # LMS_LLM_BASE_URL=https://api.deepseek.com/v1
 # LMS_LLM_MODEL=deepseek-chat
 

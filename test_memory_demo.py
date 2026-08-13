@@ -12,7 +12,7 @@ _PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
-os.environ.setdefault("DEEPSEEK_API_KEY", "sk-d91a6339112040a98c6f0617e6142307")
+os.environ.setdefault("DEEPSEEK_API_KEY", "sk-REPLACE_ME")
 
 from api.config import get_api_config
 from runtime.loop import LivingMemoryLoop

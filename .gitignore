@@ -45,3 +45,11 @@ logs/
 *.lock
 *.bak-*
 runtime/dream_state.json
+
+# 密钥安全红线（2026-08-13 泄露事故后加固）
+.env.*
+!.env.example
+openclaw.json*
+*.pem
+*identity*.key
+secrets/
