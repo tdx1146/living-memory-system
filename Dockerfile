@@ -29,9 +29,9 @@ RUN pip install --no-cache-dir --upgrade pip setuptools wheel
 
 WORKDIR /app
 
-# 1) 先单独安装 CPU 版 torch
+# 1) 先单独安装 CPU 版 torch（版本与 requirements.txt 锁一致，保证可复现；避免拉最新版与依赖不兼容）
 #    指定 PyTorch 官方 CPU 索引，避免从 PyPI 拉取含 CUDA 的大体积 wheel（约 2GB -> 190MB）
-RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+RUN pip install --no-cache-dir torch==2.5.1+cpu --index-url https://download.pytorch.org/whl/cpu
 
 # 2) 安装其余 Python 依赖（torch 已满足 requirements 中的 torch>=2.0，不会重复下载）
 COPY requirements.txt .
