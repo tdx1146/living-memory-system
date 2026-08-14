@@ -17,6 +17,7 @@ import os
 import re
 import time
 import logging
+import math
 import torch
 from collections import deque
 from dataclasses import dataclass
@@ -98,6 +99,12 @@ class EpisodicEntry:
     violated_by: Optional[str] = None     # 违反它的输入文本摘要（证伪证据）
     last_recalled_at: Optional[float] = None  # 最近一次被召回时间（遗忘曲线用）
     recall_count: int = 0                 # 累计召回次数（反教条抽查/遗忘曲线用）
+    # 阶段 3（precision 三层动态化，2026-08-14）：新字段全部带默认值 →
+    # 旧构造点/旧快照向后兼容（沿用体验层 D 先例，加载统一 getattr 兜底）：
+    consistency: Optional[float] = None   # Koriat 自一致性（召回时计算并缓存；
+                                          #   同主题簇互相印证度 [0,1]；None=未计算）
+    confidence_before_rebuttal: Optional[float] = None  # 反驳前置信度（conformal
+                                          #   校准集数据源，mark_rebutted 写入）
     # 提取层 v1.4（S1-11，P2-A 字段定案：不新增 link_count，复用 reference_count
     # 为加固计数唯一权威；全部带默认值 → 旧构造点/旧快照向后兼容，加载统一
     # getattr(e, field, default) 兜底）：
@@ -134,7 +141,8 @@ class MemoryManager:
                  episodic_hard_cap: Optional[int] = None,
                  device: Union[str, torch.device] = "auto",
                  replay_surprise_cap: Optional[float] = None,
-                 norm_latent: Optional[bool] = None) -> None:
+                 norm_latent: Optional[bool] = None,
+                 precision_adapt: Optional[bool] = None) -> None:
         """初始化记忆管理器。
 
         参数:
@@ -200,6 +208,15 @@ class MemoryManager:
         if norm_latent is None:
             norm_latent = os.environ.get("LMS_NORM_LATENT", "0") == "1"
         self.norm_latent: bool = bool(norm_latent)
+
+        # 阶段 3（precision 三层动态化）：反流畅性偏误对抗项开关——
+        # 回放权重对 reference/recall_count 做 log1p 边际递减（重复≠真，
+        # Hasher 1977 D2 / Fazio 2015）；None → 读 LMS_PRECISION_ADAPT
+        # （默认 1=开，与全局治理开关一致；测试套件 conftest 置 0 保旧行为）。
+        if precision_adapt is None:
+            from core.doubt.precision_adapt import precision_adapt_enabled
+            precision_adapt = precision_adapt_enabled(None)
+        self.precision_adapt_enabled: bool = bool(precision_adapt)
 
         # E-P2-1: 统一设备管理
         self.device: torch.device = resolve_device(device)
@@ -316,6 +333,12 @@ class MemoryManager:
                         continue
                 weight = (self.replay_weight * max(surprise, 0.0)
                           * (1.0 - rebuttal_rate) * source_trust)
+                # 阶段 3（反流畅性偏误对抗项，LMS_PRECISION_ADAPT=1 时启用）：
+                # 重复曝光不线性推高回放权重——引用/召回次数对权重的边际
+                # 贡献 log1p 压缩（重复≠真；ref=recall=0 → 1.0 零变化，
+                # 向后兼容）。依据：Hasher 1977（流畅性错觉）/ Fazio 2015。
+                if self.precision_adapt_enabled:
+                    weight = weight * self._repetition_factor(entry)
                 self.long_term_latent = (
                     self.long_term_latent + weight * state
                 )
@@ -330,6 +353,26 @@ class MemoryManager:
             if latent_norm > 1e-8:
                 self.long_term_latent = (
                     self.long_term_latent / latent_norm)
+
+    @staticmethod
+    def _repetition_factor(entry) -> float:
+        """反流畅性偏误对抗项：重复曝光降权因子。
+
+        factor = 1 / (1 + log1p(max(reference_count, recall_count)))
+        - ref=recall=0 → 1.0（零变化，向后兼容）
+        - n=1 → 1/(1+0.693) ≈ 0.59；n=10 → 1/(1+2.398) ≈ 0.29
+        重复（曝光）≠ 真（Hasher 1977 / Fazio 2015）：同一记忆被反复
+        召回不应线性放大其在长时潜变量中的权重。与 verdict_confidence
+        的反流畅折扣正交（前者管回放，后者管怀疑判定）。
+        """
+        try:
+            n = max(int(getattr(entry, 'reference_count', 0) or 0),
+                    int(getattr(entry, 'recall_count', 0) or 0))
+        except (TypeError, ValueError):
+            return 1.0
+        if n <= 0:
+            return 1.0
+        return 1.0 / (1.0 + math.log1p(n))
 
     def recall(self, cue: torch.Tensor) -> torch.Tensor:
         """从记忆中检索：用线索激活相关记忆。

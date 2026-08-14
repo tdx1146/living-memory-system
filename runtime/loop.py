@@ -229,6 +229,20 @@ class LivingMemoryLoop:
         from core.doubt.gap_registry import GapRegistry
         self.gap_registry = GapRegistry()
 
+        # 阶段 3（precision 三层动态化，质疑自动校准）：全局怀疑强度状态机。
+        # 治理开关 LMS_PRECISION_ADAPT（默认 1=开；0=关 → None，全部路径
+        # 零参与，行为与开关引入前完全一致——8/10 治理开关先例风格）。
+        # 纯进程内存状态（同 gap_registry 先例：重启即失、快照不落盘）。
+        from core.doubt.precision_adapt import (
+            PrecisionAdaptState, precision_adapt_enabled)
+        if precision_adapt_enabled(config.get('precision_adapt')):
+            self.precision_adapt = PrecisionAdaptState()
+        else:
+            self.precision_adapt = None
+        # 负性证据标记：本轮发生过证伪（conflict/去稳定化）→ observe_surprise
+        # 时 is_negative=True（对称性约束：坏消息 PE 不被系统性低估）
+        self._pending_negative_evidence: bool = False
+
         # 元可塑性控制器（可选，根据 config 决定是否启用）
         self.meta = None
         if config.get('meta_enabled', True):
@@ -337,9 +351,20 @@ class LivingMemoryLoop:
 
         # 体验层 D（设计 v1.1 §6.6）：结构化怀疑摄入（[doubt] 前缀解析，
         # fail-open）。无前缀/解析失败 = 普通塑形，逐字节不变（红线）。
+        # 阶段 3：conflict 证伪事件 → conformal 校准集 + 负性证据标记
+        # （对称性约束：坏消息进入全局怀疑基线，不被系统性低估）。
         try:
             from core.doubt.doubt_ingest import ingest as doubt_ingest
-            doubt_ingest(self, text)
+            ev = doubt_ingest(self, text)
+            if (self.precision_adapt is not None and ev
+                    and ev.get('action') == 'rebutted'):
+                self._pending_negative_evidence = True
+                hit = ev.get('entry')
+                if hit is not None:
+                    try:
+                        self.precision_adapt.record_rebuttal(hit)
+                    except Exception:
+                        pass
         except Exception:
             pass
 
@@ -491,6 +516,19 @@ class LivingMemoryLoop:
                 text, semantic_vector, activation.surprise, self.turn_count,
                 raw_semantic_vector=raw_semantic_vector,
                 source='external')  # Phase 2: 显式来源标记
+
+        # 阶段 3：precision 动态校准观测（HGF 波动性 → 全局怀疑基线；
+        # 逐试次更新，Mathys 2011 / Behrens 2007）。is_negative 由本轮
+        # 证伪事件（conflict/去稳定化）标记，对称性约束补偿坏消息 PE。
+        # fail-open：观测异常绝不阻断主循环。
+        if self.precision_adapt is not None:
+            try:
+                self.precision_adapt.observe_surprise(
+                    activation.surprise,
+                    is_negative=self._pending_negative_evidence)
+            except Exception:
+                pass
+        self._pending_negative_evidence = False
 
         # 更新状态
         self.last_activation = activation
@@ -825,8 +863,61 @@ class LivingMemoryLoop:
                         f"体验层D: 高惊讶 z={z:.2f} → 去稳定化旧记忆 "
                         f"(turn={getattr(entry, 'turn', '?')}, "
                         f"rebuttal={getattr(entry, 'rebuttal_count', 0)})")
+                    # 阶段 3：证伪 → conformal 校准集 + 负性证据标记
+                    # （对称性约束：坏消息 PE 不被系统性低估）
+                    if self.precision_adapt is not None:
+                        try:
+                            self._pending_negative_evidence = True
+                            self.precision_adapt.record_rebuttal(entry)
+                        except Exception:
+                            pass
         except Exception as e:  # pylint: disable=broad-except
             logger.warning("去稳定化标记失败（fail-open）: %s", e)
+
+    # ================================================================== #
+    #  阶段 3（precision 三层动态化）：召回/观测钩子
+    # ================================================================== #
+
+    def _attach_consistency(self, scored) -> None:
+        """阶段 3：召回簇 → Koriat 自一致性 + 域级/置信度窗口观测。
+
+        - compute_consistency：同主题簇互相印证度（召回时计算，零固定
+          阈值：自适应线 = 簇内相似度分布 P50）
+        - 结果缓存到条目 consistency 字段（进程内，供 /recall 注解与
+          verdict 判定）与 precision_adapt.consistency_cache
+        - record_recall_cohort：域级统计 + 置信度窗口（怀疑率观测）
+
+        开关关/异常 → 静默跳过（零参与，fail-open）。
+        """
+        if self.precision_adapt is None or not scored:
+            return
+        try:
+            from core.doubt.precision_adapt import compute_consistency
+            cons = compute_consistency(scored)
+            for _score, entry in scored:
+                c = cons.get(id(entry))
+                if c is not None:
+                    try:
+                        entry.consistency = round(c, 4)
+                    except Exception:
+                        pass
+            self.precision_adapt.consistency_cache.update(cons)
+            self.precision_adapt.record_recall_cohort(scored)
+        except Exception:
+            pass
+
+    def doubt_status_block(self) -> dict:
+        """阶段 3：precision 动态化观测块（/status precision_adapt、
+        /react reaction.doubt、/recall doubt 共用）。
+
+        开关关/异常 → {}（调用方 fail-open 降级回旧行为）。
+        """
+        if self.precision_adapt is None:
+            return {}
+        try:
+            return self.precision_adapt.snapshot()
+        except Exception:
+            return {}
 
     def _retrieve_episodic(self, text: str) -> list[str] | None:
         """情景记忆检索：用语义向量找最相关的历史文本。
@@ -892,6 +983,10 @@ class LivingMemoryLoop:
         scored = self.memory.recall_episodic_scored(
             query_vec, top_k=k, fallback_query=sem_vec,
             count_reference=False)
+        # 阶段 3：Koriat 自一致性（召回时计算）+ 域级/置信度窗口观测。
+        # 只读路径零持久化：仅更新进程内状态与条目 consistency 缓存字段
+        # （不进快照；/react 已有 react_surprise_history 同类先例）。
+        self._attach_consistency(scored)
         # 体验层 D：低置信复核配额（relevance-gated，只读选择）
         try:
             from core.doubt.recall_scheduler import (
@@ -914,6 +1009,23 @@ class LivingMemoryLoop:
                     float(getattr(entry, 'source_trust', 1.0) or 1.0), 3)
                 item['last_recalled_at'] = getattr(
                     entry, 'last_recalled_at', None)
+                # 阶段 3：真实 precision 数据源（质疑层注入用）——
+                # adaptive_confidence（Koriat 混合）/ consistency（自一致性
+                # 缓存）/ doubt_verdict（conformal 分位怀疑线判定）。
+                # 开关关时保持 None/False（零参与，旧客户端无感）。
+                if self.precision_adapt is not None:
+                    try:
+                        cons = self.precision_adapt.consistency_cache.get(
+                            id(entry))
+                        vconf = self.precision_adapt.verdict_confidence(
+                            entry, cons)
+                        item['adaptive_confidence'] = round(vconf, 3)
+                        item['consistency'] = (
+                            round(cons, 4) if cons is not None else None)
+                        item['doubt_verdict'] = bool(
+                            vconf < self.precision_adapt.doubt_threshold())
+                    except Exception:
+                        pass
                 results.append(item)
         return results
 
@@ -980,6 +1092,8 @@ class LivingMemoryLoop:
                     scored = self.memory.recall_episodic_scored(
                         query_vec, top_k=k, fallback_query=semantic_vector,
                         source_filter='external', count_reference=False)
+                    # 阶段 3：Koriat 自一致性 + 域级/置信度窗口观测（只读）
+                    self._attach_consistency(scored)
                     for score, entry in scored:
                         if getattr(entry, 'text', None):
                             recalled.append({
@@ -1029,6 +1143,10 @@ class LivingMemoryLoop:
             'coherence': round(float(self.purpose.coherence), 4),
             'precision_mean': round(float(precision.mean()), 4),
             'surprise_z': surprise_z,
+            # 阶段 3：precision 动态化观测块（质疑层数据源——全局怀疑
+            # 基线/conformal 分位怀疑线/域怀疑；经 glue /react 薄代理
+            # 原样透传到注入插件。开关关 → {}（插件回退旧行为））。
+            'doubt': self.doubt_status_block(),
         }
         return {
             'turn_count': self.turn_count,
@@ -1466,6 +1584,13 @@ class LivingMemoryLoop:
         except Exception as e:  # pylint: disable=broad-except
             logger.debug("get_status doubt 字段组装失败（fail-open）: %s", e)
 
+        # 阶段 3：precision 三层动态化观测（纯增量字段；开关关 → {}）
+        try:
+            status['precision_adapt'] = self.doubt_status_block()
+        except Exception as e:  # pylint: disable=broad-except
+            logger.debug(
+                "get_status precision_adapt 字段组装失败（fail-open）: %s", e)
+
         # 自指回路状态（可选）
         if self.self_ref is not None:
             status['self_ref_enabled'] = True
@@ -1509,6 +1634,9 @@ class LivingMemoryLoop:
                 self.config.get('snapshot_dir', 'snapshots'))
             # 体验层 D：怀疑复核联动 gap_registry（B 类清空 + 复核报告）
             dream_config['gap_registry'] = self.gap_registry
+            # 阶段 3：precision 动态化状态传入做梦引擎（doubt_review 的
+            # 低置信复核阈值改用 conformal 分位怀疑线；None=开关关，回退 0.3）
+            dream_config['precision_adapt'] = self.precision_adapt
             self.dream_engine = DreamEngine(
                 attractor=self.attractor,
                 purpose=self.purpose,

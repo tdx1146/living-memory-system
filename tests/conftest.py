@@ -19,6 +19,11 @@ def pytest_configure(config):
     """注册自定义 pytest marker。"""
     config.addinivalue_line(
         "markers", "slow: 反身性涌现长时实验（运行较慢）")
+    # 阶段 3（precision 三层动态化，2026-08-14）：测试套件默认关闭自适应
+    # 开关——全部既有测试验证开关引入前的行为（LMS_PRECISION_ADAPT=0 即
+    # 回滚路径）；自适应路径由 test_precision_adapt.py 显式 monkeypatch
+    # 启用。setdefault：CI 显式设 1 时尊重（此时旧行为测试需自行适配）。
+    os.environ.setdefault("LMS_PRECISION_ADAPT", "0")
 
 
 @pytest.fixture(scope="session", autouse=True)

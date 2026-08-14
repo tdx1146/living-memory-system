@@ -10,6 +10,7 @@
     POST   /react             实时反应只读（体验层 A：infer-only 零持久化）
     POST   /recall            只读情景检索（T1.3/P0-9：不 process_turn、不调 LLM）
     GET    /status/{sid}      查询会话记忆状态
+    GET    /landscape/{sid}   只读景观端点（阶段 2 思考链：盆地结构/激活/能量，raw=1 附完整张量）
     POST   /snapshot/{sid}    保存快照
     POST   /restore/{sid}     从快照恢复
     GET    /sessions          列出所有会话
@@ -976,6 +977,8 @@ async def recall(req: RecallRequest):
         "duration_ms": duration_ms,
         # 只读校验锚点：检索不应改变轮次（测试与可观测性用）
         "turn_count": loop.turn_count,
+        # 阶段 3：precision 动态化观测块（纯增量字段；开关关 → {}）
+        "doubt": loop.doubt_status_block(),
     }
 
 
@@ -993,6 +996,105 @@ async def get_status(session_id: str):
         "session_id": session_id,
         "status": status,
     }
+
+
+@app.get("/landscape/{session_id}")
+async def get_landscape(session_id: str, raw: int = 0):
+    """只读景观端点（阶段 2 思考链，2026-08-13；设计 v1.0 §五-①）。
+
+    返回 attractor.get_landscape() 的序列化摘要——盆地结构（激活分布/熵/
+    top 激活节点）、能量分布（J/bias/sigma 范数与稀疏度）；raw=1 时附加
+    完整张量序列化（J/bias/sigma 嵌套列表）。
+
+    硬约束（设计 v1.1 §八 边界）：
+      - 纯只读：不 process_turn、不调 LLM、不写盘、不创建会话
+        （sm.get 而非 get_or_create——会话缺失返回空结构，不 404 不自动建）
+      - fail-open：任何异常返回空结构，绝不 500 拖垮调用方（think_loop/
+        注入链均把非 2xx/异常视为"无景观"降级）
+    使用方：思考链兴趣分 w2（景观激活度）、注入链景观叙事（可选）、人工观测。
+    """
+    sm = get_session_manager()
+    loop = sm.get(session_id)  # 只读：不存在不创建
+    if loop is None:
+        return {
+            "session_id": session_id,
+            "ts": datetime.now().isoformat(),
+            "landscape": {},
+            "fail_open": True,
+            "note": "session_not_found（纯只读端点，不自动创建会话）",
+        }
+    try:
+        # 函数内惰性 import torch（与 server.py 模块级轻导入约定一致）
+        import torch  # pylint: disable=import-outside-toplevel
+        land = loop.attractor.get_landscape()
+        J = land["J"].detach().cpu()
+        bias = land["bias"].detach().cpu()
+        sigma = land["sigma"].detach().cpu()
+        num_nodes = int(land.get("num_nodes", J.shape[0] if J.ndim else 0))
+
+        # 激活分布（盆地结构）：熵（0=单点聚焦，ln(N)=均匀扩散）+ top 激活节点
+        abs_sigma = sigma.abs()
+        total = float(abs_sigma.sum())
+        if total < 1e-8:
+            act_entropy = 0.0
+        else:
+            p = abs_sigma / total
+            act_entropy = float(-(p * torch.log(p + 1e-8)).sum())
+        max_entropy = math.log(num_nodes) if num_nodes > 1 else 1.0
+        norm_entropy = (act_entropy / max_entropy) if max_entropy > 0 else 0.0
+        top_k = min(8, max(1, num_nodes))
+        vals, idxs = torch.topk(abs_sigma, top_k) if top_k else (torch.tensor([]), torch.tensor([]))
+        top_activated = [
+            {"node": int(i), "sigma": round(float(v), 6)}
+            for v, i in zip(vals.tolist(), idxs.tolist())
+            if abs(float(v)) > 1e-9
+        ]
+        active_count = int((abs_sigma > 0.05).sum().item())
+
+        # 能量分布（J/bias/sigma 统计）
+        offdiag = J - torch.diag(torch.diagonal(J))
+        energy = {
+            "j_norm_fro": round(float(torch.norm(J, p="fro").item()), 6),
+            "j_diag_mean": round(float(torch.diagonal(J).mean().item()), 6),
+            "j_offdiag_std": round(float(offdiag.std().item()), 6),
+            "bias_norm": round(float(torch.norm(bias).item()), 6),
+            "sigma_norm": round(float(torch.norm(sigma).item()), 6),
+            "j_sparsity_1e_3": round(float((J.abs() < 1e-3).float().mean().item()), 6),
+        }
+
+        summary = {
+            "num_nodes": num_nodes,
+            "input_dim": int(land.get("input_dim", J.shape[1] if J.ndim > 1 else 0)),
+            "activation": {
+                "entropy": round(act_entropy, 6),
+                "entropy_norm": round(norm_entropy, 6),
+                "active_nodes": active_count,
+                "top_activated": top_activated,
+            },
+            "energy": energy,
+        }
+        if raw:
+            summary["raw"] = {
+                "J": J.tolist(),
+                "bias": bias.tolist(),
+                "sigma": sigma.tolist(),
+            }
+        return {
+            "session_id": session_id,
+            "ts": datetime.now().isoformat(),
+            "turn_count": int(getattr(loop, "turn_count", 0) or 0),
+            "landscape": summary,
+            "raw_included": bool(raw),
+        }
+    except Exception as e:  # pylint: disable=broad-except
+        logger.error(f"[{session_id}] /landscape 序列化失败（fail-open 返回空结构）: {e}")
+        return {
+            "session_id": session_id,
+            "ts": datetime.now().isoformat(),
+            "landscape": {},
+            "fail_open": True,
+            "error": str(e)[:200],
+        }
 
 
 @app.post("/snapshot/{session_id}")

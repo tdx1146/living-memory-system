@@ -66,6 +66,7 @@ def ingest(loop, text: str) -> Optional[dict]:
         return None
     kind, content = ev['kind'], ev['content']
     action = 'registered'
+    hit_entry = None  # 阶段 3：conflict 证伪命中的条目（loop 校准钩子用）
     try:
         registry = getattr(loop, 'gap_registry', None)
         if kind == 'conflict':
@@ -74,6 +75,7 @@ def ingest(loop, text: str) -> Optional[dict]:
             if hit is not None:
                 mark_labile(hit, violated_by=content)
                 action = 'rebutted'
+                hit_entry = hit
                 detail = 'conflict 事件（已标记证伪条目）'
             else:
                 detail = 'conflict 事件（未找到重叠条目）'
@@ -96,7 +98,10 @@ def ingest(loop, text: str) -> Optional[dict]:
     except Exception:
         # fail-open：结构化摄入异常绝不阻断主循环
         action = 'failed'
-    return {**ev, 'action': action}
+    # 阶段 3：entry 仅对 conflict-证伪 返回（其余为 None）——loop 据此
+    # 收集 conformal 校准集 + 标记负性证据（对称性约束）。纯增量字段，
+    # 旧调用方无感。
+    return {**ev, 'action': action, 'entry': hit_entry}
 
 
 def _find_overlapping_entry(loop, content: str):

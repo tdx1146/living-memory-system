@@ -24,6 +24,16 @@
   阶段7 快照(5%): 保存状态
 
 参考：docs/DREAM_ENGINE_DESIGN.md
+
+阶段 4（2026-08-14，做梦时怀疑延伸）：怀疑是本能，不是特定场景的功能——
+本引擎的怀疑复核（阶段8 doubt_review）是持续怀疑底座（precision 三层动态化
+条目级 + 思考链）在记忆巩固期的自然延伸/生效：不完全线索再巩固式复核
+（B3） + 结果应用（Schiller 2010 更新而非抹除） + 反教条 top-N 下沉
+（加工在 LMS 内，AgentOS 侧保留触发/表达层）。治理开关 DREAM_DOUBT_ENABLED
+（默认 1=开；0=关回退阶段 1 基础行为）。
+P2-1 修复（2026-08-14）：无替代降权 ×0.98 设下限 DREAM_DOUBT_MIN_WEIGHT
+（默认 0.5，权重≤下限后不再降）——怀疑的持续表达有边界，不把长期低置信
+但为真的记忆磨到不可用（更新而非抹除）。
 """
 
 import os
@@ -83,6 +93,39 @@ def _dream_release_lock(fd: Optional[int]) -> None:
     os.close(fd)
 
 from core.types import Activation
+
+# 治理开关（阶段 4 做梦时怀疑延伸，2026-08-14）：显式参数 > 环境变量
+# DREAM_DOUBT_ENABLED（默认 1=开；0=关 → _doubt_review 回退阶段 1 基础
+# 行为：labile 裁决 + 低置信 ×1.02 回稳 + 高频只 flag，可回滚）。
+# 风格对齐 8/10 先例（LMS_NORM_SURPRISE / LMS_PRECISION_ADAPT）。
+
+
+def dream_doubt_enabled(explicit: Optional[bool] = None) -> bool:
+    """治理开关解析：显式参数 > 环境变量 DREAM_DOUBT_ENABLED（默认 1=开）。
+
+    布尔接受（不区分大小写）：1/true/yes/on 视为开，其余为关。
+    """
+    if explicit is not None:
+        return bool(explicit)
+    raw = os.environ.get('DREAM_DOUBT_ENABLED', '1')
+    return raw.strip().lower() not in ('0', 'false', 'no', 'off')
+
+
+def _doubt_param(config: dict, key: str, env: str, default: float) -> float:
+    """阶段 4 复核机制参数解析：显式 config > 环境变量 > 默认（fail-open）。
+
+    判定阈值类（替代相似度线/复核冷却/每轮上限/反教条 top-N/降权乘子/降权下限）
+    为机制参数（允许默认值，受 DREAM_DOUBT_ENABLED 治理开关保护），
+    风格对齐 precision_adapt 先例。
+    """
+    try:
+        raw = config.get(key)
+        if raw is None:
+            raw = os.environ.get(env, str(default))
+        return float(raw)
+    except (TypeError, ValueError):
+        return float(default)
+
 
 logger = logging.getLogger("dream_engine")
 
@@ -149,6 +192,16 @@ class DreamEngine:
             meta: 元可塑性控制器（MetaPlasticityController）实例，可选。
                 当提供时，空闲态计算将使用元调整后的学习参数（学习率、
                 正交化权重、温度、复杂度权重）。为 None 时行为与之前完全一致。
+            阶段 4（做梦时怀疑延伸）额外键（全部可选，env 可覆盖，
+            DREAM_DOUBT_ENABLED 治理开关保护）：
+                - dream_doubt_enabled: 显式开关（缺省读 DREAM_DOUBT_ENABLED）
+                - doubt_alt_sim_min: 替代相似度线（默认 0.7）
+                - doubt_downgrade_factor: 有替代降权乘子（默认 0.9）
+                - doubt_decay_factor: 无替代 precision 权重折损（默认 0.98）
+                - doubt_min_weight: 怀疑降权下限（默认 0.5；权重≤下限后不再降）
+                - doubt_cooldown_seconds: 每条目复核冷却（默认 86400s）
+                - doubt_review_max: 每轮低置信复核上限（默认 10）
+                - doubt_anti_dogma_n: 反教条 top-N（默认 10）
         """
         self.attractor = attractor
         self.purpose = purpose
@@ -216,6 +269,37 @@ class DreamEngine:
         }
         # gap_registry 注入（loop.get_dream_engine 经 config 传入；缺省 None）
         self.gap_registry = config.get('gap_registry')
+        # 阶段 3（precision 三层动态化）：precision_adapt 状态注入
+        # （loop.get_dream_engine 传入；缺省 None=开关关）——doubt_review
+        # 的低置信复核阈值用 conformal 分位怀疑线（零固定阈值）
+        self.precision_adapt = config.get('precision_adapt')
+
+        # 阶段 4（做梦时怀疑延伸，2026-08-14）：治理开关 DREAM_DOUBT_ENABLED
+        # （默认 1=开；0=关 → doubt_review 回退阶段 1 基础行为，可回滚）。
+        # 定位（主 AI 修正）：怀疑是本能——本开关控制的是"怀疑本能（precision
+        # 条目级 + 思考链）在记忆巩固期的自然延伸/生效"，不是新增怀疑机制。
+        self.doubt_enabled = dream_doubt_enabled(config.get('dream_doubt_enabled'))
+        # 复核机制参数（env 可覆盖；判定阈值类为机制参数非固定判定线）
+        self.doubt_alt_sim_min = _doubt_param(
+            config, 'doubt_alt_sim_min', 'DREAM_DOUBT_ALT_SIM_MIN', 0.7)
+        self.doubt_downgrade_factor = _doubt_param(
+            config, 'doubt_downgrade_factor', 'DREAM_DOUBT_DOWNGRADE_FACTOR', 0.9)
+        self.doubt_decay_factor = _doubt_param(
+            config, 'doubt_decay_factor', 'DREAM_DOUBT_DECAY_FACTOR', 0.98)
+        # P2-1 修复（2026-08-14，审计-阶段4）：降权下限——怀疑的持续表达
+        # 有边界：权重降到 doubt_min_weight（env DREAM_DOUBT_MIN_WEIGHT，
+        # 默认 0.5）后不再降，防长期低置信但为真的记忆被磨到不可用。
+        # 只拦下降不抬升；下限=0 → 无下限（回退旧行为）。
+        self.doubt_min_weight = _doubt_param(
+            config, 'doubt_min_weight', 'DREAM_DOUBT_MIN_WEIGHT', 0.5)
+        self.doubt_cooldown_seconds = _doubt_param(
+            config, 'doubt_cooldown_seconds', 'DREAM_DOUBT_COOLDOWN_SECONDS', 86400.0)
+        self.doubt_review_max = int(_doubt_param(
+            config, 'doubt_review_max', 'DREAM_DOUBT_REVIEW_MAX', 10))
+        self.doubt_anti_dogma_n = int(_doubt_param(
+            config, 'doubt_anti_dogma_n', 'DREAM_DOUBT_ANTI_DOGMA_N', 10))
+        # 逐条复核明细（观测；dream 结果透传最近 5 条）
+        self.last_doubt_review_detail: list = []
 
         logger.info(
             f"DreamEngine 已初始化 "
@@ -264,6 +348,7 @@ class DreamEngine:
         # 体验层 D：一轮做梦开始重置复核统计（防跨梦膨胀）
         self.last_doubt_review = {'reviewed': 0, 'downgraded': 0,
                                   'rewritten': 0, 'kept': 0, 'flagged': 0}
+        self.last_doubt_review_detail = []
 
         # 保存初始 J 矩阵（用于计算 j_change）
         J_initial = self.attractor.J.clone()
@@ -335,6 +420,8 @@ class DreamEngine:
             'snapshot_path': snapshot_path,
             'buffer_size': self.memory.buffer_size(),
             'doubt_review': dict(self.last_doubt_review),
+            # 阶段 4：逐条复核明细（观测；最多最近 5 条，防结果膨胀）
+            'doubt_review_detail': self.last_doubt_review_detail[-5:],
             # 提取层 v1.4（S1-13）：价值重放观测（S1-9 汇总进 dream_state.json）
             'value_replay': value_replay,
         }
@@ -381,6 +468,7 @@ class DreamEngine:
         # 体验层 D：一轮做梦开始重置复核统计（跨阶段累积，防跨梦膨胀）
         self.last_doubt_review = {'reviewed': 0, 'downgraded': 0,
                                   'rewritten': 0, 'kept': 0, 'flagged': 0}
+        self.last_doubt_review_detail = []
 
         # 提取层 v1.4（S1-13）：价值重放——PER 概率采样 → 加固 → 聚类
         # （fail-open）→ 代表幸存加固（每周期一次，§2.6）
@@ -433,6 +521,8 @@ class DreamEngine:
             'snapshot_path': snapshot_path,
             'buffer_size': self.memory.buffer_size(),
             'doubt_review': dict(self.last_doubt_review),
+            # 阶段 4：逐条复核明细（观测；最多最近 5 条，防结果膨胀）
+            'doubt_review_detail': self.last_doubt_review_detail[-5:],
             # 提取层 v1.4（S1-13）：价值重放观测（S1-9 汇总进 dream_state.json）
             'value_replay': value_replay,
         }
@@ -1180,6 +1270,12 @@ class DreamEngine:
     def _doubt_review(self) -> None:
         """怀疑复核（睡眠=整合/复核窗口，Walker & Stickgold 2009）。
 
+        定位（阶段 4，2026-08-14；主 AI 修正：怀疑是本能，不是特定场景的
+        功能）：本方法 = **持续怀疑底座**（precision 三层动态化条目级 + 思考
+        链深想/浅想已带的自我质疑）在**记忆巩固期的自然延伸/生效**——把
+        "质疑旧记忆"从思考链延伸进做梦回放。不是新增怀疑机制；开关
+        DREAM_DOUBT_ENABLED 控制的只是这个延伸的开关（默认开，可回滚）。
+
         内容（P1 §2.3 原样；显式裁决流程为"睡眠=整合/复核窗口"的工程
         翻译，溯源 §4.2 标注——论文支持睡眠做重放/整合/遗忘/去虚假吸引子，
         不支持逐条打分-裁决流程，故裁决逻辑做成纯函数、乘子保守、独立
@@ -1187,28 +1283,51 @@ class DreamEngine:
           ① labile 窗口裁决：改写=新增 source='doubt' supersedes 条目 /
              无证据 confidence×1.02 重巩固 / 超时 ×0.98 折损
              （reconsolidation.resolve_labile 纯函数）
-          ② 低置信（<0.3）复核：用不完全线索生成式回放（B3，Sinclair &
-             Barense 2019：完全重复反而稳定旧记忆，绝不复述原文）——
-             工程翻译：仅做保守重评估（×1.02 回稳）并标记 reviewed，
-             生成式回放由既有 surprise 加权采样机制自然覆盖
-          ③ 反教条抽查 top-N 高频记忆（reference/recall_count 高者——
-             正是已关注方向里被 illusory truth 强化的内容，D2 语义：
-             优先怀疑高频，Sharot 2011 C2）
+          ② 低置信（conformal 分位怀疑线 / 冷启动回退 0.3）复核——阶段 4
+             升级：不完全线索再巩固式复核（B3，Sinclair & Barense 2019：
+             完全重复反而稳定旧记忆，绝不复述原文——线索=文本前缀截断 +
+             "……？这条还成立吗？"）；结果应用（Schiller 2010 更新而非
+             抹除）：有更强替代（语义向量相似 ≥ 线 且判定置信度更高）→
+             降权旧记忆 ×0.9 + 合并新版本（superseded_by + 替代条目
+             reference+1）；无替代 → 维持但降低 precision 权重 ×0.98
+             （降到下限 DREAM_DOUBT_MIN_WEIGHT（默认 0.5）后不再降，
+             审计 P2-1 修复：怀疑的持续表达有边界——更新而非抹除，
+             不把记忆磨到不可用）。
+             被反驳≥1（doubt_ingest 证伪过）的条目同路径（同一怀疑底座
+             的标注）。
+          ③ 反教条抽查 top-N 高频记忆（默认 10，同 night_patrol_dogma；
+             reference/recall_count 高者——已关注方向里被 illusory truth
+             强化的内容，D2 语义：优先怀疑高频，Sharot 2011 C2）——阶段 4
+             下沉：night_patrol_dogma 的 top10 高频复核逻辑并入做梦引擎
+             作为"做梦时怀疑"子过程（加工在 LMS 内），AgentOS 侧保留为
+             触发/表达层（报告）。
+        治理开关 DREAM_DOUBT_ENABLED（默认 1=开）：0=关 → 回退阶段 1 基础
+        行为（② 仅 ×1.02 回稳不应用结果；③ 仅 flag 不复核）。
+        冷却：每条目 last_doubt_reviewed_at 距今 < doubt_cooldown_seconds
+        （默认 86400s）不重复复核——做梦 idle_threshold=30s 高频触发，
+        无冷却会使无替代 ×0.98 被反复应用、系统性侵蚀（工程守卫，非判定
+        阈值）。
 
-        输出复核报告（reviewed/downgraded/rewritten/kept/flagged）进
-        self.last_doubt_review（dream 结果字典 + [梦醒] 透传数据源）。
+        输出复核报告（reviewed/downgraded/rewritten/kept/flagged/merged）
+        进 self.last_doubt_review（dream 结果字典 + [梦醒] 透传数据源）；
+        逐条明细（category/clue/outcome/alt/conf_before/conf_after）进
+        self.last_doubt_review_detail（dream 结果透传最近 5 条，观测）。
         任何异常只记日志不阻断做梦（fail-open）。
         """
-        stats = dict(self.last_doubt_review)  # 跨调用累积（一轮做梦内多次复核合并）
+        stats = dict(self.last_doubt_review)
+        detail = list(self.last_doubt_review_detail)
         try:
             entries = list(self.memory.iter_episodic())
             if not entries:
                 self.last_doubt_review = stats
+                self.last_doubt_review_detail = detail
                 return
             from core.doubt.reconsolidation import resolve_labile
             from core.doubt.confidence_field import is_low_confidence
 
-            # ① labile 窗口裁决
+            # ① labile 窗口裁决（不变；labile 条目本轮不再进 ②/③，
+            # 避免同一轮双重处理）
+            was_labile = {id(e) for e in entries if getattr(e, 'labile', False)}
             for e in entries:
                 if getattr(e, 'labile', False):
                     outcome = resolve_labile(e)
@@ -1219,26 +1338,61 @@ class DreamEngine:
                         # （更新而非抹除，Schiller 2010 B2）
                         self._add_doubt_supersede(e)
 
-            # ② 低置信（<0.3）复核（不完全线索原则：绝不复述原文，
-            #    只做保守重评估并标记 reviewed）
-            for e in entries:
-                if is_low_confidence(e):
+            if not self.doubt_enabled:
+                # 回退阶段 1 基础行为（DREAM_DOUBT_ENABLED=0 可回滚路径）：
+                # ② 仅保守重评估 ×1.02 回稳 + reviewed；③ 仅 flag 不应用。
+                low_thr = 0.3
+                pa = self.precision_adapt
+                if pa is not None and not pa.is_cold():
                     try:
-                        e.confidence = max(0.0, min(
-                            1.0, float(e.confidence or 1.0) * 1.02))
-                    except (TypeError, ValueError):
+                        low_thr = pa.doubt_threshold()
+                    except Exception:
                         pass
-                    stats['reviewed'] += 1
-
-            # ③ 反教条抽查 top-N 高频记忆（优先怀疑高频——已关注方向内
-            #    被 illusory truth 强化的内容；只 flag 不抹除）
-            high_freq = sorted(
-                [e for e in entries
-                 if int(getattr(e, 'reference_count', 0) or 0) > 0],
-                key=lambda x: (int(getattr(x, 'reference_count', 0) or 0),
-                               int(getattr(x, 'recall_count', 0) or 0)),
-                reverse=True)[:3]
-            stats['flagged'] += len(high_freq)
+                for e in entries:
+                    if is_low_confidence(e, threshold=low_thr):
+                        try:
+                            e.confidence = max(0.0, min(
+                                1.0, float(e.confidence or 1.0) * 1.02))
+                        except (TypeError, ValueError):
+                            pass
+                        stats['reviewed'] += 1
+                high_freq = sorted(
+                    [e for e in entries
+                     if int(getattr(e, 'reference_count', 0) or 0) > 0],
+                    key=lambda x: (int(getattr(x, 'reference_count', 0) or 0),
+                                   int(getattr(x, 'recall_count', 0) or 0)),
+                    reverse=True)[:3]
+                stats['flagged'] += len(high_freq)
+            else:
+                # 阶段 4 延伸路径（默认）：不完全线索再巩固式复核。
+                # 候选 = 已被怀疑底座标注的条目（labile 已由 ① 处理，排除）。
+                low_thr = 0.3
+                pa = self.precision_adapt
+                if pa is not None and not pa.is_cold():
+                    try:
+                        low_thr = pa.doubt_threshold()
+                    except Exception:
+                        pass
+                reviewed_ids: set = set()
+                cands = [e for e in entries
+                         if id(e) not in was_labile
+                         and (is_low_confidence(e, threshold=low_thr)
+                              or int(getattr(e, 'rebuttal_count', 0) or 0) >= 1)]
+                for e in cands[:self.doubt_review_max]:
+                    self._review_entry_with_clue(
+                        e, 'low_conf', stats, detail, reviewed_ids)
+                # ③ 反教条下沉：top-N 高频条目同样做不完全线索复核
+                # （加工在 LMS 内；night_patrol_dogma 保留为表达/触发层）
+                high_freq = sorted(
+                    [e for e in entries
+                     if int(getattr(e, 'reference_count', 0) or 0) > 0],
+                    key=lambda x: (int(getattr(x, 'reference_count', 0) or 0),
+                                   int(getattr(x, 'recall_count', 0) or 0)),
+                    reverse=True)[:self.doubt_anti_dogma_n]
+                stats['flagged'] += len(high_freq)
+                for e in high_freq:
+                    self._review_entry_with_clue(
+                        e, 'anti_dogma', stats, detail, reviewed_ids)
 
             # 联动 gap_registry（B 类清空 + 复核报告 + last_review）
             if self.gap_registry is not None:
@@ -1249,6 +1403,178 @@ class DreamEngine:
         except Exception as e:  # pylint: disable=broad-except
             logger.warning("doubt_review 复核异常（fail-open）: %s", e)
         self.last_doubt_review = stats
+        self.last_doubt_review_detail = detail[-50:]
+
+    def _build_incomplete_clue(self, entry, keep_ratio: float = 0.5,
+                               max_len: int = 60) -> str:
+        """生成不完全线索（B3：完全重复反而稳定旧记忆——绝不复述全文）。
+
+        工程翻译（溯源 §4.2 标注）：文本前缀截断（保留 ~50% 或 ≤60 字）+
+        省略号 + 质疑问句（"这条还成立吗"）——只给部分线索，让"补全/自证"
+        过程本身成为复核（对应 reconsolidation 的不完全提醒诱发预测误差）。
+        纯函数，fail-open（异常回退通用疑问句）。
+        """
+        try:
+            text = str(getattr(entry, 'text', '') or '').strip()
+            text = re.sub(r'^用户[:：]\s*', '', text)
+            if not text:
+                return '（无文本可复核）这条还成立吗？'
+            cut = max(8, min(int(len(text) * keep_ratio), max_len))
+            fragment = text[:cut].strip()
+            if len(fragment) < len(text):
+                fragment += '……'
+            return f'{fragment}？这条还成立吗？'
+        except Exception:
+            return '这条还成立吗？'
+
+    def _review_confidence(self, entry) -> float:
+        """判定置信度（precision_adapt.verdict_confidence 优先；fail-open
+        回退 entry.confidence）。阶段 3 条目级置信度是"这条值不值得信"的
+        统一判据，复核的替代比较用它（Koriat 2012 自一致性同构）。"""
+        try:
+            if self.precision_adapt is not None:
+                return float(self.precision_adapt.verdict_confidence(entry))
+        except Exception:
+            pass
+        try:
+            return float(getattr(entry, 'confidence', 0.5) or 0.5)
+        except (TypeError, ValueError):
+            return 0.5
+
+    def _find_stronger_alternative(self, entry):
+        """找更强替代记忆（阶段 4；纯工程匹配，无 LLM，溯源 §4.2 标注）。
+
+        规则：其他条目中语义向量余弦 ≥ doubt_alt_sim_min（默认 0.7，与
+        precision_adapt 同主题簇阈值同尺度）且判定置信度严格更高者，取
+        判定置信度最高者。维度不匹配对跳过（同 precision_adapt 先例）。
+        无向量/异常 → None（fail-open：没有替代信息就按无替代处理，
+        走"维持但降低 precision 权重"保守路径）。
+        """
+        try:
+            v = getattr(entry, 'semantic_vector', None)
+            if v is None:
+                return None
+            v = v.detach().cpu().float().reshape(-1)
+            vn = v / (v.norm() + 1e-12)
+            base = self._review_confidence(entry)
+            best, best_conf = None, base
+            for e in self.memory.iter_episodic():
+                if e is entry:
+                    continue
+                ev = getattr(e, 'semantic_vector', None)
+                if ev is None:
+                    continue
+                ev = ev.detach().cpu().float().reshape(-1)
+                if ev.shape != v.shape:
+                    continue
+                en = ev / (ev.norm() + 1e-12)
+                sim = float((vn * en).sum().item())
+                if sim < self.doubt_alt_sim_min:
+                    continue
+                ec = self._review_confidence(e)
+                if ec > best_conf:
+                    best, best_conf = e, ec
+            return best
+        except Exception:
+            return None
+
+    def _apply_doubt_decay(self, conf_before: float, factor: float) -> float:
+        """怀疑降权（含下限守卫；P2-1 修复，2026-08-14，审计-阶段4）。
+
+        语义：降权是"怀疑的持续表达"，但不该把记忆磨到不可用（更新而非
+        抹除的边界）——权重降到 doubt_min_weight（env DREAM_DOUBT_MIN_WEIGHT，
+        默认 0.5）后不再降。两条降权路径共用：
+          - 无替代 ×doubt_decay_factor(0.98)（kept）
+          - 有替代 ×doubt_downgrade_factor(0.9)（downgraded+merged；合并
+            信息已由 superseded_by 保全，confidence 同样不该无底磨没）
+        边界语义（只拦下降，不抬升）：
+          - conf_before ≤ 下限 → 原样返回：已在下限内不降也不抬升
+            （低置信条目仍留在复核通道；证伪 rebuttal≥2→0.1 是独立机制，
+            不受本下限影响）
+          - conf_before > 下限 → max(下限, conf_before×factor)：一次最多
+            降到下限，不再继续
+        配置：下限=0 → 无下限（回退旧行为）；下限=1 → 降权恒不生效。
+        """
+        floor = min(1.0, max(0.0, float(self.doubt_min_weight)))
+        if conf_before <= floor:
+            return conf_before
+        return min(1.0, max(floor, conf_before * factor))
+
+    def _review_entry_with_clue(self, entry, category: str, stats: dict,
+                                detail: list, reviewed_ids: set) -> bool:
+        """不完全线索再巩固式复核（单条目；阶段 4 延伸路径）。
+
+        流程（B3 不完全线索 + Schiller 2010 更新而非抹除）：
+          1. 冷却检查：last_doubt_reviewed_at 距今 < doubt_cooldown_seconds
+             → 跳过（返回 False；防高频做梦系统性侵蚀）
+          2. 生成不完全线索（_build_incomplete_clue，绝不复述全文）
+          3. 找更强替代（_find_stronger_alternative）
+          4. 结果应用（降权统一经 _apply_doubt_decay，含下限守卫
+             DREAM_DOUBT_MIN_WEIGHT=0.5：权重降到下限后不再降，P2-1）：
+             - 有替代 → confidence ×doubt_downgrade_factor(0.9) 降权 +
+               superseded_by 指向替代 + 替代条目 reference+1（合并新版本，
+               更新而非抹除）→ 'downgraded' + merged
+             - 无替代 → confidence ×doubt_decay_factor(0.98)（维持但降低
+               precision 权重）→ 'kept'
+          5. 记明细 {category, clue, outcome, alt, conf_before, conf_after}
+        返回 True（完成复核）/ False（跳过/异常）。fail-open。
+        """
+        if entry is None or id(entry) in reviewed_ids:
+            return False
+        try:
+            now = time.time()
+            last = getattr(entry, 'last_doubt_reviewed_at', None)
+            if last is not None and (now - float(last)) < self.doubt_cooldown_seconds:
+                return False
+            conf_before = float(getattr(entry, 'confidence', 0.5) or 0.5)
+            clue = self._build_incomplete_clue(entry)
+            alt = self._find_stronger_alternative(entry)
+            if alt is not None:
+                # 有更强替代：降权旧记忆 + 合并新版本（更新而非抹除）；
+                # 降权同样经 _apply_doubt_decay 下限守卫（P2-1：合并信息
+                # 已由 superseded_by 保全，confidence 不该无底磨没）
+                entry.confidence = self._apply_doubt_decay(
+                    conf_before, self.doubt_downgrade_factor)
+                try:
+                    alt_text = str(getattr(alt, 'text', '') or '')[:200]
+                    entry.superseded_by = alt_text or '（更强替代）'
+                except Exception:
+                    pass
+                # 合并：替代条目吸收旧记忆的加固（reference+1；不记
+                # recall/last_recalled_at——不是真实召回，避免污染遗忘曲线）
+                try:
+                    alt.reference_count = int(
+                        getattr(alt, 'reference_count', 0) or 0) + 1
+                    from core.doubt.confidence_field import refresh_confidence
+                    refresh_confidence(alt)
+                except Exception:
+                    pass
+                outcome = 'downgraded'
+                stats['merged'] = stats.get('merged', 0) + 1
+            else:
+                # 无替代：维持但降低 precision 权重（保守，防教条固化；
+                # 重复≠真，Fazio 2015 反流畅性偏误）；下限守卫：降到
+                # doubt_min_weight 后不再降（P2-1，审计-阶段4）
+                entry.confidence = self._apply_doubt_decay(
+                    conf_before, self.doubt_decay_factor)
+                outcome = 'kept'
+            entry.last_doubt_reviewed_at = now
+            reviewed_ids.add(id(entry))
+            stats['reviewed'] = stats.get('reviewed', 0) + 1
+            stats[outcome] = stats.get(outcome, 0) + 1
+            detail.append({
+                'ts': round(now, 1),
+                'category': category,
+                'outcome': outcome,
+                'clue': clue,
+                'alt': bool(alt is not None),
+                'conf_before': round(conf_before, 3),
+                'conf_after': round(float(
+                    getattr(entry, 'confidence', 0.0) or 0.0), 3),
+            })
+            return True
+        except Exception:
+            return False
 
     def _add_doubt_supersede(self, entry) -> None:
         """改写 = 新增 source='doubt' supersedes 条目（不抹除原文）。

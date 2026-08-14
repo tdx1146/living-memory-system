@@ -102,8 +102,19 @@ def mark_rebutted(entry, violated_by: Optional[str] = None,
     """② 证伪：rebuttal_count +1、violated_by 记录、置信度重算。
 
     （去稳定化/结构化 doubt 摄入共用；fail-open。）
+
+    阶段 3（precision 三层动态化）：先把**反驳前置信度**存到
+    entry.confidence_before_rebuttal——conformal 分位怀疑线的校准集
+    数据源（"什么样置信度的条目最终被证伪"，precision_adapt 消费；
+    纯增量字段，旧构造点/旧快照无此字段时 getattr 兜底 None）。
     """
     try:
+        # 阶段 3：反驳前置信度快照（校准集；须在计数/重算前取）
+        try:
+            entry.confidence_before_rebuttal = float(
+                getattr(entry, 'confidence', 1.0) or 1.0)
+        except (TypeError, ValueError):
+            entry.confidence_before_rebuttal = None
         entry.rebuttal_count = getattr(entry, 'rebuttal_count', 0) + 1
         if violated_by:
             entry.violated_by = str(violated_by)[:200]
