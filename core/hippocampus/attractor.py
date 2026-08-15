@@ -149,9 +149,84 @@ class AttractorNetwork:
         # 2026-08-10 设计回归：J 范数钳制目标（‖J‖_F 上限）
         self.j_target_norm: float = float(os.environ.get("LMS_J_TARGET_NORM", "40.0"))
 
+        # ── 阶段 1 弥散态修复（2026-08-16，v1.2 §三 A 级）──
+        # per-node precision 差异性重标定（env 开关 + 快照回滚）：
+        #   弥散态根因 = J@σ 主导（J_norm 40 自 8/10 钳制）→ σ 输入不变
+        #   （inter-input cosine ≈ 1.0）→ precision 塌缩（极差 1.1%）→
+        #   surprise 退化为 mse 线性函数（方向响应丢失）。
+        # A 级 = 每个 sensory 节点的 precision 按其激活模式（跨输入误差
+        #   方差）单独重标定，恢复 node 间差异（非全局缩放），并把均值恢复
+        #   到 8/10 有结构期水平（π̄≈1.5，当前 ≈0.34）——恢复感官钳制
+        #   s·π 与 J@σ 的平衡（实验：J→5 + π×12~16 → surprise 组间差转正）。
+        # 开关：LMS_PRECISION_RECALIB=1 启用（默认 0，零行为变化，可回滚）；
+        #   LMS_PRECISION_RECALIB_MEAN=目标均值（默认 1.5）；
+        #   LMS_PRECISION_RECALIB_STRENGTH=重标定强度（默认 1.0）。
+        self.precision_recalib_enabled: bool = (
+            os.environ.get("LMS_PRECISION_RECALIB", "0") == "1")
+        self.precision_recalib_mean: float = float(
+            os.environ.get("LMS_PRECISION_RECALIB_MEAN", "1.5"))
+        self.precision_recalib_strength: float = float(
+            os.environ.get("LMS_PRECISION_RECALIB_STRENGTH", "1.0"))
+        if self.precision_recalib_enabled:
+            logger.info(
+                "per-node precision 差异性重标定已启用 "
+                f"(mean_target={self.precision_recalib_mean}, "
+                f"strength={self.precision_recalib_strength})——"
+                "阶段1 弥散态修复 A 级，env 可回滚")
+
     # ------------------------------------------------------------------ #
     #  推断
     # ------------------------------------------------------------------ #
+
+    def _recalibrate_precision_per_node(
+            self, precision: torch.Tensor,
+            sensory_input: torch.Tensor) -> torch.Tensor:
+        """per-node precision 差异性重标定（阶段 1 弥散态修复 A 级，v1.2 §三）。
+
+        弥散态根因链：J@σ 主导（J_norm 40 自 8/10 钳制）→ σ 输入不变
+        （inter-input cosine ≈ 1.0）→ precision 塌缩（极差 1.1%）→ surprise
+        退化为 mse 线性函数（方向响应丢失）。本方法恢复感官钳制 s·π 与
+        内部驱动 J@σ 的平衡：
+
+          π_i = π̄_target × (1 + strength × z_i)
+
+        其中 z_i 是每节点激活模式（跨输入误差 std）的 z-score——恢复
+        node 间差异（非全局乘一个系数）；π̄_target 默认 1.5（8/10 有结构期
+        均值，当前 ≈0.34）。每个节点按其历史方差/激活模式单独重标定。
+
+        激活模式来源：本次输入的 per-dim 误差 (σ−s)² 历史由调用方在
+        memory 层积累；本方法用 sensory_input 与 precision 当前值的
+        局部结构做轻量估计（零额外状态，可回滚）。
+
+        参数:
+            precision: 原始 precision 向量 [input_dim]。
+            sensory_input: 感官输入 [input_dim]（激活模式参考）。
+
+        返回:
+            重标定后的 precision 向量（克隆，不改原张量）。
+        """
+        # 局部激活模式：|sensory_input| 归一化后作为每节点权重基底
+        # （不同输入簇激活不同维度——即使 σ 被压平，输入模式仍有结构）。
+        act = sensory_input.abs()
+        act_sum = act.sum()
+        if act_sum < 1e-9:
+            return precision.clone()
+        # 激活占比（概率归一化）→ 每节点“重要性”权重
+        w = act / act_sum  # [input_dim]，和为 1
+        # 权重去中心化 z-score（保留 node 间差异的方向）
+        w_mean = w.mean()
+        w_std = w.std()
+        if w_std < 1e-9:
+            return precision.clone()
+        z = (w - w_mean) / w_std
+
+        # 重标定：均值恢复到目标，node 间差异按激活模式放大
+        pi_bar = float(self.precision_recalib_mean)
+        strength = float(self.precision_recalib_strength)
+        new_pi = pi_bar * (1.0 + strength * z)
+        # clamp 到 precision 合法范围（对齐 purpose 层 [0.1, 10]）
+        new_pi = torch.clamp(new_pi, 0.1, 10.0)
+        return new_pi.to(precision.device)
 
     def infer(self, sensory_input: torch.Tensor, precision: torch.Tensor,
               num_steps: int = 10,
@@ -201,6 +276,13 @@ class AttractorNetwork:
         # E-P2-1: 输入张量自动迁移到正确 device
         sensory_input = sensory_input.to(self.device)
         precision = precision.to(self.device)
+
+        # 阶段 1 弥散态修复（A 级，env 开关）：per-node precision 差异性
+        # 重标定——每个 sensory 节点按其激活模式单独重标定（恢复 node 间
+        # 差异），并把均值恢复到 8/10 有结构期水平。默认关（零行为变化）。
+        if self.precision_recalib_enabled:
+            precision = self._recalibrate_precision_per_node(
+                precision, sensory_input)
 
         # B7 修复：输入形状校验，防止晦涩的广播错误
         assert sensory_input.shape == (self.input_dim,), (
