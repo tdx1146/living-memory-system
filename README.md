@@ -3,9 +3,9 @@
 > 一个基于海马体模型的"活体"记忆痕迹维护器：通过自由能原理（FEP）学习规则，
 > 让记忆在与对话的持续交互中**涌现**、**巩固**与**演化**，而不是静态的键值存取。
 
-> 🔗 **系统定位**（2026-08-11）：本模块是「LMS 活体记忆」+ 体验层（实时反应/怀疑融入）。
-> 上游依赖：无（被胶水层/self_pulse/OpenClaw 调用）｜ 下游消费者：胶水层(:19000)、self_pulse、OpenClaw 插件
-> 外部接口：`:8190` /health、`/status/{sid}`、`/feed`、`/recall`、`/chat`、**`/react`（体验层A：infer-only 实时反应+解读段）**；`:8191` 控制口
+> 🔗 **系统定位**（2026-08-11 建立，08-15 同步阶段2/3/4）：本模块是「LMS 活体记忆」+ 体验层（实时反应/怀疑融入）+ 阶段3 precision 动态化 + 阶段4 做梦时怀疑。
+> 上游依赖：无（被胶水层/self_pulse/思考链 think_loop/OpenClaw 调用）｜ 下游消费者：胶水层(:19000)、self_pulse、思考链、OpenClaw 插件
+> 外部接口：`:8190` /health、`/status/{sid}`、`/feed`、`/store`、`/recall`、`/chat`、**`/react`**（体验层A：infer-only 实时反应+解读段）、**`/landscape/{sid}`**（阶段2：只读景观摘要，`?raw=1` 附完整张量 J/bias/sigma）；`:8191` 控制口
 > 仓库：`https://github.com/tdx1146/living-memory-system`（**main，公开**）
 > 系统全图：**见 `tdx1146/agent-os` 仓库的 `TOPOLOGY.md`**（https://github.com/tdx1146/agent-os/blob/main/TOPOLOGY.md）｜ **部署中心/数据流/踩坑：`SYSTEM.md`**（https://github.com/tdx1146/agent-os/blob/main/SYSTEM.md）
 
@@ -48,6 +48,15 @@ LMS 把记忆建模为一组相互竞争的**吸引子**（attractor），其连
    - **元目的翻转回初版**：coherence 低时**强化已关注维度**（`_meta_adjust` 改回 `avg_precision.argmax()`，越关注越专注）；
    - **怀疑融入（置信度场）**：记忆条目带 `confidence/rebuttal_count/labile/source_trust`，被证伪降权、做梦 `doubt_review` 阶段复核、
      反流畅项抑制虚假强化、唤起 salience 低置信配额相关性门控——**怀疑修正"信多少"，不改变"关注哪"**（confidence≠precision）。
+5. **precision 三层动态化（2026-08-13，阶段3）** —— precision 从"静态公式"改为"动态自适应"，零固定判定阈值：
+   - **条目级**：Koriat 自一致性（召回簇内两两余弦 → `adaptive_confidence`）；被反驳条目快照反驳前置信度（conformal 校准集）；
+   - **域级**：召回簇聚合（域反驳率在全局分布中的分数秩）；
+   - **全局级**：HGF 波动性 → `doubt_baseline`（分数秩）+ conformal P85 分位怀疑线（随证据流漂移）+ 对称性约束（重复曝光降权、负性 PE 不被低估）。
+   - 开关：`LMS_PRECISION_ADAPT`（默认 1；0=关 → 行为与引入前一致）。观测：`/status` 的 `precision_adapt` 块、`/react` 的 `reaction.doubt`、`/recall` 条目 `adaptive_confidence/consistency/doubt_verdict` 注解。
+6. **行动层 + 做梦时怀疑（2026-08-14，阶段4）** —— 怀疑本能（对话期证伪 → 思考期自我质疑）在巩固期的自然延伸：
+   - 做梦 `doubt_review` 阶段4：不完全线索复核（线索=文本前缀截断，绝不复述全文）+ 反教条 top-N 下沉 + 结果应用（有替代 ×0.9+合并 / 无替代 ×0.98）+ 冷却守卫（默认 86400s/条防高频做梦侵蚀）；
+   - 思考链深想产出行动四问（`action` 字段：what/willing/want/worth_against_energy + willingness/energy_cost/status），边界=只产出不执行。
+   - 开关：`DREAM_DOUBT_ENABLED`（默认 1；0=关 → 回退阶段 1 基础行为：labile 裁决+低置信 ×1.02 回稳+高频只 flag）。
 
 简言之：**LMS 不存储记忆，而是维护一个能产生记忆的大脑状态。**
 
@@ -158,13 +167,15 @@ python -m api.run
 验证是否真的加载了配置：`curl http://127.0.0.1:8190/status/main` 应返回非空 turn_count，
 且启动日志不应出现 "降级" 字样。
 
-验证体验层（2026-08-11 新功能）是否生效：
+验证体验层（2026-08-11 新功能）与阶段2/3（2026-08-13）是否生效：
 
 ```bash
 curl -X POST http://127.0.0.1:8190/react -H 'Content-Type: application/json' \
   -d '{"user_input":"你好","k":0}'
-# → 200，含 reaction（熵/惊讶/coherence）+ interpretation（解读段）；连续两次 turn_count 不变（零持久化）
+# → 200，含 reaction（熵/惊讶/coherence）+ interpretation（解读段）+ reaction.doubt（阶段3 分位怀疑线）；连续两次 turn_count 不变（零持久化）
 curl http://127.0.0.1:8190/status/main | grep -o '"doubt"'   # 体验层D：怀疑融入字段存在
+curl http://127.0.0.1:8190/status/main | python3 -c "import json,sys;print(json.load(sys.stdin).get('status',{}).get('precision_adapt'))"  # 阶段3：precision_adapt 块（baseline/threshold/window_n）
+curl http://127.0.0.1:8190/landscape/main | head -c 200        # 阶段2：只读景观摘要
 ```
 
 ### 3b. 启动 MCP 服务器（供 TRAE IDE 调用）
@@ -281,6 +292,12 @@ loop_config = cfg.to_loop_config()         # 转 loop 配置
 | `DREAM_FULL_CYCLE` | `false` | 是否使用完整七阶段做梦周期 |
 | `DREAM_CHECK_INTERVAL` | `5` | 调度器检查间隔（秒） |
 | `LMS_FEED_RATE_LIMIT` | `10` | /feed 限流（次/分钟，超限 429，防总线风暴） |
+| `LMS_PRECISION_ADAPT` | `1` | **阶段3 precision 三层动态化总开关**（0=关 → 行为与引入前一致；测试 conftest 默认 0 保旧行为） |
+| `DREAM_DOUBT_ENABLED` | `1` | **阶段4 做梦时怀疑总开关**（0=关 → 回退阶段 1 基础行为） |
+| `DREAM_DOUBT_ALT_SIM_MIN` | `0.7` | 做梦复核：替代条目向量相似度下限（≥0.7 且判定置信度更高 → 旧记忆 ×0.9 降权+合并） |
+| `DREAM_DOUBT_DOWNGRADE_FACTOR` / `DECAY_FACTOR` | `0.9` / `0.98` | 有替代降权 / 无替代衰减乘子 |
+| `DREAM_DOUBT_COOLDOWN_SECONDS` | `86400` | 每条目复核冷却（防高频做梦系统性侵蚀） |
+| `DREAM_DOUBT_REVIEW_MAX` / `ANTI_DOGMA_N` | — / `10` | 每轮复核批量上限 / 反教条 top-N 高频条目数 |
 | `LMS_SNAPSHOT_DIR` | `./snapshots` | 快照目录（.pt 状态文件） |
 | `LMS_*`（其余） | — | 任意 CoreConfig 字段大写加 `LMS_` 前缀，如 `LMS_TEMPERATURE` |
 
@@ -295,20 +312,24 @@ loop_config = cfg.to_loop_config()         # 转 loop 配置
 
 ## API 端点文档
 
-API 服务由 `api/server.py` 提供，共 10 个端点。简要列表如下，详细文档见
+API 服务由 `api/server.py` 提供，共 16 个端点（含 /feed、/store、/landscape、/self-ref/voice 等扩展）。简要列表如下，详细文档见
 [docs/API.md](docs/API.md)。
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| POST | `/react` | 实时反应只读（体验层A：infer-only 零持久化，返回 reaction+interpretation+可选 recalled；k=0 只要反应+解读） |
+| POST | `/react` | 实时反应只读（体验层A：infer-only 零持久化，返回 reaction+interpretation+可选 recalled；k=0 只要反应+解读；**含 `reaction.doubt`（阶段3：baseline/threshold 分位怀疑线）**） |
 | POST | `/chat` | 完整对话（手动控制 LLM 注入时机） |
 | POST | `/chat/simple` | 简化对话（自动处理记忆 + LLM 查询） |
-| GET | `/status/{sid}` | 查询会话记忆状态 |
+| POST | `/feed` | 总线塑形喂入（限流 10/min；**思考链 thought 也走它**：sender=thought，独立会话域） |
+| POST | `/store` | 写侧提取层（阶段2 接线：幂等去重 → 提取核心 ≤300 字 → 塑形；glue `/store-turn` 薄代理转发） |
+| GET | `/status/{sid}` | 查询会话记忆状态（**含 `precision_adapt` 块**：baseline/volatility/threshold/calibration_n，阶段3） |
+| GET | `/landscape/{sid}` | **只读景观摘要（阶段2）**：activation（entropy/entropy_norm/active_nodes/top_activated）+ energy（J 范数/稀疏度）；`?raw=1` 附完整张量 J/bias/sigma；会话缺失 fail-open 空结构不 500；思考链兴趣分数据源 |
 | POST | `/snapshot/{sid}` | 保存快照 |
 | POST | `/restore/{sid}` | 从快照恢复 |
 | GET | `/sessions` | 列出所有会话 |
+| GET | `/self-ref/voice` | 自指回路语音（2026-08-05，默认关闭，`LMS_SELF_REF_ENABLED=false`） |
 | DELETE | `/sessions/{sid}` | 删除指定会话 |
-| POST | `/dream/{sid}` | 手动触发做梦 |
+| POST | `/dream/{sid}` | 手动触发做梦（**阶段4 起含 doubt_review 阶段4：不完全线索复核+反教条下沉，明细进 `last_doubt_review_detail`**） |
 | GET | `/dream/status` | 查询做梦调度器状态 |
 | GET | `/health` | 健康检查 |
 
@@ -344,7 +365,7 @@ pytest --cov=. --cov-report=term-missing
 ```
 
 API 层测试（`tests/test_api_server.py`）使用轻量级 config（`num_nodes=32`）和 MockLLMBridge
-隔离外部 API，覆盖全部 10 个 HTTP 端点的正常流程、错误处理、并发 503 拒绝与快照往返恢复。
+隔离外部 API，覆盖全部 16 个 HTTP 端点的正常流程、错误处理、并发 503 拒绝与快照往返恢复。
 
 CI 配置位于 `.github/workflows/`：`ci.yml`（Python 3.10/3.11/3.12 矩阵 + CPU 版 PyTorch）
 与 `lint.yml`（ruff 风格检查，line-length=120）。
@@ -357,7 +378,7 @@ CI 配置位于 `.github/workflows/`：`ci.yml`（Python 3.10/3.11/3.12 矩阵 +
 │   ├── __init__.py
 │   ├── config.py               # API 配置（环境变量读取）
 │   ├── run.py                  # 服务启动脚本
-│   ├── server.py               # FastAPI 端点定义（10 个端点）
+│   ├── server.py               # FastAPI 端点定义（16 个端点：/health /chat /chat/simple /feed /store /react /recall /status /landscape /snapshot /restore /sessions /self-ref/voice /dream /dream/status 等）
 │   └── session_manager.py      # 会话管理器
 ├── bridge/                     # 桥接层（文本↔向量转换 + LLM）
 │   ├── __init__.py
@@ -369,9 +390,10 @@ CI 配置位于 `.github/workflows/`：`ci.yml`（Python 3.10/3.11/3.12 矩阵 +
 │   ├── config.py               # CoreConfig 统一配置（含 validate/from_env）
 │   ├── paths.py                # 跨平台路径管理（pathlib，缓存目录探测）
 │   ├── types.py                # 核心数据类型（SensoryInput/Activation/PurposeState；体验层D：EpisodicEntry 置信度场字段）
-│   ├── doubt/                  # 体验层D：怀疑融入（置信度场/去稳定化/召回调度/doubt_ingest/gap_registry）
+│   ├── doubt/                  # 体验层D：怀疑融入 + 阶段3/4（置信度场/去稳定化/召回调度/doubt_ingest/gap_registry/precision_adapt）
 │   │   ├── __init__.py
-│   │   ├── confidence_field.py # 置信度场（confidence = 1×(1−rebuttal_rate)×source_trust）
+│   │   ├── precision_adapt.py  # 阶段3（2026-08-13）：precision 三层动态化（HGF 波动性→doubt_baseline / conformal 分位怀疑线 / Koriat 自一致性 / 对称性约束），LMS_PRECISION_ADAPT 开关
+│   │   ├── confidence_field.py # 置信度场（confidence = 1×(1−rebuttal_rate)×source_trust；mark_rebutted 快照反驳前置信度→conformal 校准集）
 │   │   ├── reconsolidation.py  # 惊讶度双角色：去稳定化（mark_labile）
 │   │   ├── recall_scheduler.py # 唤起 salience（相关性门控配额）
 │   │   ├── doubt_ingest.py     # /feed 结构化 doubt 摄入（fail-open）
@@ -379,7 +401,7 @@ CI 配置位于 `.github/workflows/`：`ci.yml`（Python 3.10/3.11/3.12 矩阵 +
 │   ├── hippocampus/            # 海马体子模块
 │   │   ├── __init__.py
 │   │   ├── attractor.py        # 吸引子网络（FEP 推断与学习）
-│   │   ├── dream_engine.py     # 做梦引擎（MVP + 完整七阶段）
+│   │   ├── dream_engine.py     # 做梦引擎（MVP + 完整七阶段；阶段4 起 doubt_review 含不完全线索复核+反教条下沉，DREAM_DOUBT_ENABLED 开关）
 │   │   ├── memory.py           # 记忆管理器（短时/长时 + 向量化检索）
 │   │   └── purpose.py          # 目的层（precision 演化 + coherence）
 │   ├── meta/                   # 元可塑性
