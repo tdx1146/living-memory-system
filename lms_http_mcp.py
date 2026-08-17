@@ -18,31 +18,68 @@ DEFAULT_SESSION = "main"
 
 
 def lms_recall(user_input: str, sid: str = DEFAULT_SESSION) -> dict:
-    """检索记忆context
-    
+    """检索记忆context（纯只读）
+
+    P0-9/T1.3：转发 :8190 /recall 只读端点——不 process_turn、不调 LLM、
+    不写缓冲、不落盘，turn_count 零增量。
+
+    2026-08-17 修复（recall 纯只读）：此前误 POST /chat（写路径，内部
+    process_turn → turn_count += 1），每次检索 +1 turn，污染 allostatic
+    统计与 turn 语义（754=750+4 实证）。现改走 /recall，并附加一次只读
+    GET /status 组装 memory_state（与旧 /chat 返回形态同构）。
+
     Args:
         user_input: 用户输入
         sid: 会话ID（默认main）
-    
+
     Returns:
         包含记忆context的字典
     """
     try:
-        # P0-3 止血修复：旧请求体用 sid 字段，服务端 pydantic 默认忽略未知字段
-        # → 检索也静默落进 default 脑。统一改用 session_id 字段。
+        # 只读检索：query 走 /recall 的 query 字段（k=5 与服务端默认一致）。
+        # 注意：/chat 是写路径（process_turn），检索禁用；/recall 才是只读口。
         response = requests.post(
-            f"{LMS_API_URL}/chat",
-            json={"session_id": sid, "user_input": user_input},
+            f"{LMS_API_URL}/recall",
+            json={"session_id": sid, "query": user_input, "k": 5},
             timeout=10
         )
         response.raise_for_status()
         data = response.json()
-        
+
+        # /recall 响应自带 turn_count 锚点（只读校验用，测试与可观测性）
+        anchor_turn = int(data.get("turn_count", 0) or 0) \
+            if isinstance(data, dict) else 0
+
+        # 组装 memory_context（相关记忆文本；与旧 /chat 返回形态同构）
+        results = data.get("results", []) if isinstance(data, dict) else []
+        if results:
+            lines = []
+            for i, item in enumerate(results, 1):
+                text = (item or {}).get("text", "")
+                score = (item or {}).get("score", 0.0)
+                lines.append(f"--- 记忆 {i}（相关度 {score:.3f}）---\n{text}")
+            memory_context = "\n\n".join(lines)
+        else:
+            memory_context = ""
+
+        # 附加当前会话状态（只读 GET；失败不影响检索结果本身）
+        memory_state = {}
+        turn_count = anchor_turn
+        try:
+            st = requests.get(f"{LMS_API_URL}/status/{sid}", timeout=5)
+            if st.status_code == 200:
+                status = st.json().get("status", {})
+                if isinstance(status, dict):
+                    memory_state = status
+                    turn_count = int(status.get("turn_count", 0) or 0)
+        except Exception:
+            pass  # /recall 的 turn_count 锚点兜底
+
         return {
             "success": True,
-            "memory_context": data.get("memory_context", ""),
-            "memory_state": data.get("memory_state", {}),
-            "turn_count": data.get("memory_state", {}).get("turn_count", 0)
+            "memory_context": memory_context,
+            "memory_state": memory_state,
+            "turn_count": turn_count
         }
     except Exception as e:
         return {"success": False, "error": str(e)}
