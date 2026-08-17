@@ -53,3 +53,6 @@ openclaw.json*
 *.pem
 *identity*.key
 secrets/
+
+# P0 污染处置备份（2026-08-17）：备份物不入库（同 data/ 约定，磁盘保留）
+backups/
