@@ -1,0 +1,43 @@
+{
+  "module": "core/store",
+  "milestone": "M1-1",
+  "rewrite_spec": "四妹-LMS核心重写规格v2-20260817.md §1.5 / §2.2 / §5.2",
+  "claims": {
+    "idempotency": {
+      "statement": "写侧所有入口（ingest/feed/store）幂等：同键重发不双写，已处理键原样返回原结果",
+      "verified_by": "tests/test_store_m1.py::test_idempotent_key_resend_no_double_write"
+    },
+    "register_after_success": {
+      "statement": "写成功才登记幂等键；writer 失败不登记，重试同键可重写（修复旧实现失败也占用窗口的假 dedup_hit）",
+      "verified_by": "tests/test_store_m1.py::test_failed_write_not_registered_retry_allowed"
+    },
+    "concurrent_same_key_serialized": {
+      "statement": "同键并发（首写与超时重试同时在途）由同键锁串行化，全程只写一次",
+      "verified_by": "tests/test_store_m1.py::test_timeout_retry_race_single_write"
+    },
+    "feed_store_separation": {
+      "statement": "feed 永不灰化且 source 必须可召回；store 灰度走 store_gray（L1 不可召回——口径登记，非 bug）",
+      "verified_by": "tests/test_store_m1.py::test_feed_store_semantic_separation"
+    },
+    "dedup_hit_no_side_effect": {
+      "statement": "幂等命中路径零写入、零状态变更（无副作用）",
+      "verified_by": "tests/test_store_m1.py::test_dedup_hit_returns_original_result"
+    },
+    "doubt_hook_fail_open": {
+      "statement": "注入时怀疑钩子异常 fail-open，绝不阻断写侧",
+      "verified_by": "tests/test_store_m1.py::test_doubt_hook_fail_open"
+    },
+    "doubt_hook_labile_not_persisted": {
+      "statement": "注入时怀疑信号是 labile 内存态，绝不落库：幂等记录/写结果/响应不被怀疑标记污染（§2.2 只读防线同款）",
+      "verified_by": "tests/test_store_m1.py::test_doubt_hook_labile_not_persisted"
+    },
+    "window_is_race_guard_not_permanent_dedup": {
+      "statement": "60s 窗口是竞态防护不是永久去重；窗口外同键视为新写（旧结果自然过期）",
+      "verified_by": "tests/test_store_m1.py::test_window_expiry_allows_new_write"
+    },
+    "journal_replay_survives_restart": {
+      "statement": "journal 配置时窗口内重启后重放：重启后同键重试不双写（写侧默认保守）",
+      "verified_by": "tests/test_store_m1.py::test_journal_replay_after_restart"
+    }
+  }
+}
