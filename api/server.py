@@ -21,18 +21,6 @@
 
 记忆处理与 LLM 调用均为同步执行（torch 非 async），FastAPI 端点使用
 run_in_executor 将阻塞调用交给线程池，避免阻塞事件循环。
-
-    【M1 接线（2026-08-17，核心重建·血管不换）】
-    /store /feed 端点内部实现已改调 core/store 写侧统一入口
-    （api/wiring.py：语义分离 + 幂等键机制 + 注入时怀疑钩子）。
-    端点路径 / 请求参数名 / 返回结构与现状逐字节同构——血管不换；
-    memory-recall.js / glue 消费者无感。
-    旧 /store 幂等去重（_store_dedup_*）与灰度开关读取（_store_gray_enabled）
-    已删除：幂等键机制迁入 core/store（LMS_STORE_IDEMPOTENCY_WINDOW，
-    写成功才登记——修复旧"失败也占用窗口"的假 dedup_hit）；灰度开关由
-    core/store 语义层统一读取（LMS_STORE_GRAY，单一权威）。
-    本文件为生产 api/server.py 的接线版副本（M8 合入时按
-    rewrite-M1/api/README-接线方案.md 的步骤 diff 合入生产）。
 """
 
 import os
@@ -54,7 +42,24 @@ from api.session_manager import SessionManager
 from api.config import get_api_config
 from runtime.dream_scheduler import DreamScheduler
 from persistence.audit import audit
-from api import wiring as store_wiring  # M1 接线：/store /feed 写侧统一入口（core/store）
+
+# M2（recall 只读化）：只读四不变违反异常 + 空怀疑投影（§5.1 / §4.2）。
+# core/recall 为纯 stdlib 模块，无循环依赖。
+from core.recall.guard import ReadOnlyViolation
+from core.recall.suspicion import empty_suspicion
+
+
+def _last_suspicion(loop) -> dict:
+    """读取 loop 最近一次检索的怀疑投影（旧实例无该属性 → 空投影）。
+
+    怀疑信号区只追加在既有响应结构之后（§4.2 独立区段），空检索也返回
+    稳定同构结构（消费端零特判）。
+    """
+    try:
+        s = getattr(loop, 'last_recall_suspicion', None)
+    except Exception:  # pylint: disable=broad-except
+        return empty_suspicion()
+    return s if isinstance(s, dict) else empty_suspicion()
 
 # ---------------------------------------------------------------------------
 # 日志配置
@@ -297,10 +302,11 @@ _FEED_RATE_WINDOW = 60.0
 
 
 # ---------------------------------------------------------------------------
-# M1 接线（core/store）：/store 状态——每会话限流 + 503 计数
-# （幂等去重已迁入 core/store 幂等键机制，LMS_STORE_IDEMPOTENCY_WINDOW；
-#  旧 _store_dedup_* / _store_gray_enabled 已删除，见 api/wiring.py 决策登记）
+# 提取层 v1.4（S1-1）：/store 状态——幂等去重 + 每会话限流 + 503 计数
 # ---------------------------------------------------------------------------
+_store_dedup: dict = {}          # {session_id: {dedup_key: ts}}
+_store_dedup_lock = threading.Lock()
+
 _store_rate: dict = {}           # {session_id: (window_start, count)}
 _store_rate_lock = asyncio.Lock()
 STORE_RATE_WINDOW = 60.0
@@ -310,8 +316,11 @@ _store_503_lock = threading.Lock()
 
 
 # 提取层 v1.4（S1-1）：运行时可调参数——请求时读取 env（灰度"随时可关"语义：
-# LMS_STORE_RATE_LIMIT/LMS_STORE_SESSION_ALLOWLIST 改动即时生效，无需重启；
-# 灰度开关 LMS_STORE_GRAY 由 core/store 语义层读取——单一权威，见 wiring.py）
+# LMS_STORE_GRAY/LMS_STORE_RATE_LIMIT/LMS_STORE_DEDUP_WINDOW/
+# LMS_STORE_SESSION_ALLOWLIST 改动即时生效，无需重启）
+def _store_gray_enabled() -> bool:
+    """灰度标记开关（LMS_STORE_GRAY=1 期间 /store 条目带 gray 标记）。"""
+    return os.environ.get("LMS_STORE_GRAY", "0") == "1"
 
 
 def _store_rate_limit() -> int:
@@ -322,11 +331,42 @@ def _store_rate_limit() -> int:
         return 30
 
 
+def _store_dedup_window() -> float:
+    """幂等去重窗口秒数（默认 60）。"""
+    try:
+        return max(1.0, float(
+            os.environ.get("LMS_STORE_DEDUP_WINDOW", "60") or 60))
+    except (TypeError, ValueError):
+        return 60.0
+
+
 def _store_session_allowlist() -> set:
     """会话白名单（默认 {main}；M6：验收全用 main）。"""
     raw = os.environ.get("LMS_STORE_SESSION_ALLOWLIST", "main").strip()
     allow = {s.strip() for s in raw.split(",") if s.strip()}
     return allow or {"main"}
+
+
+def _store_dedup_key(user_input: str, llm_output: str) -> str:
+    """幂等键：sha256(user_input, llm_output)（工程惯例，设计附录 B 标注）。"""
+    return hashlib.sha256(
+        f"{user_input}\x00{llm_output}".encode("utf-8")).hexdigest()
+
+
+def _store_dedup_hit(session_id: str, key: str,
+                     window: Optional[float] = None) -> bool:
+    """滑动窗口幂等去重：窗口内同 payload → True（不重复处理）。"""
+    window = _store_dedup_window() if window is None else window
+    now = time.time()
+    with _store_dedup_lock:
+        bucket = _store_dedup.setdefault(session_id, {})
+        expired = [k for k, ts in bucket.items() if now - ts > window]
+        for k in expired:
+            bucket.pop(k, None)
+        if key in bucket:
+            return True
+        bucket[key] = now
+        return False
 
 
 async def _store_rate_check(session_id: str) -> Optional[float]:
@@ -413,6 +453,25 @@ async def _request_id_middleware(request: Request, call_next):
     response = await call_next(request)
     response.headers["X-Request-ID"] = rid
     return response
+
+
+# ---------------------------------------------------------------------------
+# M2（§5.1）：ReadOnlyViolation → 500 全局映射（注意：必须注册在 app 定义之后）
+# ---------------------------------------------------------------------------
+# 只读四不变违反（/recall、/react 检索段、MCP 直连路径）统一映射 500 + 告警
+# （G 模式：禁止静默、绝不 fail-open 掩盖——这是机器防线在抓失守）。
+# 端点侧只负责"重抛不吞"（except ReadOnlyViolation: raise），映射收敛到此处，
+# 任何未来新增的只读调用面无需重复写映射。
+@app.exception_handler(ReadOnlyViolation)
+async def _readonly_violation_handler(request: Request, exc: ReadOnlyViolation):
+    from fastapi.responses import JSONResponse
+    rid = getattr(request.state, "request_id", "-")
+    logger.error(
+        f"[{rid}] 只读四不变违反（scope={exc.scope}）: {exc}")
+    return JSONResponse(
+        status_code=500,
+        content={"detail": f"只读四不变违反: {exc}"},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -629,10 +688,6 @@ async def feed(req: FeedRequest):
     塑形但不产 LLM 回复（process_turn 返回的记忆 context 直接丢弃）。
     LMS 内部如何塑形（权重/吸引子演化）是它自己的事，总线不指挥。
 
-    【M1 接线】写侧统一入口：core/store feed 语义（永不灰化 + source
-    可召回——坑 6 口径）＋幂等键机制（同 payload 60s 内重发不重复塑形，
-    D-4）；FeedRequest.source 保持观测字段（D-3，不透传）。
-
     - 限流：默认 ≤10 次/分钟（LMS_FEED_RATE_LIMIT 可覆盖），超限 429
     - 与 /chat 等现有端点完全独立，互不影响
     - 做梦协调：与对话请求同等对待（等待做梦完成），防止并发写记忆状态
@@ -652,29 +707,38 @@ async def feed(req: FeedRequest):
     sm = get_session_manager()
     scheduler = get_dream_scheduler()
     loop = sm.get_or_create(req.session_id)
+    scheduler.register_session(req.session_id)
 
-    # 写侧统一入口（core/store feed 语义）：语义校验 → 幂等查重 → 塑形
-    # → 登记。writer 内部完成做梦协调（D-5：dedup 命中不协调）。
-    write_req = store_wiring.build_feed_request(req)
-    writer = store_wiring.make_feed_writer(
-        loop, scheduler=scheduler, session_id=req.session_id)
+    acquired = scheduler.acquire_conversation(req.session_id)
+    scheduler.touch(req.session_id)
+    if not acquired:
+        raise HTTPException(
+            status_code=503,
+            detail="系统正在做梦（记忆巩固中），请稍后重试。")
     try:
-        result = await asyncio.get_event_loop().run_in_executor(
-            None, lambda: store_wiring.feed_ingest(write_req, writer))
-    except Exception as e:  # 写侧异常 → HTTP 映射（422 语义违规 / 503 做梦）
-        mapped = store_wiring.http_error_for(e)
-        if mapped is None:
-            raise
-        status, detail, headers = mapped
-        raise HTTPException(status_code=status, detail=detail, headers=headers)
+        # 塑形但不产 LLM 回复：返回值是记忆 context，直接丢弃
+        # 提取层 v1.4（S1-2）：llm_output 透传进塑形（可选；sender 仅日志）
+        await asyncio.get_event_loop().run_in_executor(
+            None, lambda: loop.process_turn(
+                req.text, llm_output=req.llm_output))
+        status = loop.get_status()
+        logger.info(
+            f"[{req.session_id}] /feed 塑形完成 "
+            f"(source={req.source}, sender={req.sender or '-'}, "
+            f"text_len={len(req.text)}, "
+            f"llm_output_len={len(req.llm_output)})")
+    finally:
+        scheduler.release_conversation(req.session_id)
 
-    logger.info(
-        f"[{req.session_id}] /feed 塑形完成 "
-        f"(source={req.source}, sender={req.sender or '-'}, "
-        f"text_len={len(req.text)}, "
-        f"llm_output_len={len(req.llm_output)}, "
-        f"dedup_hit={result.dedup_hit})")
-    return FeedResponse(**store_wiring.build_feed_response(result, req))
+    return FeedResponse(
+        status="ok",
+        entropy=float(status.get("last_entropy", 0.0) or 0.0),
+        surprise=float(status.get("last_surprise", 0.0) or 0.0),
+        free_energy=float(status.get("last_free_energy", 0.0) or 0.0),
+        mse=float(status.get("last_mse", 0.0) or 0.0),
+        turn_count=int(status.get("turn_count", 0) or 0),
+        session_id=req.session_id,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -682,19 +746,17 @@ async def feed(req: FeedRequest):
 # ---------------------------------------------------------------------------
 @app.post("/store", response_model=StoreResponse)
 async def store(req: StoreRequest):
-    """提取层写侧入口（腿 1，S1-1）——【M1 接线】改调 core/store 写侧统一入口。
+    """提取层写侧入口（腿 1，S1-1）。
 
-    流程（§7.1，内部实现已换，端点形态冻结）：
+    流程（§7.1）：
       1. 会话白名单（LMS_STORE_SESSION_ALLOWLIST，默认 main）→ 非白名单 422
       2. 每会话限流（B7：限流每会话桶；默认 30/分，灰度期建议 10）
-      3. core/store 写侧统一入口（语义校验 → 幂等查重 → 写 → 登记）：
-         - 幂等键机制（LMS_STORE_IDEMPOTENCY_WINDOW，默认 60s）——
-           "客户端超时≠未写入"；**写成功才登记**（修复旧假 dedup_hit）；
-         - feed/store 语义分离 + 注入时怀疑钩子（M3 接入点）；
-      4. writer 内部（api/wiring.py）：提取核心（≤300 字，两段式，S1-5）
-         ＋分段标记（S1-3，观测）→ process_turn(user_input, 核心)
-         （embed 3 处全包熔断，S1-7；内部检索即写侧引用加固 P2-B）
-         → 新条目 meta（core/info_value/ts/gray/source，S1-11 字段）。
+      3. 幂等去重（sha256(user_input,llm_output)，60s 窗口）→ 命中不重复处理
+      4. 提取核心（≤300 字，两段式，S1-5）＋分段标记（S1-3，观测）
+      5. process_turn(user_input, 核心)（embed 3 处全包熔断，S1-7）——
+         内部检索即写侧引用加固（P2-B：count_reference=True 默认路径＋
+         reinforce_turn 刷新，跳过 gray 天然满足）
+      6. 后处理新条目 meta：core/info_value/ts/gray/source（S1-11 字段）
 
     熔断降级（P3）：写侧 embed 熔断 → 503＋Retry-After:30＋degraded 响应体
     （插件 fail-open 不重试）；store_503_count 计数（进灰度仪表）。
@@ -722,42 +784,150 @@ async def store(req: StoreRequest):
         )
 
     sm = get_session_manager()
-    scheduler = get_dream_scheduler()
     loop = sm.get_or_create(req.session_id)
 
-    # 3. 写侧统一入口（core/store）：语义校验 → 幂等查重 → 写 → 登记。
-    #    writer 内部完成：核心提取 → 做梦协调（D-5）→ process_turn →
-    #    条目 meta 后处理（embed 熔断降级抛 StoreDegradedError → 503）。
-    write_req = store_wiring.build_store_request(req)
-    writer = store_wiring.make_store_writer(
-        loop, scheduler=scheduler, session_id=req.session_id)
-    try:
-        result = await asyncio.get_event_loop().run_in_executor(
-            None, lambda: store_wiring.store_ingest(write_req, writer))
-    except store_wiring.StoreDegradedError as e:
-        # 熔断降级（P3）：写侧 embed 熔断 → 503＋Retry-After:30＋degraded
-        _store_count_503()
-        logger.error(f"[{req.session_id}] /store 塑形失败（503）: {e}")
-        from fastapi.responses import JSONResponse
-        return JSONResponse(
-            status_code=503,
-            content={
-                "status": "degraded",
-                "reason": e.reason,
-                "turn": e.turn,
-            },
-            headers={"Retry-After": "30"},
+    # 3. 幂等去重（60s 窗口）
+    dedup_key = _store_dedup_key(req.user_input, req.llm_output)
+    if _store_dedup_hit(req.session_id, dedup_key):
+        logger.info(
+            f"[{req.session_id}] /store 幂等命中（窗口内同 payload，不重复处理）")
+        return StoreResponse(
+            session_id=req.session_id,
+            turn_count=loop.turn_count,
+            stored=True,          # 该内容此前已落库
+            dedup_hit=True,
+            value_filtered=True,
+            core_chars=0,
+            gray=False,
+            surprise=0.0,
+            info_value=0.0,
         )
-    except Exception as e:  # 其余写侧异常 → HTTP 映射（422 语义违规 / 503 做梦）
-        mapped = store_wiring.http_error_for(e)
-        if mapped is None:
-            raise
-        status, detail, headers = mapped
-        raise HTTPException(status_code=status, detail=detail, headers=headers)
 
-    # 4. 响应（与 StoreResponse 字段集合逐字节同构——血管不换；
-    #    dedup 命中 D-2：原样返回首次写结果）
-    return StoreResponse(**store_wiring.build_store_response(result, loop, req))
+    # 4. 提取核心（≤300 字）+ 分段标记（观测）
+    from api.extract_core import extract_core
+    from api.segment_reply import segment_reply
+    core = extract_core(req.llm_output)
+    try:
+        segments = segment_reply(core or req.llm_output)
+    except Exception:  # pylint: disable=broad-except
+        segments = []
+
+    # 5. 做梦协调（与 /chat//feed 同等对待，防并发写记忆状态）
+    scheduler = get_dream_scheduler()
+    scheduler.register_session(req.session_id)
+    acquired = scheduler.acquire_conversation(req.session_id)
+    scheduler.touch(req.session_id)
+    if not acquired:
+        raise HTTPException(
+            status_code=503,
+            detail="系统正在做梦（记忆巩固中），请稍后重试。")
+
+    epi_before = loop.memory.episodic_size()
+    gray = _store_gray_enabled()
+    try:
+        # 5a. process_turn（embed 3 处全包熔断；核心 ≤300 字塑形）
+        try:
+            await asyncio.get_event_loop().run_in_executor(
+                None, lambda: loop.process_turn(req.user_input, core))
+        except Exception as e:  # pylint: disable=broad-except
+            # 熔断 CLOSED 窗口 embed 裸抛（既有行为）→ 503 fail-open
+            # （C-05 先例：503 属预期失败，插件不重试不进死信）
+            _store_count_503()
+            logger.error(f"[{req.session_id}] /store 塑形失败（503）: {e}")
+            from fastapi.responses import JSONResponse
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "status": "degraded",
+                    "reason": "embed_unavailable",
+                    "turn": loop.turn_count,
+                },
+                headers={"Retry-After": "30"},
+            )
+
+        # 5b. 熔断降级检测（P3 ②）：写侧语义向量失败 → 本轮不落库 → 503
+        if loop.memory.episodic_size() == epi_before and getattr(
+                loop, 'last_turn_degraded', False):
+            _store_count_503()
+            logger.warning(
+                f"[{req.session_id}] /store embed 熔断降级 → 503"
+                "（不落僵尸：无向量条目=检索不可达）")
+            from fastapi.responses import JSONResponse
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "status": "degraded",
+                    "reason": "embed_circuit_open",
+                    "turn": loop.turn_count,
+                },
+                headers={"Retry-After": "30"},
+            )
+
+        # 6. 后处理新条目 meta（S1-11 字段：core/info_value/ts/gray/source）
+        entries = list(loop.memory.iter_episodic())
+        new_entry = entries[-1] if entries else None
+        stored = False
+        reason = None
+        info_value = 0.0
+        if new_entry is not None and \
+                loop.memory.episodic_size() > epi_before:
+            new_entry.core = core or None
+            new_entry.ts = time.time()
+            if gray:
+                # 灰度标记：三重冻结（不参与重放/聚类/引用加固；
+                # L1 天然不可见：source_filter='external' 过滤 store_gray）
+                new_entry.gray = True
+                new_entry.source = 'store_gray'
+            # 价值分数（论文判据 §6.2；条目已带 process_turn 原生 surprise）
+            try:
+                from api.value_filter import (
+                    compute_info_value, value_filtered,
+                )
+                surprises = [float(getattr(e, 'surprise', 0.0) or 0.0)
+                             for e in entries]
+                refs = [float(getattr(e, 'reference_count', 0) or 0)
+                        for e in entries]
+                info_value = compute_info_value(
+                    surprise=float(getattr(new_entry, 'surprise', 0.0) or 0.0),
+                    reference_count=int(
+                        getattr(new_entry, 'reference_count', 0) or 0),
+                    surprise_max=max(surprises) if surprises else None,
+                    ref_count_max=max(refs) if refs else None,
+                    text=core or req.llm_output,
+                )
+                new_entry.info_value = info_value
+            except Exception as e:  # pylint: disable=broad-except
+                logger.warning(
+                    f"[{req.session_id}] /store info_value 计算失败（fail-open）: {e}")
+            stored = True
+        else:
+            # 未落库：垃圾过滤命中 / embedder 无语义编码（非熔断降级）
+            stored = False
+            reason = "filtered_garbage" if not getattr(
+                loop, 'last_turn_degraded', False) else "embed_circuit_open"
+
+        vf = True
+        try:
+            from api.value_filter import value_filtered
+            vf = value_filtered(info_value)
+        except Exception:  # pylint: disable=broad-except
+            pass
+
+        status = loop.get_status()
+        return StoreResponse(
+            session_id=req.session_id,
+            turn_count=loop.turn_count,
+            stored=stored,
+            dedup_hit=False,
+            value_filtered=vf,
+            core_chars=len(core),
+            gray=gray and stored,
+            surprise=float(status.get("last_surprise", 0.0) or 0.0),
+            info_value=round(info_value, 4),
+            reason=reason,
+        )
+    finally:
+        scheduler.release_conversation(req.session_id)
 
 
 @app.post("/react")
@@ -785,6 +955,11 @@ async def react(req: ReactRequest):
     try:
         data = await asyncio.get_event_loop().run_in_executor(
             None, lambda: loop.react_readonly(req.user_input, k=k))
+    except ReadOnlyViolation:
+        # M2（§5.1）：重抛不吞——全局 exception_handler 映射 500 + 告警
+        # （G 模式禁止静默，绝不 fail-open 掩盖——/react 是 infer-only 读口，
+        # 违反即失守）。
+        raise
     except Exception as e:
         # 只读路径异常：500（调用方 fail-open 降级，不阻塞主循环）
         logger.error(f"[{req.session_id}] /react 实时反应失败: {e}")
@@ -796,6 +971,9 @@ async def react(req: ReactRequest):
         "session_id": req.session_id,
         **data,
         "duration_ms": duration_ms,
+        # M2：检索时怀疑信号投影（§4.2 独立区段——只追加在既有结构之后，
+        # 不改动既有字段语义；labile 内存态投影，不落库）。
+        "suspicion": _last_suspicion(loop),
     }
 
 
@@ -829,6 +1007,10 @@ async def recall(req: RecallRequest):
         # T2.3：内存+归档合并检索（内存优先；归档超时/异常内部 fail-open）
         results = await asyncio.get_event_loop().run_in_executor(
             None, lambda: loop.recall_merged_readonly(req.query, k=k))
+    except ReadOnlyViolation:
+        # M2（§5.1）：重抛不吞——全局 exception_handler 映射 500 + 告警
+        # （G 模式禁止静默：这是机器防线在抓失守，绝不 fail-open 返回空结果掩盖）。
+        raise
     except Exception as e:
         # 只读路径异常：fail-open，返回空结果，绝不 500 拖垮调用方
         logger.error(f"[{req.session_id}] /recall 检索失败（返回空）: {e}")
@@ -846,6 +1028,9 @@ async def recall(req: RecallRequest):
         "turn_count": loop.turn_count,
         # 阶段 3：precision 动态化观测块（纯增量字段；开关关 → {}）
         "doubt": loop.doubt_status_block(),
+        # M2：检索时怀疑信号投影（§4.2 独立区段——只追加在既有结构之后，
+        # 不改动既有字段语义；labile 内存态投影，不落库）。
+        "suspicion": _last_suspicion(loop),
     }
 
 

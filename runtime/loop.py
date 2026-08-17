@@ -37,6 +37,12 @@ from persistence.snapshot import (
 )
 from persistence.recovery import Recovery
 
+# M2（recall 只读化）：只读四不变守卫 + 怀疑信号投影。
+# core/recall 为纯 stdlib 模块（不 import 本仓库运行时），无循环依赖。
+from core.recall.guard import (
+    FourInvariantGuard, episodic_fingerprint)
+from core.recall.suspicion import project_suspicion, empty_suspicion
+
 logger = logging.getLogger(__name__)
 
 
@@ -221,6 +227,11 @@ class LivingMemoryLoop:
         # 与 decoder 共享窗口（self.surprise_history，/chat 路径在用）隔离，
         # /react 解读零污染 /chat 路径（惊讶度修复 P0-12 零回归）。
         self.react_surprise_history: deque = deque(maxlen=200)
+
+        # M2（recall 只读化）：最近一次只读检索的怀疑信号投影。
+        # 纯内存态（同 react_surprise_history 先例：不落盘、不进快照、
+        # 重启即失）；/recall 与 /react 响应 suspicion 区段数据源。
+        self.last_recall_suspicion: dict = empty_suspicion()
 
         # 体验层 D（设计 v1.1 §6.2）：去稳定化的近 200 轮 surprise 窗口
         # （G1 思路，LMS 内自有 deque；与 /react 窗口独立）
@@ -940,33 +951,53 @@ class LivingMemoryLoop:
     #  阶段 3（precision 三层动态化）：召回/观测钩子
     # ================================================================== #
 
-    def _attach_consistency(self, scored) -> None:
-        """阶段 3：召回簇 → Koriat 自一致性 + 域级/置信度窗口观测。
+    def _project_consistency_readonly(self, scored) -> dict:
+        """只读一致性投影（M2，替换旧 _attach_consistency）。
 
-        - compute_consistency：同主题簇互相印证度（召回时计算，零固定
-          阈值：自适应线 = 簇内相似度分布 P50）
-        - 结果缓存到条目 consistency 字段（进程内，供 /recall 注解与
-          verdict 判定）与 precision_adapt.consistency_cache
-        - record_recall_cohort：域级统计 + 置信度窗口（怀疑率观测）
+        旧 ``_attach_consistency`` 在 recall 内改写 ``entry.consistency``
+        并随快照持久化（``memory.get_state()`` 直接返回条目对象）= **只读
+        泄漏（P1，未修）**——M2 已整体删除该方法。
 
-        开关关/异常 → 静默跳过（零参与，fail-open）。
+        本方法只计算 + 更新**进程内观测缓存**（consistency_cache / 召回簇
+        统计），**绝不 setattr 条目**；一致性值通过返回的 ``cons_map``
+        （{id(entry): cons}）供调用方做响应注解与怀疑投影，绝不落库
+        （进程内观测同 react_surprise_history 先例：重启即失、快照不落盘）。
+
+        开关关/异常 → 返回 {}（调用方 fail-open 降级回旧行为）。
         """
         if self.precision_adapt is None or not scored:
-            return
+            return {}
         try:
             from core.doubt.precision_adapt import compute_consistency
             cons = compute_consistency(scored)
-            for _score, entry in scored:
-                c = cons.get(id(entry))
-                if c is not None:
-                    try:
-                        entry.consistency = round(c, 4)
-                    except Exception:
-                        pass
+            # 进程内观测缓存（供 /recall 注解与 doubt 观测块；零持久化）
             self.precision_adapt.consistency_cache.update(cons)
-            self.precision_adapt.record_recall_cohort(scored)
-        except Exception:
-            pass
+            try:
+                self.precision_adapt.record_recall_cohort(scored)
+            except Exception:  # pylint: disable=broad-except
+                pass
+            return cons
+        except Exception:  # pylint: disable=broad-except
+            return {}
+
+    def _readonly_state_snapshot(self) -> dict:
+        """只读四不变状态快照（§5.1：turn / episodic 条目集 / J / σ）。
+
+        供 core.recall.guard 比较；张量转 list（纯 stdlib 可比形态）。
+        episodic 条目集指纹含全部可变标量字段（含 consistency）——既能
+        抓条目增删，也能抓字段改写（旧 _attach_consistency 泄漏形态）。
+        """
+        return {
+            "turn": self.turn_count,
+            "episodic": episodic_fingerprint(self.memory.iter_episodic()),
+            "J": self.attractor.J.detach().cpu().tolist(),
+            "sigma": self.attractor.sigma.detach().cpu().tolist(),
+        }
+
+    def _recall_guard(self, scope: str) -> FourInvariantGuard:
+        """只读四不变守卫（M2 机器防线，默认强制开启——§5.1 违反即抛）。"""
+        return FourInvariantGuard(
+            state_reader=self._readonly_state_snapshot, scope=scope)
 
     def doubt_status_block(self) -> dict:
         """阶段 3：precision 动态化观测块（/status precision_adapt、
@@ -1038,58 +1069,67 @@ class LivingMemoryLoop:
         """
         if not query or not query.strip():
             return []
-        raw_vec, sem_vec = self._encode_query_vector(query)
-        if raw_vec is None and sem_vec is None:
-            return []  # embedder 无 embed_text：无可检索的语义空间（fail-open）
-        query_vec = raw_vec if raw_vec is not None else sem_vec
-        scored = self.memory.recall_episodic_scored(
-            query_vec, top_k=k, fallback_query=sem_vec,
-            count_reference=False)
-        # 阶段 3：Koriat 自一致性（召回时计算）+ 域级/置信度窗口观测。
-        # 只读路径零持久化：仅更新进程内状态与条目 consistency 缓存字段
-        # （不进快照；/react 已有 react_surprise_history 同类先例）。
-        self._attach_consistency(scored)
-        # 体验层 D：低置信复核配额（relevance-gated，只读选择）
-        try:
-            from core.doubt.recall_scheduler import (
-                select_with_low_confidence_quota)
-            scored = select_with_low_confidence_quota(scored, k)
-        except Exception:
-            pass
-        results = []
-        for score, entry in scored:
-            text = getattr(entry, 'text', None)
-            if text:
-                item = {'text': text, 'score': float(score)}
-                # 体验层 D（设计 v1.1 §8.1/§8.3）：置信度场字段注解
-                item['confidence'] = round(
-                    float(getattr(entry, 'confidence', 1.0) or 1.0), 3)
-                item['rebuttal_count'] = int(
-                    getattr(entry, 'rebuttal_count', 0) or 0)
-                item['labile'] = bool(getattr(entry, 'labile', False))
-                item['source_trust'] = round(
-                    float(getattr(entry, 'source_trust', 1.0) or 1.0), 3)
-                item['last_recalled_at'] = getattr(
-                    entry, 'last_recalled_at', None)
-                # 阶段 3：真实 precision 数据源（质疑层注入用）——
-                # adaptive_confidence（Koriat 混合）/ consistency（自一致性
-                # 缓存）/ doubt_verdict（conformal 分位怀疑线判定）。
-                # 开关关时保持 None/False（零参与，旧客户端无感）。
-                if self.precision_adapt is not None:
-                    try:
-                        cons = self.precision_adapt.consistency_cache.get(
-                            id(entry))
-                        vconf = self.precision_adapt.verdict_confidence(
-                            entry, cons)
-                        item['adaptive_confidence'] = round(vconf, 3)
-                        item['consistency'] = (
-                            round(cons, 4) if cons is not None else None)
-                        item['doubt_verdict'] = bool(
-                            vconf < self.precision_adapt.doubt_threshold())
-                    except Exception:
-                        pass
-                results.append(item)
-        return results
+        # M2：只读四不变守卫（§5.1 机器防线——违反即抛 ReadOnlyViolation）
+        guard = self._recall_guard("recall_episodic_readonly")
+        with guard:
+            raw_vec, sem_vec = self._encode_query_vector(query)
+            if raw_vec is None and sem_vec is None:
+                return []  # embedder 无 embed_text：无可检索的语义空间（fail-open）
+            query_vec = raw_vec if raw_vec is not None else sem_vec
+            scored = self.memory.recall_episodic_scored(
+                query_vec, top_k=k, fallback_query=sem_vec,
+                count_reference=False)
+            # M2：只读一致性投影——计算但不写回条目（旧 _attach_consistency
+            # 的 entry.consistency 改写 = 只读泄漏 P1，已整体删除；条目指纹
+            # 含 consistency 字段，任何改写都会被四不变守卫当场抓住）。
+            cons_map = self._project_consistency_readonly(scored)
+            # 体验层 D：低置信复核配额（relevance-gated，只读选择）
+            try:
+                from core.doubt.recall_scheduler import (
+                    select_with_low_confidence_quota)
+                scored = select_with_low_confidence_quota(scored, k)
+            except Exception:
+                pass
+            results = []
+            for score, entry in scored:
+                text = getattr(entry, 'text', None)
+                if text:
+                    item = {'text': text, 'score': float(score)}
+                    # 体验层 D（设计 v1.1 §8.1/§8.3）：置信度场字段注解
+                    item['confidence'] = round(
+                        float(getattr(entry, 'confidence', 1.0) or 1.0), 3)
+                    item['rebuttal_count'] = int(
+                        getattr(entry, 'rebuttal_count', 0) or 0)
+                    item['labile'] = bool(getattr(entry, 'labile', False))
+                    item['source_trust'] = round(
+                        float(getattr(entry, 'source_trust', 1.0) or 1.0), 3)
+                    item['last_recalled_at'] = getattr(
+                        entry, 'last_recalled_at', None)
+                    # 阶段 3：真实 precision 数据源（质疑层注入用）——
+                    # adaptive_confidence（Koriat 混合）/ consistency（自一致性
+                    # 投影）/ doubt_verdict（conformal 分位怀疑线判定）。
+                    # M2：consistency 来自只读投影 cons_map（绝不写回条目）。
+                    # 开关关时保持 None/False（零参与，旧客户端无感）。
+                    if self.precision_adapt is not None:
+                        try:
+                            cons = cons_map.get(id(entry))
+                            vconf = self.precision_adapt.verdict_confidence(
+                                entry, cons)
+                            item['adaptive_confidence'] = round(vconf, 3)
+                            item['consistency'] = (
+                                round(cons, 4) if cons is not None else None)
+                            item['doubt_verdict'] = bool(
+                                vconf < self.precision_adapt.doubt_threshold())
+                        except Exception:
+                            pass
+                    results.append(item)
+            # M2：检索时怀疑投影（§2.1——labile 内存态投影，只读不落库；
+            # /recall 响应 suspicion 区段数据源）。
+            self.last_recall_suspicion = project_suspicion(
+                scored, precision_adapt=self.precision_adapt,
+                consistency_provider=(
+                    (lambda e: cons_map.get(id(e))) if cons_map else None))
+            return results
 
     # ================================================================== #
     #  体验层 A（设计 v1.1 §3）：/react 实时反应只读接口（纯 infer 不 store）
@@ -1108,7 +1148,8 @@ class LivingMemoryLoop:
           - 不做长时潜变量 recall / 不 acquire_conversation（对齐 /recall
             无锁只读先例；做梦写 J 期间的瞬时读不一致可接受）
         唯一可变状态：self.react_surprise_history（内存 deque，不落盘
-        不进快照）——/react 是"读"，反应不是大脑轮次。
+        不进快照）与 M2 的 self.last_recall_suspicion（检索时怀疑投影，
+        同为内存态）——/react 是"读"，反应不是大脑轮次。
 
         参数:
             user_input: 当前用户输入文本。
@@ -1118,6 +1159,11 @@ class LivingMemoryLoop:
             {turn_count, reaction, interpretation, recalled, detail} 字典。
         """
         text = user_input
+        # M2：只读四不变守卫（§5.1——/react 是 infer-only 读口，执行前后
+        # turn / episodic 条目集 / J / σ 零增量；违反抛 ReadOnlyViolation
+        # → 端点 500 + 告警，绝不静默）。
+        _guard = self._recall_guard("react_readonly")
+        _before_readonly = _guard.snapshot()
         # 1. 编码（与 process_turn 相同：只对当前输入反应，不带 llm_output）
         sensory_input = self.encoder.encode(
             text, self.tokenizer, self.embedder)
@@ -1146,6 +1192,7 @@ class LivingMemoryLoop:
         # 5. 只读情景检索（k>0 时；体验层 A 阶段无 record_reference 钩子，
         #    不产生任何引用计数副作用）
         recalled = []
+        self.last_recall_suspicion = empty_suspicion()
         if k > 0:
             query_vec = (raw_semantic_vector if raw_semantic_vector is not None
                          else semantic_vector)
@@ -1154,8 +1201,10 @@ class LivingMemoryLoop:
                     scored = self.memory.recall_episodic_scored(
                         query_vec, top_k=k, fallback_query=semantic_vector,
                         source_filter='external', count_reference=False)
-                    # 阶段 3：Koriat 自一致性 + 域级/置信度窗口观测（只读）
-                    self._attach_consistency(scored)
+                    # M2：只读一致性投影——计算但不写回条目（旧
+                    # _attach_consistency 的 entry.consistency 改写 = 只读
+                    # 泄漏 P1，已整体删除）。
+                    self._project_consistency_readonly(scored)
                     for score, entry in scored:
                         if getattr(entry, 'text', None):
                             recalled.append({
@@ -1163,6 +1212,10 @@ class LivingMemoryLoop:
                                 'score': float(score),
                                 'origin': 'memory',
                             })
+                    # M2：检索时怀疑投影（§2.1——labile 内存态投影，只读
+                    # 不落库；/react 响应 suspicion 区段数据源）。
+                    self.last_recall_suspicion = project_suspicion(
+                        scored, precision_adapt=self.precision_adapt)
                 except Exception as e:  # pylint: disable=broad-except
                     # fail-open：只读检索异常不阻塞反应返回
                     logger.warning(
@@ -1210,6 +1263,10 @@ class LivingMemoryLoop:
             # 原样透传到注入插件。开关关 → {}（插件回退旧行为））。
             'doubt': self.doubt_status_block(),
         }
+        # M2：只读四不变断言（§5.1——/react 执行前后四量零增量；
+        # 违反 → ReadOnlyViolation → 端点 500，绝不静默）。
+        _guard.assert_unchanged(_before_readonly)
+
         return {
             'turn_count': self.turn_count,
             'reaction': reaction,
@@ -1267,6 +1324,18 @@ class LivingMemoryLoop:
         返回:
             [{'text', 'score', 'origin'}, ...]（内存条目在前，归档条目在后，
             各自按相似度降序；按 text 去重，内存版本优先；最多 k 条）。
+        """
+        # M2：只读四不变守卫（§5.1——/recall 全路径含归档补充检索段；
+        # 违反抛 ReadOnlyViolation → 端点 500 + 告警，绝不静默）。
+        guard = self._recall_guard("recall_merged_readonly")
+        with guard:
+            return self._recall_merged_readonly_impl(query, k=k)
+
+    def _recall_merged_readonly_impl(self, query: str, k: int = 5) -> list[dict]:
+        """合并检索内部实现（由 recall_merged_readonly 守卫包装内执行）。
+
+        与旧 recall_merged_readonly 行为逐字节一致（血管不换），仅被
+        只读四不变守卫包裹。
         """
         # 0. 合并开关（LMS_ARCHIVE_ENABLED=0 关闭合并，回滚路径）
         archive_enabled = str(self.config.get(
