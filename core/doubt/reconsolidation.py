@@ -70,7 +70,10 @@ def mark_labile(entry, violated_by: Optional[str] = None,
                 now: Optional[float] = None) -> bool:
     """标记条目为 labile（去稳定化窗口打开）。
 
-    副作用（三路汇入②）：rebuttal_count +1、violated_by 记录、置信度重算。
+    副作用（三路汇入②）：rebuttal_count +1、violated_by 记录、置信度重算；
+    M3-1（规格 v2 §2.3）：证伪同时写 rebuttal-consistency 原生字段
+    （``updated_by='ingest'``——写侧时相合法写者；检索只读铁律由
+    rebuttal_field 写者守卫 + guard.py 四不变双保）。
     fail-open：异常返回 False，不阻塞调用方。
 
     返回:
@@ -79,10 +82,13 @@ def mark_labile(entry, violated_by: Optional[str] = None,
     if entry is None:
         return False
     try:
-        from core.doubt.confidence_field import mark_rebutted
+        from core.doubt.rebuttal_field import record_rebuttal_native
         entry.labile = True
         entry.labile_since = now if now is not None else time.time()
-        mark_rebutted(entry, violated_by=violated_by)
+        # 证伪标记（写侧时相）：平坦字段（mark_rebutted 既有行为逐字节
+        # 保留）+ 结构化原生字段同步（rebuttals/consistency/updated_by）
+        record_rebuttal_native(entry, violated_by=violated_by,
+                               updated_by='ingest')
         return True
     except Exception:
         return False
