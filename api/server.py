@@ -390,6 +390,15 @@ async def _feed_rate_limited() -> bool:
 # ---------------------------------------------------------------------------
 # FastAPI 应用
 # ---------------------------------------------------------------------------
+app = FastAPI(
+    title="活体记忆系统 API",
+    description=(
+        "为 TRAE/OpenClaw UI 提供后台记忆服务的 HTTP 接口。"
+        "对话时自动生成记忆并适时注入。"
+    ),
+    version="0.1.0",
+)
+
 # M2（核心重建）：只读四不变守卫——违反即 500 + 告警（G 模式禁止静默）。
 try:
     from core.recall.guard import ReadOnlyViolation
@@ -404,14 +413,6 @@ try:
 except Exception:
     pass  # 守卫模块未合入时 fail-open（兼容期）
 
-app = FastAPI(
-    title="活体记忆系统 API",
-    description=(
-        "为 TRAE/OpenClaw UI 提供后台记忆服务的 HTTP 接口。"
-        "对话时自动生成记忆并适时注入。"
-    ),
-    version="0.1.0",
-)
 
 
 # ---------------------------------------------------------------------------
@@ -843,6 +844,8 @@ async def recall(req: RecallRequest):
         # T2.3：内存+归档合并检索（内存优先；归档超时/异常内部 fail-open）
         results = await asyncio.get_event_loop().run_in_executor(
             None, lambda: loop.recall_merged_readonly(req.query, k=k))
+    except ReadOnlyViolation:
+        raise  # M2：只读四不变违反绝不 fail-open——exception_handler 映射 500 + 告警
     except Exception as e:
         # 只读路径异常：fail-open，返回空结果，绝不 500 拖垮调用方
         logger.error(f"[{req.session_id}] /recall 检索失败（返回空）: {e}")

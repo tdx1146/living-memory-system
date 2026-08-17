@@ -940,30 +940,6 @@ class LivingMemoryLoop:
     #  阶段 3（precision 三层动态化）：召回/观测钩子
     # ================================================================== #
 
-    def _attach_consistency(self, scored) -> None:
-        """阶段 3：召回簇 → Koriat 自一致性 + 域级/置信度窗口观测。
-
-        - compute_consistency：同主题簇互相印证度（召回时计算，零固定
-          阈值：自适应线 = 簇内相似度分布 P50）
-        - 结果缓存到条目 consistency 字段（进程内，供 /recall 注解与
-          verdict 判定）与 precision_adapt.consistency_cache
-        - record_recall_cohort：域级统计 + 置信度窗口（怀疑率观测）
-
-        开关关/异常 → 静默跳过（零参与，fail-open）。
-        """
-        if self.precision_adapt is None or not scored:
-            return
-        try:
-            from core.doubt.precision_adapt import compute_consistency
-            cons = compute_consistency(scored)
-            # M2（核心重建）：检索绝不改写条目——consistency 只做进程内投影，
-            # 不写 entry 字段（旧实现写 entry.consistency 随快照持久化 = 只读泄漏，
-            # 8/17 扫描实证：recall 前后 consistency None→-0.1098 且快照往返后仍在）。
-            self.precision_adapt.consistency_cache.update(cons)
-            self.precision_adapt.record_recall_cohort(scored)
-        except Exception:
-            pass
-
 
     def _readonly_state_snapshot(self) -> dict:
         """M2：只读四不变守卫的状态快照（turn/episodic 指纹/J/σ）。
@@ -997,15 +973,14 @@ class LivingMemoryLoop:
             'sigma': sigma,
         }
 
-    def _guard_recall(self, before: dict) -> None:
+    def _guard_recall(self, before: dict, scope: str = "recall") -> None:
         """M2：recall 后守卫校验——不一致抛 ReadOnlyViolation（机器防线）。"""
         try:
-            from core.recall.guard import check_readonly_invariants
+            from core.recall.guard import FourInvariantGuard
         except Exception:
-            return  # fail-open：守卫缺失不阻断（模块未合入时兼容）
-        after = self._readonly_state_snapshot()
-        if before and after:
-            check_readonly_invariants(before, after)
+            return  # fail-open：守卫模块未合入时不阻断（兼容期）
+        guard = FourInvariantGuard(self._readonly_state_snapshot, scope=scope)
+        guard.assert_unchanged(before)  # 抛 ReadOnlyViolation——禁止吞（G 模式）
 
     def doubt_status_block(self) -> dict:
         """阶段 3：precision 动态化观测块（/status precision_adapt、
@@ -1088,7 +1063,15 @@ class LivingMemoryLoop:
         # 阶段 3：Koriat 自一致性（召回时计算）+ 域级/置信度窗口观测。
         # 只读路径零持久化：仅更新进程内状态与条目 consistency 缓存字段
         # （不进快照；/react 已有 react_surprise_history 同类先例）。
-        self._attach_consistency(scored)
+        # M2：consistency 进程内投影（不写 entry 字段——只读四不变；旧 _attach_consistency 已删）
+        try:
+            from core.doubt.precision_adapt import compute_consistency
+            _cons = compute_consistency(scored)
+            if self.precision_adapt is not None:
+                self.precision_adapt.consistency_cache.update(_cons)
+                self.precision_adapt.record_recall_cohort(scored)
+        except Exception:
+            pass
         # 体验层 D：低置信复核配额（relevance-gated，只读选择）
         try:
             from core.doubt.recall_scheduler import (
@@ -1129,7 +1112,7 @@ class LivingMemoryLoop:
                     except Exception:
                         pass
                 results.append(item)
-        self._guard_recall(_g_before)
+        self._guard_recall(_g_before, scope="recall_episodic_readonly")
         return results
 
     # ================================================================== #
@@ -1197,7 +1180,15 @@ class LivingMemoryLoop:
                         query_vec, top_k=k, fallback_query=semantic_vector,
                         source_filter='external', count_reference=False)
                     # 阶段 3：Koriat 自一致性 + 域级/置信度窗口观测（只读）
-                    self._attach_consistency(scored)
+                    # M2：consistency 进程内投影（不写 entry 字段——只读四不变；旧 _attach_consistency 已删）
+        try:
+            from core.doubt.precision_adapt import compute_consistency
+            _cons = compute_consistency(scored)
+            if self.precision_adapt is not None:
+                self.precision_adapt.consistency_cache.update(_cons)
+                self.precision_adapt.record_recall_cohort(scored)
+        except Exception:
+            pass
                     for score, entry in scored:
                         if getattr(entry, 'text', None):
                             recalled.append({
@@ -1252,7 +1243,7 @@ class LivingMemoryLoop:
             # 原样透传到注入插件。开关关 → {}（插件回退旧行为））。
             'doubt': self.doubt_status_block(),
         }
-        self._guard_recall(_g_before)
+        self._guard_recall(_g_before, scope="react_readonly")
         return {
             'turn_count': self.turn_count,
             'reaction': reaction,
@@ -1367,7 +1358,7 @@ class LivingMemoryLoop:
                 continue
             seen.add(t)
             merged.append(r)
-        self._guard_recall(_g_before)
+        self._guard_recall(_g_before, scope="recall_merged_readonly")
         return merged[:k]
 
     def _snapshot_dir_path(self) -> Path:
