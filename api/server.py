@@ -390,6 +390,20 @@ async def _feed_rate_limited() -> bool:
 # ---------------------------------------------------------------------------
 # FastAPI 应用
 # ---------------------------------------------------------------------------
+# M2（核心重建）：只读四不变守卫——违反即 500 + 告警（G 模式禁止静默）。
+try:
+    from core.recall.guard import ReadOnlyViolation
+
+    @app.exception_handler(ReadOnlyViolation)
+    async def _readonly_violation_handler(request, exc):
+        import logging
+        logging.getLogger("lms.api").error(
+            "ReadOnlyViolation: %s %s -> %s", request.method, request.url.path, exc)
+        from fastapi.responses import JSONResponse
+        return JSONResponse(status_code=500, content={"detail": f"readonly invariant violated: {exc}"})
+except Exception:
+    pass  # 守卫模块未合入时 fail-open（兼容期）
+
 app = FastAPI(
     title="活体记忆系统 API",
     description=(

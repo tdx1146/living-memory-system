@@ -65,9 +65,9 @@ MODULE_CLAIMS: dict = {
                          "前后 turn / episodic 条目集 / J / σ 四量零增量；"
                          "违反抛 ReadOnlyViolation → API 500 + 告警（G 模式"
                          "禁止静默）",
-            "verified_by": "tests/test_recall_m2.py::TestFourInvariantGuard + "
+            "verified_by": "tests/test_recall_m2.py::TestFourInvariantGuard; "
                            "tests/test_recall_m2.py::TestRecallReadonlyM2::"
-                           "test_guard_armed_detects_mutation + "
+                           "test_guard_armed_detects_mutation; "
                            "tests/test_recall_m2.py::TestRecallEndpointM2::"
                            "test_recall_violation_maps_500",
         },
@@ -76,7 +76,7 @@ MODULE_CLAIMS: dict = {
                          "entry.consistency 改写已删除）；条目指纹含全部可变"
                          "标量字段——字段改写同样触发守卫",
             "verified_by": "tests/test_recall_m2.py::TestRecallReadonlyM2::"
-                           "test_recall_does_not_mutate_entries + "
+                           "test_recall_does_not_mutate_entries; "
                            "tests/test_recall_m2.py::TestFourInvariantGuard::"
                            "test_entry_fingerprint_captures_consistency_mutation",
         },
@@ -98,8 +98,8 @@ MODULE_CLAIMS: dict = {
                          "逐字节不变，怀疑信号只追加在既有结构之后独立区段"
                          "（§4.2）",
             "verified_by": "tests/test_recall_m2.py::TestRecallEndpointM2::"
-                           "test_recall_response_has_suspicion_section + "
-                           "tests/test_recall_readonly.py（回归）",
+                           "test_recall_response_has_suspicion_section; "
+                           "tests/test_recall_readonly.py",
         },
     },
 }

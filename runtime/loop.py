@@ -956,17 +956,56 @@ class LivingMemoryLoop:
         try:
             from core.doubt.precision_adapt import compute_consistency
             cons = compute_consistency(scored)
-            for _score, entry in scored:
-                c = cons.get(id(entry))
-                if c is not None:
-                    try:
-                        entry.consistency = round(c, 4)
-                    except Exception:
-                        pass
+            # M2（核心重建）：检索绝不改写条目——consistency 只做进程内投影，
+            # 不写 entry 字段（旧实现写 entry.consistency 随快照持久化 = 只读泄漏，
+            # 8/17 扫描实证：recall 前后 consistency None→-0.1098 且快照往返后仍在）。
             self.precision_adapt.consistency_cache.update(cons)
             self.precision_adapt.record_recall_cohort(scored)
         except Exception:
             pass
+
+
+    def _readonly_state_snapshot(self) -> dict:
+        """M2：只读四不变守卫的状态快照（turn/episodic 指纹/J/σ）。
+
+        core.recall.guard 的 state_reader 注入点——张量在注入侧转可比值。
+        违反只读即抛 ReadOnlyViolation（API 层映射 500——G 模式禁止静默）。
+        """
+        try:
+            from core.recall.guard import entry_fingerprint
+        except Exception:
+            return {}
+        try:
+            epi = frozenset(
+                entry_fingerprint(e)
+                for e in getattr(getattr(self, 'memory', None), 'episodic', []) or []
+            )
+        except Exception:
+            epi = frozenset()
+        try:
+            j = float(getattr(getattr(self, 'attractor', None), 'j_target_norm', 0.0))
+        except Exception:
+            j = 0.0
+        try:
+            sigma = getattr(self, '_sigma_peek', None)
+        except Exception:
+            sigma = None
+        return {
+            'turn': getattr(self, 'turn_count', 0),
+            'episodic': epi,
+            'J': j,
+            'sigma': sigma,
+        }
+
+    def _guard_recall(self, before: dict) -> None:
+        """M2：recall 后守卫校验——不一致抛 ReadOnlyViolation（机器防线）。"""
+        try:
+            from core.recall.guard import check_readonly_invariants
+        except Exception:
+            return  # fail-open：守卫缺失不阻断（模块未合入时兼容）
+        after = self._readonly_state_snapshot()
+        if before and after:
+            check_readonly_invariants(before, after)
 
     def doubt_status_block(self) -> dict:
         """阶段 3：precision 动态化观测块（/status precision_adapt、
@@ -1036,6 +1075,7 @@ class LivingMemoryLoop:
             [{'text': str, 'score': float, ...}, ...]（按相关度降序）；
             embedder 不支持语义编码或缓冲区为空时返回空列表（fail-open）。
         """
+        _g_before = self._readonly_state_snapshot()
         if not query or not query.strip():
             return []
         raw_vec, sem_vec = self._encode_query_vector(query)
@@ -1089,6 +1129,7 @@ class LivingMemoryLoop:
                     except Exception:
                         pass
                 results.append(item)
+        self._guard_recall(_g_before)
         return results
 
     # ================================================================== #
@@ -1117,6 +1158,7 @@ class LivingMemoryLoop:
         返回:
             {turn_count, reaction, interpretation, recalled, detail} 字典。
         """
+        _g_before = self._readonly_state_snapshot()
         text = user_input
         # 1. 编码（与 process_turn 相同：只对当前输入反应，不带 llm_output）
         sensory_input = self.encoder.encode(
@@ -1210,6 +1252,7 @@ class LivingMemoryLoop:
             # 原样透传到注入插件。开关关 → {}（插件回退旧行为））。
             'doubt': self.doubt_status_block(),
         }
+        self._guard_recall(_g_before)
         return {
             'turn_count': self.turn_count,
             'reaction': reaction,
@@ -1268,6 +1311,7 @@ class LivingMemoryLoop:
             [{'text', 'score', 'origin'}, ...]（内存条目在前，归档条目在后，
             各自按相似度降序；按 text 去重，内存版本优先；最多 k 条）。
         """
+        _g_before = self._readonly_state_snapshot()
         # 0. 合并开关（LMS_ARCHIVE_ENABLED=0 关闭合并，回滚路径）
         archive_enabled = str(self.config.get(
             'archive_enabled',
@@ -1323,6 +1367,7 @@ class LivingMemoryLoop:
                 continue
             seen.add(t)
             merged.append(r)
+        self._guard_recall(_g_before)
         return merged[:k]
 
     def _snapshot_dir_path(self) -> Path:
