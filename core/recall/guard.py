@@ -61,6 +61,9 @@ class ReadOnlyViolation(RuntimeError):
 #: 参与条目指纹的可变标量字段（读 getattr + 默认值兜底；绝不 setattr）。
 #: 覆盖旧泄漏形态（consistency 改写）+ 写侧会触碰的全部标量字段——
 #: 条目集指纹既抓增删又抓字段改写。
+#: M3-1 追加 rebuttal_consistency（结构化 dict，_norm_value 已支持）与
+#: doubt_state——检索路径对原生怀疑字段的任何改写同样触发守卫（§2.3
+#: 检索只读铁律的机器防线）。
 _ENTRY_FIELD_NAMES: tuple = (
     "text",
     "surprise",
@@ -82,6 +85,8 @@ _ENTRY_FIELD_NAMES: tuple = (
     "core",
     "ts",
     "gray",
+    "rebuttal_consistency",
+    "doubt_state",
 )
 
 
@@ -91,7 +96,10 @@ def _norm_value(value: Any) -> Any:
     - None / bool / str / int 原样；
     - float：NaN → 哨兵字符串（NaN != NaN 会破坏 frozenset 比较），
       其余 round(v, 9)（平滑嵌入噪声，但保留 ≥1e-9 的真实改写）；
-    - list/tuple → 递归归一化后的 tuple（可哈希）。
+    - list/tuple → 递归归一化后的 tuple（可哈希）；
+    - dict → 按键排序的 (key, value) 元组序列（可哈希——M3-1 追加的
+      rebuttal_consistency 结构化字段由此可进指纹；键统一转 str 排序，
+      防异构键比较崩溃）。
     """
     if value is None or isinstance(value, (bool, str, int)):
         return value
@@ -101,6 +109,11 @@ def _norm_value(value: Any) -> Any:
         return round(value, 9)
     if isinstance(value, (list, tuple)):
         return tuple(_norm_value(v) for v in value)
+    if isinstance(value, dict):
+        return tuple(
+            (str(k), _norm_value(v))
+            for k, v in sorted(value.items(), key=lambda kv: str(kv[0]))
+        )
     # 其他类型（不应出现在标量字段）：原样返回，__eq__ 由调用方保证可比
     return value
 

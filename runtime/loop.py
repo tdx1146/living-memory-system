@@ -41,7 +41,7 @@ from persistence.recovery import Recovery
 # core/recall 为纯 stdlib 模块（不 import 本仓库运行时），无循环依赖。
 from core.recall.guard import (
     FourInvariantGuard, episodic_fingerprint)
-from core.recall.suspicion import project_suspicion, empty_suspicion
+from core.recall.suspicion import empty_suspicion
 
 logger = logging.getLogger(__name__)
 
@@ -232,6 +232,17 @@ class LivingMemoryLoop:
         # 纯内存态（同 react_surprise_history 先例：不落盘、不进快照、
         # 重启即失）；/recall 与 /react 响应 suspicion 区段数据源。
         self.last_recall_suspicion: dict = empty_suspicion()
+
+        # M3-1（核心重建规格 v2 §二，自我怀疑原生机制）：三时相怀疑状态机
+        # + 验证链。开关：注入时怀疑 LMS_DOUBT_INJECTION_ENABLED（默认 1=
+        # 开——机制本体）；验证链 LMS_VERIFICATION_CHAIN_ENABLED（默认 0=
+        # 关——§5.3 写侧默认保守，假阳性演练通过才 env 开启）。纯进程内存
+        # 状态（同 precision_adapt 先例：重启即失、快照不落盘）。
+        from core.doubt.state_machine import DoubtStateMachine
+        from core.doubt.verification_chain import VerificationChain
+        self.verification_chain = VerificationChain()
+        self.doubt_state = DoubtStateMachine(
+            verification_chain=self.verification_chain)
 
         # 体验层 D（设计 v1.1 §6.2）：去稳定化的近 200 轮 surprise 窗口
         # （G1 思路，LMS 内自有 deque；与 /react 窗口独立）
@@ -585,10 +596,34 @@ class LivingMemoryLoop:
         except Exception:
             _is_sys_event = False
         if semantic_vector is not None and not _is_sys_event:
+            # M3-1 注入时怀疑（§2.1 写侧时相）：仅当本轮确实新增了条目
+            # （store_episodic 可能被垃圾过滤跳过——用条目数变化判定）。
+            _epi_before = self.memory.episodic_size()
             self.memory.store_episodic(
                 text, semantic_vector, activation.surprise, self.turn_count,
                 raw_semantic_vector=raw_semantic_vector,
                 source='external')  # Phase 2: 显式来源标记
+            if self.memory.episodic_size() > _epi_before:
+                try:
+                    # 注入时怀疑判定：高 surprise（>factor×J_target）或
+                    # rebuttal 命中 → 标 suspect + 登记验证链（写侧）。
+                    # fail-open：怀疑逻辑异常绝不阻断主循环（G 模式以日志
+                    # 可见，不以静默吞掉）。
+                    entry = list(self.memory.iter_episodic())[-1]
+                    from core.doubt.state_machine import compute_rebuttal_hit
+                    rebuttal_hit = compute_rebuttal_hit(
+                        entry, self.memory.iter_episodic())
+                    self.doubt_state.injection_check(
+                        entry,
+                        surprise=activation.surprise,
+                        j_target=getattr(
+                            self.attractor, 'j_target_norm', None),
+                        rebuttal_hit=rebuttal_hit,
+                        verification_chain=self.verification_chain,
+                    )
+                except Exception as e:  # pylint: disable=broad-except
+                    logger.warning(
+                        "M3-1 注入时怀疑检查失败（fail-open）: %s", e)
 
         # 阶段 3：precision 动态校准观测（HGF 波动性 → 全局怀疑基线；
         # 逐试次更新，Mathys 2011 / Behrens 2007）。is_negative 由本轮
@@ -1125,7 +1160,10 @@ class LivingMemoryLoop:
                     results.append(item)
             # M2：检索时怀疑投影（§2.1——labile 内存态投影，只读不落库；
             # /recall 响应 suspicion 区段数据源）。
-            self.last_recall_suspicion = project_suspicion(
+            # M3-1 衔接：经 doubt_state.retrieval_projection 执行——命中
+            # 条目进 labile 窗口（内存态累积，M6 做梦期待核查清单）+ 投影
+            # 结构逐键同构（M2 形态冻结，§4.1）。
+            self.last_recall_suspicion = self.doubt_state.retrieval_projection(
                 scored, precision_adapt=self.precision_adapt,
                 consistency_provider=(
                     (lambda e: cons_map.get(id(e))) if cons_map else None))
@@ -1214,7 +1252,9 @@ class LivingMemoryLoop:
                             })
                     # M2：检索时怀疑投影（§2.1——labile 内存态投影，只读
                     # 不落库；/react 响应 suspicion 区段数据源）。
-                    self.last_recall_suspicion = project_suspicion(
+                    # M3-1 衔接：同 recall 路径——进 labile 窗口 + 投影
+                    # 逐键同构（形态冻结）。
+                    self.last_recall_suspicion = self.doubt_state.retrieval_projection(
                         scored, precision_adapt=self.precision_adapt)
                 except Exception as e:  # pylint: disable=broad-except
                     # fail-open：只读检索异常不阻塞反应返回
@@ -1721,6 +1761,14 @@ class LivingMemoryLoop:
         except Exception as e:  # pylint: disable=broad-except
             logger.debug(
                 "get_status precision_adapt 字段组装失败（fail-open）: %s", e)
+
+        # M3-1（规格 v2 §二）：三时相怀疑状态机 + 验证链观测（纯增量字段；
+        # 开关关 → {'enabled': False}；旧客户端忽略——§4.2 独立追加语义）。
+        try:
+            status['doubt_native'] = self.doubt_state.snapshot()
+        except Exception as e:  # pylint: disable=broad-except
+            logger.debug(
+                "get_status doubt_native 字段组装失败（fail-open）: %s", e)
 
         # 论文机制 A：allostatic J 滑动设定点观测（纯增量字段；开关关 → {}）
         # 灵魂指标②③：j_history 序列动态（非固定）+ events 越界触发可观测。

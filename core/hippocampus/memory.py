@@ -120,6 +120,14 @@ class EpisodicEntry:
     core: Optional[str] = None            # 提取式压缩核心（≤300 字，TextRank 两段式产物）
     ts: Optional[float] = None            # 写入时间戳（初始=store 时刻）
     gray: bool = False                    # 灰度标记（LMS_STORE_GRAY=1 期间 /store 条目）
+    # M3-1（核心重建规格 v2 §2.3 / §2.1）：rebuttal-consistency 字段原生 +
+    # 条目持久怀疑态。全部带默认值 → 旧构造点/旧快照向后兼容（体验层 D 先例）。
+    rebuttal_consistency: Optional[dict] = None  # §2.3 结构化原生字段：
+    #   {"rebuttals": [...], "consistency": 0..1, "updated_at": ts,
+    #    "updated_by": "ingest"|"consolidation"}——写侧溯源封装（检索只读，
+    #    updated_by 永不为 retrieval——core/doubt/rebuttal_field.py 铁律）
+    doubt_state: str = 'stable'           # §2.1 持久怀疑态三选一：
+    #   'stable' | 'suspect' | 'superseded'（labile 是时相状态不落库）
 
 
 class MemoryManager:
@@ -476,6 +484,15 @@ class MemoryManager:
             core=core,
             gray=bool(gray),
         )
+        # M3-1（规格 v2 §2.3）：写入口（ingest）初始化 rebuttal-consistency
+        # 原生字段（updated_by='ingest'——合法写者之一；检索只读铁律由
+        # core/recall/guard.py 四不变守卫 + rebuttal_field 写者守卫双保）。
+        # fail-open：字段初始化异常绝不阻断存储主流程。
+        try:
+            from core.doubt.rebuttal_field import init_rebuttal_consistency
+            init_rebuttal_consistency(entry)
+        except Exception:
+            pass
         self._episodic_buffer.append(entry)
         # 提取层 v1.4（S1-14）：显式容量守卫（软容量不丢＋告警；硬顶兜底）
         self._enforce_episodic_capacity()
