@@ -35,6 +35,11 @@ _GARBAGE_PATTERNS = [
     re.compile(r"^System:", re.I),                           # System 前缀
     re.compile(r"端口探测|自主唤醒.*冒烟测试", re.I),           # 探测日志
     re.compile(r"用户: 我叫小明|装饰器确实是Python", re.I),      # 测试数据
+    # P0 污染处置（2026-08-17）：[doubt 系统事件（conflict 事件 /
+    # [doubt-supersedes] 证伪标记）不是对话，清理出 episodic。锚定行首：
+    # 正文提及 [doubt 的真实条目不误伤（与 memory.py/archive_store.py
+    # 检索排除同正则语义）。
+    re.compile(r"^\s*\[doubt(?:-[a-z]+)?\]", re.I),
 ]
 
 
@@ -85,7 +90,10 @@ def main() -> int:
     total = len(ep)
     keep, drop = [], []
     for e in ep:
-        txt = str(e.get("text", "")) if isinstance(e, dict) else str(e)
+        # 兼容 dict 与 EpisodicEntry dataclass（0.5.0/T1.3 起快照存类实例，
+        # 旧版 str(e) 取 repr 导致锚定正则永不命中——2026-08-17 dry-run 实锤）
+        txt = str(e.get("text", "")) if isinstance(e, dict) else str(
+            getattr(e, "text", "") or "")
         if _is_garbage(txt):
             drop.append(e)
         else:
@@ -95,7 +103,8 @@ def main() -> int:
     if drop:
         print("清理清单:")
         for e in drop:
-            txt = str(e.get("text", "")) if isinstance(e, dict) else str(e)
+            txt = str(e.get("text", "")) if isinstance(e, dict) else str(
+                getattr(e, "text", "") or "")
             print(f"  - {txt[:60]}")
 
     if args.dry_run and not args.apply:
