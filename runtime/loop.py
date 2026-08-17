@@ -243,6 +243,46 @@ class LivingMemoryLoop:
         # 时 is_negative=True（对称性约束：坏消息 PE 不被系统性低估）
         self._pending_negative_evidence: bool = False
 
+        # 论文机制 A（2026-08-17 实施，dandan 拍板）：allostatic J 滑动设定点。
+        # 治理开关 LMS_J_ALLOSTATIC（默认 0=关 → 固定 J 行为完全不变，回滚干净）。
+        # 固定 J=7.0 在生产持续学习下漂移失效（双快照复测实锤：J 内容漂移 →
+        # norm 7 工作点崩塌）——J 从 env 固定值 → surprise 序列统计在线重估的
+        # 滑动设定点（Mehra 1970 innovation 法 + Sterling 2012 allostasis）。
+        # 纯进程内存状态（同 precision_adapt 先例：重启即失、快照不落盘）。
+        from runtime.allostatic_j import (
+            AllostaticJController, allostatic_j_enabled, compute_sigma_stats)
+        self._compute_sigma_stats = compute_sigma_stats  # process_turn 复用
+        if allostatic_j_enabled(config.get('j_allostatic')):
+            self.allostatic_j = AllostaticJController(
+                enabled=True,
+                # 初始设定点 = 当前 env 值（LMS_J_TARGET_NORM），不另设固定值
+                init_target=float(config.get(
+                    'j_target_norm',
+                    os.environ.get('LMS_J_TARGET_NORM', '40.0'))),
+                window=int(config.get('j_allostatic_window', 200)),
+                k=float(config.get('j_allostatic_k', 2.0)),
+                step=float(config.get('j_allostatic_step', 0.5)),
+                persist=int(config.get('j_allostatic_persist', 5)),
+                j_min=float(config.get('j_allostatic_min', 3.0)),
+                j_max=float(config.get('j_allostatic_max', 40.0)),
+                min_samples=int(
+                    config.get('j_allostatic_min_samples', 30)),
+                sat_frac=float(config.get('j_allostatic_sat_frac', 0.9)),
+                col_act=int(config.get('j_allostatic_col_act', 5)),
+            )
+            # 初始设定点立即接管（attractor 的 learn 钳制按动态值执行）
+            self.attractor.j_target_norm = self.allostatic_j.j_target
+            logger.info(
+                "allostatic J 已启用：初始设定点 J_target=%.4f "
+                "（window=%d, k=%.2f, step=%.2f, persist=%d, "
+                "range=[%.2f, %.2f]）",
+                self.allostatic_j.j_target, self.allostatic_j.window,
+                self.allostatic_j.k, self.allostatic_j.step,
+                self.allostatic_j.persist, self.allostatic_j.j_min,
+                self.allostatic_j.j_max)
+        else:
+            self.allostatic_j = None
+
         # 元可塑性控制器（可选，根据 config 决定是否启用）
         self.meta = None
         if config.get('meta_enabled', True):
@@ -438,6 +478,18 @@ class LivingMemoryLoop:
             temperature_override=_meta_temp,
             initial_state=initial_state,
         )
+
+        # 2.5 论文机制 A（默认关）：allostatic J 滑动设定点
+        # 用本轮 surprise + σ 统计更新 J_target，并在 learn 前写入
+        # attractor.j_target_norm——learn() 的范数钳制按动态设定点执行
+        # （attractor 本体零改动；开关关时零参与）。fail-open。
+        if self.allostatic_j is not None:
+            try:
+                sigma_stats = self._compute_sigma_stats(activation.state)
+                self.attractor.j_target_norm = self.allostatic_j.update(
+                    activation.surprise, sigma_stats)
+            except Exception as e:  # pylint: disable=broad-except
+                logger.warning("allostatic J 更新失败（fail-open）: %s", e)
 
         # 3. FEP学习（E-P2-5: 通过 override 参数传递元调整后的权重）
         self.attractor.learn(
@@ -1600,6 +1652,16 @@ class LivingMemoryLoop:
         except Exception as e:  # pylint: disable=broad-except
             logger.debug(
                 "get_status precision_adapt 字段组装失败（fail-open）: %s", e)
+
+        # 论文机制 A：allostatic J 滑动设定点观测（纯增量字段；开关关 → {}）
+        # 灵魂指标②③：j_history 序列动态（非固定）+ events 越界触发可观测。
+        if self.allostatic_j is not None:
+            try:
+                status['allostatic_j'] = self.allostatic_j.snapshot(
+                    turn_count=self.turn_count)
+            except Exception as e:  # pylint: disable=broad-except
+                logger.debug(
+                    "get_status allostatic_j 字段组装失败（fail-open）: %s", e)
 
         # 自指回路状态（可选）
         if self.self_ref is not None:

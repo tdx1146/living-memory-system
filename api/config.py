@@ -23,6 +23,11 @@
     LMS_INPUT_DIM         -- 输入维度（默认 64）
     LMS_NUM_NODES         -- 节点数（默认 256）
     LMS_PRETRAINED_MODEL  -- 预训练模型本地路径（覆盖默认缓存路径）
+    LMS_J_TARGET_NORM     -- J 范数钳制目标（allostatic 开启时 = 滑动设定点初值）
+    LMS_J_ALLOSTATIC      -- allostatic J 滑动设定点开关（默认 0=关，固定 J 不变）
+    LMS_J_ALLOSTATIC_WINDOW / _K / _STEP / _PERSIST / _MIN / _MAX /
+    LMS_J_ALLOSTATIC_MIN_SAMPLES / _SAT_FRAC / _COL_ACT
+                          -- allostatic 机制参数（详见 runtime/allostatic_j.py）
     LMS_API_HOST          -- 服务监听地址（默认 127.0.0.1，run.py 使用）
     LMS_API_PORT          -- 服务监听端口（默认 8190，run.py 使用）
 """
@@ -237,6 +242,33 @@ def get_api_config() -> dict:
     # embed 熔断器：连续 3 次失败 → 熔断 5 分钟（=1 启用）
     config['embed_circuit'] = (
         _get_env("LMS_EMBED_CIRCUIT", "0") == "1")
+
+    # --- 论文机制 A（2026-08-17，dandan 拍板）：allostatic J 滑动设定点 ---
+    # 默认关（LMS_J_ALLOSTATIC=0）→ 固定 J 行为完全不变（回滚干净）；
+    # 开启后 J_target_norm 由 surprise 序列统计在线重估（Mehra 1970 innovation
+    # 法 + Sterling 2012 allostasis），LMS_J_TARGET_NORM 仅作初始设定点。
+    config['j_target_norm'] = float(
+        _get_env("LMS_J_TARGET_NORM", "40.0") or 40.0)
+    config['j_allostatic'] = (
+        _get_env("LMS_J_ALLOSTATIC", "0") == "1")
+    config['j_allostatic_window'] = int(
+        _get_env("LMS_J_ALLOSTATIC_WINDOW", "200"))
+    config['j_allostatic_k'] = float(
+        _get_env("LMS_J_ALLOSTATIC_K", "2.0"))
+    config['j_allostatic_step'] = float(
+        _get_env("LMS_J_ALLOSTATIC_STEP", "0.5"))
+    config['j_allostatic_persist'] = int(
+        _get_env("LMS_J_ALLOSTATIC_PERSIST", "5"))
+    config['j_allostatic_min'] = float(
+        _get_env("LMS_J_ALLOSTATIC_MIN", "3.0"))
+    config['j_allostatic_max'] = float(
+        _get_env("LMS_J_ALLOSTATIC_MAX", "40.0"))
+    config['j_allostatic_min_samples'] = int(
+        _get_env("LMS_J_ALLOSTATIC_MIN_SAMPLES", "30"))
+    config['j_allostatic_sat_frac'] = float(
+        _get_env("LMS_J_ALLOSTATIC_SAT_FRAC", "0.9"))
+    config['j_allostatic_col_act'] = int(
+        _get_env("LMS_J_ALLOSTATIC_COL_ACT", "5"))
 
     # --- 快照配置 ---
     config['auto_snapshot'] = True
