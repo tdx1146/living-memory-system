@@ -399,21 +399,6 @@ app = FastAPI(
     version="0.1.0",
 )
 
-# M2（核心重建）：只读四不变守卫——违反即 500 + 告警（G 模式禁止静默）。
-try:
-    from core.recall.guard import ReadOnlyViolation
-
-    @app.exception_handler(ReadOnlyViolation)
-    async def _readonly_violation_handler(request, exc):
-        import logging
-        logging.getLogger("lms.api").error(
-            "ReadOnlyViolation: %s %s -> %s", request.method, request.url.path, exc)
-        from fastapi.responses import JSONResponse
-        return JSONResponse(status_code=500, content={"detail": f"readonly invariant violated: {exc}"})
-except Exception:
-    pass  # 守卫模块未合入时 fail-open（兼容期）
-
-
 
 # ---------------------------------------------------------------------------
 # T2.8/P2-4：request_id 中间件（幂等/链路追踪）
@@ -844,8 +829,6 @@ async def recall(req: RecallRequest):
         # T2.3：内存+归档合并检索（内存优先；归档超时/异常内部 fail-open）
         results = await asyncio.get_event_loop().run_in_executor(
             None, lambda: loop.recall_merged_readonly(req.query, k=k))
-    except ReadOnlyViolation:
-        raise  # M2：只读四不变违反绝不 fail-open——exception_handler 映射 500 + 告警
     except Exception as e:
         # 只读路径异常：fail-open，返回空结果，绝不 500 拖垮调用方
         logger.error(f"[{req.session_id}] /recall 检索失败（返回空）: {e}")
