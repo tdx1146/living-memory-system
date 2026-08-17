@@ -46,6 +46,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import time
 from pathlib import Path
 from typing import Iterable, List, Optional
@@ -58,6 +59,13 @@ logger = logging.getLogger(__name__)
 
 # 归档记录版本（将来字段变更时递增，读取端做向后兼容）
 ARCHIVE_VERSION = 1
+
+# P0 污染处置（2026-08-17）：系统事件不是对话——[doubt 前缀条目
+# （[doubt] conflict 事件 / [doubt-supersedes] 证伪标记）不参与归档检索。
+# 锚定行首：正文提及 [doubt 的真实条目不误伤。与
+# core/hippocampus/memory.py 的 _DOUBT_EVENT_RE 同语义（各自模块内定义，
+# 保持 core 层依赖无环）。
+_DOUBT_EVENT_RE = re.compile(r"^\s*\[doubt(?:-[a-z]+)?\]", re.I)
 
 # 归档根目录默认：项目根/data/archive（可用 LMS_ARCHIVE_DIR 环境变量覆盖）
 _DEFAULT_ARCHIVE_DIR = PROJECT_ROOT / "data" / "archive"
@@ -347,6 +355,12 @@ def query_archive(session_id: str, query_vec, k: int = 5,
 
     scored: List[tuple] = []
     for rec in _iter_records(path):
+        # P0 污染处置（2026-08-17）：[doubt 系统事件（conflict 事件 /
+        # 证伪标记）不是对话，不参与归档检索——归档路径此前无任何
+        # source/前缀过滤，[doubt 条目在合并检索（recall_merged_readonly）
+        # 中满权重可见。锚定行首，正文提及 [doubt 的条目不误伤。
+        if _DOUBT_EVENT_RE.match(rec.get("text", "") or ""):
+            continue
         vb = rec.get("vector_b64")
         if not vb:
             continue  # 无向量条目无法参与向量检索（导出时已记录）

@@ -47,6 +47,11 @@ _GARBAGE_TEXT_RE = [
 ]
 _GARBAGE_FILTERED = 0  # 计数器（进程内，可被 status 读取）
 
+# P0 污染处置（2026-08-17）：系统事件不是对话——[doubt 前缀条目
+# （[doubt] conflict 事件 / [doubt-supersedes] 证伪标记）不参与外部检索。
+# 锚定行首：正文提及 [doubt 的真实条目不误伤（如 turn=680）。
+_DOUBT_EVENT_RE = re.compile(r"^\s*\[doubt(?:-[a-z]+)?\]", re.I)
+
 
 def _is_garbage_text(text: str) -> bool:
     """判断文本是否为消息元数据/系统事件垃圾（非对话）。"""
@@ -600,6 +605,15 @@ class MemoryManager:
         for entry in self._episodic_buffer:
             # Phase 2: 来源过滤
             if source_filter is not None and entry.source != source_filter:
+                continue
+            # P0 污染处置（2026-08-17）：[doubt 系统事件（conflict 事件 /
+            # 证伪标记）不是对话，显式排除出 external 检索面——此前
+            # [doubt-supersedes]（source='doubt'）被排除纯属 Phase 2 来源
+            # 过滤巧合（非 supersede 语义），[doubt] conflict
+            # （source='external'）则完全未排除（满权重进检索/注入面）。
+            if (source_filter == 'external'
+                    and _DOUBT_EVENT_RE.match(
+                        getattr(entry, 'text', '') or '')):
                 continue
             v = entry.semantic_vector.detach().cpu().float()
             if v.dim() > 1:

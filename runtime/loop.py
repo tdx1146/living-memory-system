@@ -511,7 +511,17 @@ class LivingMemoryLoop:
 
         # 6.5 情景记忆存储（当前轮文本存入缓冲区，供后续检索）
         # 优先存 384 维 raw 向量；无 raw 向量时退化为投影向量（向后兼容）
-        if semantic_vector is not None:
+        # P0 污染处置（2026-08-17）：系统事件不是对话——[doubt 前缀事件
+        # 已由 doubt_ingest 结构化摄入（gap_registry 登记 / 证伪标记），
+        # 不再作为普通对话入库（对齐 doubt_ingest 模块 docstring 已声明
+        # 未执行的语义，注释与实现的根因修复；防复发）。fail-open：
+        # 判定异常不阻断主循环。
+        try:
+            from core.doubt.doubt_ingest import is_doubt_event
+            _is_sys_event = is_doubt_event(text)
+        except Exception:
+            _is_sys_event = False
+        if semantic_vector is not None and not _is_sys_event:
             self.memory.store_episodic(
                 text, semantic_vector, activation.surprise, self.turn_count,
                 raw_semantic_vector=raw_semantic_vector,
