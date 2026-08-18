@@ -1,0 +1,27 @@
+{
+  "module": "runtime/loop",
+  "milestone": "M5",
+  "rewrite_spec": "四妹-LMS核心重写规格v2-20260817.md §1.2/§7.1 M5",
+  "claims": {
+    "turn_increment_unique": {
+      "statement": "turn 计数唯一增量点：全库唯一的 `turn_count += 1` 只发生在 process_turn 内（loop._increment_turn，emit 步）；快照恢复是赋值恢复不是增量；/recall、/react、/dream 零增量",
+      "verified_by": "tests/test_loop_m5.py::TestUniqueTurnIncrement"
+    },
+    "lifecycle_nine_steps_no_bypass": {
+      "statement": "turn 生命周期固定 9 步（§1.2：ingest/encode/query/retrieve/integrate/doubt_check/commit/state_update/emit），process_turn 每轮 9 步各恰一次、无重复、无未知步（broken=False 才合法——禁止旁路）",
+      "verified_by": "tests/test_loop_m5.py::TestNineStepLifecycle"
+    },
+    "state_ownership_single_writer": {
+      "statement": "状态管理清单（§1.2）六项状态各登记唯一写者：turn 计数=process_turn、J/工作点/σ=state_update、π=doubt ingest/consolidation、entry.confidence=store 注入/巩固、entry 怀疑态=doubt 三时相状态机（写侧）、fok_unresolved=验证链；检索路径零写",
+      "verified_by": "tests/test_loop_m5.py::TestStateOwnershipRegistry"
+    },
+    "lifecycle_trace_side_effect_free": {
+      "statement": "生命周期记录器零副作用：只读观测、绝不 setattr 条目、绝不写持久层、不进快照；/recall 与 /react 只读口不产生生命周期记录（不 process_turn 则无记录）",
+      "verified_by": "tests/test_loop_m5.py::TestLifecycleTraceSideEffectFree"
+    },
+    "readonly_four_invariants_hold_after_m5": {
+      "statement": "M5 重组后只读四不变仍成立：一次 recall（/recall 与 /react 检索段）执行前后 turn/episodic 条目集/J/σ 零增量；四不变守卫强制开启",
+      "verified_by": "tests/test_loop_m5.py::TestReadonlyFourInvariantsAfterM5"
+    }
+  }
+}

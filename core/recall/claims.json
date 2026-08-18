@@ -1,0 +1,27 @@
+{
+  "module": "core/recall",
+  "milestone": "M2",
+  "spec": "四妹-LMS核心重写规格v2-20260817.md §1.4/§2.1/§5.1/§5.2",
+  "claims": {
+    "read_only_four_invariants": {
+      "statement": "一次 recall（/recall、/react 检索段、MCP 直连）执行前后 turn / episodic 条目集 / J / σ 四量零增量；违反抛 ReadOnlyViolation → API 500 + 告警（G 模式禁止静默）",
+      "verified_by": "tests/test_recall_m2.py::TestFourInvariantGuard; tests/test_recall_m2.py::TestRecallReadonlyM2::test_guard_armed_detects_mutation; tests/test_recall_m2.py::TestRecallEndpointM2::test_recall_violation_maps_500"
+    },
+    "no_entry_mutation": {
+      "statement": "检索路径绝不改写条目（旧 _attach_consistency 的 entry.consistency 改写已删除）；条目指纹含全部可变标量字段——字段改写同样触发守卫",
+      "verified_by": "tests/test_recall_m2.py::TestRecallReadonlyM2::test_recall_does_not_mutate_entries; tests/test_recall_m2.py::TestFourInvariantGuard::test_entry_fingerprint_captures_consistency_mutation"
+    },
+    "suspicion_projection_only": {
+      "statement": "检索时怀疑（labile 窗口 / rebuttal 待核查 / verdict 可疑）只进内存态投影随响应返回；绝不写条目、绝不进快照",
+      "verified_by": "tests/test_recall_m2.py::TestSuspicionProjection::test_projection_never_mutates_entries"
+    },
+    "attach_consistency_removed": {
+      "statement": "旧 _attach_consistency 整体删除（loop 无此方法），一致性计算保留为只读投影（仅进程内观测缓存）",
+      "verified_by": "tests/test_recall_m2.py::TestRecallReadonlyM2::test_attach_consistency_removed"
+    },
+    "endpoint_contract_frozen": {
+      "statement": "端点签名/返回结构同构：/recall 与 /react 既有字段逐字节不变，怀疑信号只追加在既有结构之后独立区段（§4.2）",
+      "verified_by": "tests/test_recall_m2.py::TestRecallEndpointM2::test_recall_response_has_suspicion_section; tests/test_recall_readonly.py"
+    }
+  }
+}

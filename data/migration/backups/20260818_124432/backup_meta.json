@@ -1,0 +1,16 @@
+{
+  "ts": 1787028273.0287418,
+  "snapshot": {
+    "src": "data/migration/inputs/latest_main.pt",
+    "dst": "data/migration/backups/20260818_124432/latest_main.pt",
+    "sha256": "5741fbf7b8661ae827789b38316ead91d24d4e2a2e0cc79ef8e14182724753fb",
+    "episodic_count": 419
+  },
+  "archive": {
+    "src": "data/migration/inputs/main.jsonl",
+    "dst": "data/migration/backups/20260818_124432/main.jsonl",
+    "sha256": "12ef5d372732f2f9d199713ec3fe75c1c88835752882f5b64346e2e18ae85698",
+    "valid_lines": 165
+  },
+  "readable_verified": true
+}

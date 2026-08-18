@@ -1,0 +1,55 @@
+{
+  "module": "core/doubt",
+  "milestone": "M3-1/M3-2",
+  "rewrite_spec": "四妹-LMS核心重写规格v2-20260817.md §2.1/§2.2/§2.3/§5.2",
+  "claims": {
+    "retrieval_phase_readonly": {
+      "statement": "检索时怀疑（labile 窗口 / 原生字段视图）只进内存态投影；retrieval_hit / retrieval_projection 绝不 setattr 条目（只读四不变与怀疑机制共存的根基）",
+      "verified_by": "tests/test_doubt_m3.py::TestThreePhaseStateMachine::test_retrieval_phase_never_mutates_entry"
+    },
+    "transition_write_side_only": {
+      "statement": "条目怀疑态转移（stable→suspect→superseded）只能由写侧时相驱动（injection_check / consolidation_resolve）；检索时相零转移",
+      "verified_by": "tests/test_doubt_m3.py::TestThreePhaseStateMachine::test_transitions_only_from_write_side"
+    },
+    "injection_suspect_and_verify": {
+      "statement": "注入时怀疑：高 surprise（>factor×J_target）或 rebuttal 命中 → 标 suspect + 登记验证链（验证链开关默认关）",
+      "verified_by": "tests/test_doubt_m3.py::TestThreePhaseStateMachine::test_injection_high_surprise_marks_suspect"
+    },
+    "labile_not_persistent": {
+      "statement": "labile 是时相状态不是持久状态：检索时相只进内存态 labile 窗口，绝不落库；持久层只存 stable/suspect/superseded 三态",
+      "verified_by": "tests/test_doubt_m3.py::TestThreePhaseStateMachine::test_labile_is_transient_not_persistent"
+    },
+    "rebuttal_field_writer_guard": {
+      "statement": "rebuttal_consistency 写者守卫：updated_by 仅允许 ingest/consolidation；retrieval 必拒（IllegalWriterError——§2.3 铁律）；读取返回深拷贝",
+      "verified_by": "tests/test_doubt_m3.py::TestRebuttalConsistencyField::test_retrieval_writer_rejected"
+    },
+    "rebuttal_field_ingest_init": {
+      "statement": "写入口（ingest/store_episodic）初始化原生字段：updated_by='ingest'、rebuttals=[]；证伪标记（mark_labile）同步结构化字段与平坦字段",
+      "verified_by": "tests/test_doubt_m3.py::TestRebuttalConsistencyField::test_ingest_init_and_rebuttal_sync"
+    },
+    "verification_chain_idempotent": {
+      "statement": "验证链幂等：同幂等键重发不重复登记；结果登记同键同验证只一条记录（客户端超时≠服务端未写入）",
+      "verified_by": "tests/test_doubt_m3.py::TestVerificationChainSkeleton::test_same_key_resend_no_duplicate"
+    },
+    "verification_chain_default_off": {
+      "statement": "验证链开关默认 false（§5.3 写侧默认保守：默认关闭、显式开启；开启必须过假阳性演练）；关时 register 返回 None 零参与",
+      "verified_by": "tests/test_doubt_m3.py::TestVerificationChainSkeleton::test_switch_default_off"
+    },
+    "verification_anti_fraud_four_dimensions": {
+      "statement": "防伪独立四维：verify_query ≠ register_query；验证批次 ≠ 登记批次；验证通道 ≠ 登记通道（独立端点/query/批次/信号）",
+      "verified_by": "tests/test_doubt_m3.py::TestVerificationChainSkeleton::test_anti_fraud_independence_dimensions"
+    },
+    "contradiction_three_way": {
+      "statement": "矛盾判定三选一（§2.2）：只有方向矛盾（结论相反）/数值矛盾（同量纲区间不相交）/否定矛盾（存在性/成立性否定）三类明确矛盾才判 conflict；未命中三选一一律不判矛盾（P0 假冲突根因①根治）",
+      "verified_by": "tests/test_doubt_m3.py::TestContradictionJudgment::test_directional_contradiction"
+    },
+    "metadata_exclusion_no_false_conflict": {
+      "statement": "元数据排除（P0 假冲突根因②根治）：时间戳/日期前缀碰撞、同义复述、来源互补一律不判矛盾（metadata_excluded=True——假阳性演练红线）",
+      "verified_by": "tests/test_doubt_m3.py::TestMetadataExclusion::test_timestamp_prefix_collision_not_conflict"
+    },
+    "verification_full_chain": {
+      "statement": "验证链全链（草稿→独立验证→修正）：verify/run_pending 驱动，防伪独立四维全程保持，VERIFY-* provenance 全程记录；CONFLICT 结果由写侧应用为 [doubt] conflict → 目标条目 labile（幂等记账）",
+      "verified_by": "tests/test_doubt_m3.py::TestVerificationChainFullChain::test_verify_provenance_full_trail"
+    }
+  }
+}

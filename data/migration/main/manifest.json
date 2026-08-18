@@ -1,0 +1,76 @@
+{
+  "tool": "tools/migrate_m7.py",
+  "milestone": "M7",
+  "rewrite_spec": "四妹-LMS核心重写规格v2-20260817.md §三/§7.1 M7",
+  "ts": 1787028272.2101588,
+  "data_ts": 1786851771.0933082,
+  "session": "main",
+  "inputs": {
+    "snapshot": {
+      "path": "data/migration/inputs/latest_main.pt",
+      "sha256": "5741fbf7b8661ae827789b38316ead91d24d4e2a2e0cc79ef8e14182724753fb"
+    },
+    "archive": {
+      "path": "data/migration/inputs/main.jsonl",
+      "sha256": "12ef5d372732f2f9d199713ec3fe75c1c88835752882f5b64346e2e18ae85698"
+    }
+  },
+  "validation": {
+    "snapshot_issues": [
+      {
+        "level": "warning",
+        "msg": "快照 episodic 条目数 = 419"
+      },
+      {
+        "level": "warning",
+        "msg": "turn 硬复位段（归 0，规格 §3.2-3 预判场景，不阻断）：条目[14] turn=0 < 前一条目 turn=13——输出将按 turn 稳定排序并强制键唯一（见 validate_merged）"
+      }
+    ],
+    "archive_issues": [
+      {
+        "level": "warning",
+        "msg": "归档行数 = 165（坏行 0）"
+      }
+    ],
+    "merged_issues": [
+      {
+        "level": "warning",
+        "msg": "合并后条目数 = 444，turn 范围 [0..846]"
+      }
+    ],
+    "backup_issues": [],
+    "passed": true
+  },
+  "merge": {
+    "session": "main",
+    "snapshot_entries": 419,
+    "snapshot_unique": 419,
+    "snapshot_internal_dup": 0,
+    "archive_records": 165,
+    "archive_valid": 165,
+    "archive_invalid": 0,
+    "archive_unique_new": 25,
+    "dup_with_snapshot": 140,
+    "dup_archive_internal": 0,
+    "dup_total": 140,
+    "final_union": 444,
+    "final_episodic": 444,
+    "final_archive": 444,
+    "formula_ok": true
+  },
+  "outputs": {
+    "snapshot": {
+      "path": "data/migration/main/migrated_latest_main.pt",
+      "sha256": "a1b691acc1b01abb28690fe7eb1c053e11ec22a24140dbe02dd1e10a8a182e23"
+    },
+    "archive": {
+      "path": "data/migration/main/main.jsonl",
+      "sha256": "14e996694481c9989e6572721cf4db61eec978b42f4cd4b47bbc5f460713dab0"
+    }
+  },
+  "backup_dir": "data/migration/backups/20260818_124432",
+  "dual_write": {
+    "rounds": 0,
+    "journal": "data/migration/main/dual_write_journal.jsonl"
+  }
+}
