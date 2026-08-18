@@ -43,7 +43,63 @@ from core.recall.guard import (
     FourInvariantGuard, episodic_fingerprint)
 from core.recall.suspicion import empty_suspicion
 
+# M5（loop 重组，§7.1）：turn 生命周期 9 步固化 + 状态管理清单。
+# runtime/lifecycle 为纯 stdlib（不 import 本仓库运行时），无循环依赖——
+# 同 core/recall 防循环依赖策略。
+from runtime.lifecycle import (
+    LifecycleTrace, STATE_OWNERSHIP, TURN_LIFECYCLE_9)
+
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------- #
+#  M5（规格 §5.2：claim 登记，machine-readable；实现与 runtime/claims.json
+#  同源）。loop 是 turn 生命周期的编排者——claim 覆盖：唯一增量点 / 9 步
+#  无旁路 / 状态管理清单单一写者 / 记录器零副作用 / 四不变衔接。
+# ---------------------------------------------------------------------- #
+MODULE_CLAIMS: dict = {
+    "module": "runtime/loop",
+    "milestone": "M5",
+    "rewrite_spec": "四妹-LMS核心重写规格v2-20260817.md §1.2/§7.1 M5",
+    "claims": {
+        "turn_increment_unique": {
+            "statement": "turn 计数唯一增量点：全库唯一的 `turn_count += 1` "
+                         "只发生在 process_turn 内（loop._increment_turn，"
+                         "emit 步）；快照恢复是赋值恢复不是增量；/recall、"
+                         "/react、/dream 零增量",
+            "verified_by": "tests/test_loop_m5.py::TestUniqueTurnIncrement",
+        },
+        "lifecycle_nine_steps_no_bypass": {
+            "statement": "turn 生命周期固定 9 步（§1.2：ingest/encode/query/"
+                         "retrieve/integrate/doubt_check/commit/state_update/"
+                         "emit），process_turn 每轮 9 步各恰一次、无重复、"
+                         "无未知步（broken=False 才合法——禁止旁路）",
+            "verified_by": "tests/test_loop_m5.py::TestNineStepLifecycle",
+        },
+        "state_ownership_single_writer": {
+            "statement": "状态管理清单（§1.2）六项状态各登记唯一写者：turn "
+                         "计数=process_turn、J/工作点/σ=state_update、π=doubt "
+                         "ingest/consolidation、entry.confidence=store 注入/"
+                         "巩固、entry 怀疑态=doubt 三时相状态机（写侧）、"
+                         "fok_unresolved=验证链；检索路径零写",
+            "verified_by": "tests/test_loop_m5.py::TestStateOwnershipRegistry",
+        },
+        "lifecycle_trace_side_effect_free": {
+            "statement": "生命周期记录器零副作用：只读观测、绝不 setattr "
+                         "条目、绝不写持久层、不进快照；/recall 与 /react "
+                         "只读口不产生生命周期记录（不 process_turn 则无记录）",
+            "verified_by": "tests/test_loop_m5.py::"
+                           "TestLifecycleTraceSideEffectFree",
+        },
+        "readonly_four_invariants_hold_after_m5": {
+            "statement": "M5 重组后只读四不变仍成立：一次 recall（/recall 与 "
+                         "/react 检索段）执行前后 turn/episodic 条目集/J/σ "
+                         "零增量；四不变守卫强制开启",
+            "verified_by": "tests/test_loop_m5.py::"
+                           "TestReadonlyFourInvariantsAfterM5",
+        },
+    },
+}
 
 
 # ---------------------------------------------------------------------- #
@@ -275,6 +331,16 @@ class LivingMemoryLoop:
         # getattr 防御外部注入的 attractor 缺该属性）。
         self.allostatic_j = getattr(self.attractor, 'allostatic', None)
 
+        # M5（loop 重组，§7.1）：turn 生命周期 9 步固化 + 状态管理清单。
+        # lifecycle_trace：当前轮进行中的生命周期记录器（process_turn 内
+        # 创建，结束时转存 last_turn_lifecycle——纯内存，不落盘、不进快照，
+        # 同 react_surprise_history / gap_registry 先例：重启即失）。
+        # last_turn_lifecycle：最近一轮的**状态汇总**（9 步观测 + broken
+        # 判定；get_status lifecycle 观测块数据源）。/recall 与 /react
+        # 只读口不创建记录器（不 process_turn 则无记录——只读四不变）。
+        self.lifecycle_trace: Optional[LifecycleTrace] = None
+        self.last_turn_lifecycle: Optional[dict] = None
+
         # 元可塑性控制器（可选，根据 config 决定是否启用）
         self.meta = None
         if config.get('meta_enabled', True):
@@ -347,20 +413,59 @@ class LivingMemoryLoop:
             f"(nodes={self.attractor.num_nodes}, dim={self.attractor.input_dim})"
         )
 
+    def _increment_turn(self) -> int:
+        """turn 计数**唯一增量点**（§1.2：process_turn 唯一；全库唯一
+        ``+= 1`` 站点——M5 固化，grep 可证）。
+
+        - emit 步调用；/recall、/react、/dream、save/load 均零增量；
+        - ``load_state`` 的快照恢复是**赋值恢复**（不是增量），不经过本
+          方法——已在 STATE_OWNERSHIP（turn 计数）登记说明。
+        """
+        self.turn_count += 1
+        return self.turn_count
+
+    def _record_lifecycle(self, step: str, **obs) -> None:
+        """M5：记录当前轮生命周期一步的观测（fail-open——G 模式以日志
+        可见，不以静默吞掉；记录异常绝不阻断主循环）。
+
+        固化红线：同一步重复记录/未知步名由 LifecycleTrace.record 抛
+        RuntimeError/KeyError → 本方法告警 → 状态汇总 broken=True
+        （missing/duplicated/unknown）——机器可验，测试断言。
+        """
+        trace = self.lifecycle_trace
+        if trace is None:
+            return
+        try:
+            trace.record(step, **obs)
+        except Exception as e:  # pylint: disable=broad-except
+            logger.warning(
+                "M5 生命周期步骤 %r 记录失败（fail-open，汇总将 broken=True）:"
+                " %s", step, e)
+
     def process_turn(self, user_input: str, llm_output: str = "") -> str:
         """处理一轮对话，执行完整的记忆循环。
 
-        流程：
-        1. 编码输入（用户输入+LLM输出 -> 感官向量）
-        2. FEP推断（感官向量 + precision -> 激活态）
-        3. FEP学习（更新J矩阵）
-        3.5 在线熵管理（熵过高增强正交化 / 熵过低放松正交化）
-        4. 调整目的（更新precision）
-        5. 记忆更新与巩固（短时更新 + 定期短时->长时迁移）
-        5.5 记忆检索（用当前激活态作为线索，检索长时记忆）—— S1 修复
-        6. 解码context（激活态 + 检索到的记忆 -> context文本）
-        7. 自动快照（可选，按间隔保存状态）—— G4 修复
-        8. 返回context
+        流程（M5 loop 重组——turn 生命周期**固定 9 步，禁止旁路**；规格
+        四妹-LMS核心重写规格v2-20260817.md §1.2；固化清单见
+        runtime/lifecycle.py ``TURN_LIFECYCLE_9``，每步观测进状态汇总）：
+        step 1  ingest        写侧入口：输入进入 + [doubt] 事件结构化摄入
+                              （注入时怀疑前置，§2.2）
+        step 2  encode        编码输入：自指回注 + 感官向量 + 语义向量 +
+                              FEP infer（surprise/熵 计算，π 读取调制）
+        step 3  query         构造检索 query（长时线索 activation.state +
+                              情景语义 query 独立构造）
+        step 4  retrieve      只读检索（memory.recall + _retrieve_episodic；
+                              检索时怀疑投影入口）
+        step 5  integrate     结果并入工作记忆（decoder.decode + 自指观测；
+                              反流畅性：来源与内容分开评估）
+        step 6  doubt_check   验证链判定登记（注入时怀疑 + conflict 应用，
+                              只登记不改条目）
+        step 7  commit        写侧提交（store_episodic——store 提取层统一
+                              出口；写侧默认保守）
+        step 8  state_update  allostatic J 滑动设定点 + J/σ 更新（learn）+
+                              π 更新（purpose.adjust）+ 记忆更新/巩固
+        step 9  emit          观测：turn 唯一增量 + 自动快照 + plastified
+                              事件 + 状态汇总
 
         参数:
             user_input: 用户输入文本
@@ -369,6 +474,22 @@ class LivingMemoryLoop:
         返回:
             记忆context文本（供LLM查询使用）
         """
+        # M5（§7.1）：本轮生命周期记录器（9 步固化——每步观测进状态汇总；
+        # 纯内存，重启即失；/recall 与 /react 只读口不创建——只读四不变）。
+        self.lifecycle_trace = LifecycleTrace()
+        # 本轮尚未完成（正常路径在 emit 步落状态汇总；异常路径 last_turn_
+        # lifecycle 保持 None——get_status 观测块给出"未完成"提示）。
+        self.last_turn_lifecycle = None
+        # M5（§1.2 状态管理清单）：本轮状态增量基准（turn 前的 J/σ/π
+        # 观测值——state_update 步据此汇总"期望增量/零增量"断言；与 M4
+        # 规格 §1.3 emit 落观测同源）。
+        _j_norm_before = float(torch.norm(self.attractor.J, p='fro').item())
+        _sigma_norm_before = float(torch.norm(self.attractor.sigma).item())
+        _precision_mean_before = float(self.purpose.get_precision().mean())
+
+        # ────────────────────────────────────────────────────────── #
+        # M5 step 1/9 ingest —— 写侧入口（输入进入 + 注入时怀疑前置）
+        # ────────────────────────────────────────────────────────── #
         # 1. 编码输入
         text = f"用户: {user_input}\n助手: {llm_output}" if llm_output else user_input
         # 提取层 v1.4（S1-7/P3）：每轮开始重置降级标记（观测粒度=单轮）
@@ -385,9 +506,12 @@ class LivingMemoryLoop:
         # fail-open）。无前缀/解析失败 = 普通塑形，逐字节不变（红线）。
         # 阶段 3：conflict 证伪事件 → conformal 校准集 + 负性证据标记
         # （对称性约束：坏消息进入全局怀疑基线，不被系统性低估）。
+        _doubt_action = None
         try:
             from core.doubt.doubt_ingest import ingest as doubt_ingest
             ev = doubt_ingest(self, text)
+            if ev:
+                _doubt_action = ev.get('action')
             if (self.precision_adapt is not None and ev
                     and ev.get('action') == 'rebutted'):
                 self._pending_negative_evidence = True
@@ -399,6 +523,15 @@ class LivingMemoryLoop:
                         pass
         except Exception:
             pass
+
+        # M5 step 1/9 ingest 观测（写侧入口：输入进入 + [doubt] 结构化摄入；
+        # 无前缀 = 普通塑形，逐字节不变——红线）。
+        self._record_lifecycle(
+            "ingest",
+            text_len=len(text),
+            degraded=self.last_turn_degraded,
+            doubt_action=_doubt_action,
+        )
 
         # ★ 插入点 A：自指回注（提取为 _inject_self_ref）
         # 在编码后、推断前，将上一轮蒸馏的自述以自适应权重回注到感官向量。
@@ -471,6 +604,19 @@ class LivingMemoryLoop:
             initial_state=initial_state,
         )
 
+        # M5 step 2/9 encode 观测（编码输入 + surprise 计算落点——规格
+        # 步骤 2：surprise=0.5·Σπᵢ(σᵢ−sᵢ)²，π 读取逐通道调制）。
+        self._record_lifecycle(
+            "encode",
+            surprise=round(float(activation.surprise), 6),
+            entropy=round(float(activation.entropy), 6),
+            precision_mean=round(float(precision.mean()), 6),
+            semantic_available=bool(semantic_vector is not None),
+            raw_semantic_available=bool(raw_semantic_vector is not None),
+            is_self_ref_dominant=bool(is_self_ref_dominant),
+            self_ref_alpha=round(float(alpha_t), 4),
+        )
+
         # 2.5 论文机制 A（默认关）：allostatic J 滑动设定点（M4 原生）
         # 用本轮 surprise + σ 激活态更新 J_target，并在 learn 前写回
         # attractor.j_target_norm——learn() 的范数钳制按动态设定点执行
@@ -519,6 +665,16 @@ class LivingMemoryLoop:
             self.memory.consolidate()
             logger.debug(f"第{self.turn_count}轮：执行记忆巩固")
 
+        # M5 step 3/9 query —— 构造检索 query（规格步骤 3：与注入内容同源
+        # 但独立构造——防伪独立 query 维；长时线索 = activation.state，
+        # 情景语义 query 由 _retrieve_episodic 内部经 _encode_query_vector
+        # 独立构造）。
+        self._record_lifecycle(
+            "query",
+            long_term_cue="activation.state",
+            episodic_query_source="text → _encode_query_vector",
+        )
+
         # 5.5 长时记忆检索（S1 修复：用当前激活态作为线索，检索长时记忆）
         # recall() 返回 [num_nodes] 维向量，与 activation.state 同维。
         # 这是"记忆只写不读"缺陷的核心修复点：长时记忆通过此步进入输出路径。
@@ -527,6 +683,15 @@ class LivingMemoryLoop:
         # 5.6 情景记忆检索（用语义向量找最相关的历史文本）
         # 先检索后存储：避免当前轮文本出现在检索结果中
         episodic_texts = self._retrieve_episodic(text)
+
+        # M5 step 4/9 retrieve 观测（只读检索；检索时怀疑投影入口——
+        # _retrieve_episodic 内部写侧引用匹配 record_reference 属写侧时相
+        # 的引用加固，非条目改写——四不变守卫口径不变）。
+        self._record_lifecycle(
+            "retrieve",
+            long_term_recalled=bool(recalled is not None),
+            episodic_hits=len(episodic_texts) if episodic_texts else 0,
+        )
 
         # 5.7 体验层 D（设计 v1.1 §6.2）：惊讶度双角色-角色2 去稳定化
         # 高惊讶（z>2）→ 标记被当前输入违反的旧记忆为 labile
@@ -541,6 +706,14 @@ class LivingMemoryLoop:
             activation, recalled_memory=recalled,
             episodic_texts=episodic_texts,
             coherence=self.purpose.coherence)
+
+        # M5 step 5/9 integrate 观测（结果并入工作记忆；反流畅性：来源与
+        # 内容分开评估——来源可信度进 π，高流畅≠真）。
+        self._record_lifecycle(
+            "integrate",
+            context_len=len(memory_context),
+            coherence=round(float(self.purpose.coherence), 6),
+        )
 
         # ★ 插入点 B：自指观测
         # 观测自述：将 decoder 输出和当前激活态送入自指回路进行蒸馏缓存，
@@ -563,10 +736,13 @@ class LivingMemoryLoop:
             _is_sys_event = is_doubt_event(text)
         except Exception:
             _is_sys_event = False
+        # M5 step 7/9 commit —— 写侧提交前置：条目数基准（store_episodic
+        # 可能被垃圾过滤跳过——用条目数变化判定注入时怀疑；基准外提，
+        # 观测口径与旧判定逐字节一致）。
+        _epi_before = self.memory.episodic_size()
         if semantic_vector is not None and not _is_sys_event:
             # M3-1 注入时怀疑（§2.1 写侧时相）：仅当本轮确实新增了条目
             # （store_episodic 可能被垃圾过滤跳过——用条目数变化判定）。
-            _epi_before = self.memory.episodic_size()
             self.memory.store_episodic(
                 text, semantic_vector, activation.surprise, self.turn_count,
                 raw_semantic_vector=raw_semantic_vector,
@@ -593,10 +769,35 @@ class LivingMemoryLoop:
                     logger.warning(
                         "M3-1 注入时怀疑检查失败（fail-open）: %s", e)
 
+        # M5 step 7/9 commit 观测（写侧提交：store_episodic——store 提取层
+        # 统一出口；写侧默认保守；[doubt] 系统事件不入库——P0 污染处置）。
+        _epi_delta = self.memory.episodic_size() - _epi_before
+        self._record_lifecycle(
+            "commit",
+            episodic_delta=_epi_delta,
+            entry_added=bool(_epi_delta > 0),
+            suspect_marked=self.doubt_state.injection_suspect_marked,
+            sys_event_skipped=bool(_is_sys_event),
+        )
+
         # M3-2 验证链全链写侧（§2.2）：验证结果 CONFLICT → [doubt] conflict
         # 事件 → 目标旧记忆 labile（写侧时相）。fail-open；开关默认关
         # （LMS_VERIFICATION_CHAIN_ENABLED=0）→ 零参与。
         self._apply_verification_conflicts()
+
+        # M5 step 6/9 doubt_check 观测（验证链判定：矛盾三选一/元数据排除/
+        # 幂等——只登记，不改条目；应用由写侧时相驱动）。
+        try:
+            _chain_pending = len(self.verification_chain.pending_conflicts())
+        except Exception:
+            _chain_pending = 0
+        self._record_lifecycle(
+            "doubt_check",
+            chain_enabled=bool(self.verification_chain.enabled),
+            chain_pending_conflicts=_chain_pending,
+            injection_checks=self.doubt_state.injection_checks,
+            injection_suspect_marked=self.doubt_state.injection_suspect_marked,
+        )
 
         # 阶段 3：precision 动态校准观测（HGF 波动性 → 全局怀疑基线；
         # 逐试次更新，Mathys 2011 / Behrens 2007）。is_negative 由本轮
@@ -611,9 +812,52 @@ class LivingMemoryLoop:
                 pass
         self._pending_negative_evidence = False
 
+        # M5 step 8/9 state_update 观测（状态更新：allostatic J 滑动设定点
+        # + J/σ 更新（learn）+ π 更新（purpose.adjust）+ 记忆更新/巩固——
+        # 锚点分散在 FEP 管线，观测在此聚合；增量 = 本轮期望增量，供
+        # 回归断言零增量/期望增量——M4 规格 §1.3 emit 同源）。
+        try:
+            _j_norm_after = float(torch.norm(self.attractor.J, p='fro').item())
+        except Exception:  # pylint: disable=broad-except
+            _j_norm_after = _j_norm_before
+        try:
+            _sigma_norm_after = float(
+                torch.norm(self.attractor.sigma).item())
+        except Exception:  # pylint: disable=broad-except
+            _sigma_norm_after = _sigma_norm_before
+        try:
+            _precision_mean_after = float(
+                self.purpose.get_precision().mean())
+        except Exception:  # pylint: disable=broad-except
+            _precision_mean_after = _precision_mean_before
+        _allostatic_events = 0
+        try:
+            _allostatic_ctl = getattr(self.attractor, 'allostatic', None)
+            if _allostatic_ctl is not None:
+                _allostatic_events = len(
+                    list(getattr(_allostatic_ctl, 'events', []) or []))
+        except Exception:  # pylint: disable=broad-except
+            _allostatic_events = 0
+        self._record_lifecycle(
+            "state_update",
+            j_norm=round(float(_j_norm_after), 6),
+            j_norm_delta=round(
+                float(_j_norm_after - _j_norm_before), 6),
+            sigma_norm_delta=round(
+                float(_sigma_norm_after - _sigma_norm_before), 6),
+            precision_mean_delta=round(
+                float(_precision_mean_after - _precision_mean_before), 6),
+            consolidation_ran=bool(
+                self.turn_count > 0
+                and self.turn_count % self.consolidation_interval == 0),
+            allostatic_events=_allostatic_events,
+        )
+
         # 更新状态
         self.last_activation = activation
-        self.turn_count += 1
+        # M5 step 9/9 emit —— turn 计数**唯一增量点**（§1.2：process_turn
+        # 唯一；全库唯一 `+= 1` 站点，见 _increment_turn）。
+        self._increment_turn()
 
         logger.debug(
             f"第{self.turn_count}轮: "
@@ -626,6 +870,35 @@ class LivingMemoryLoop:
 
         # ★ Phase 4 钩子：塑形状态反哺总线（外围、静默降级，绝不影响主循环）
         self._maybe_publish_plastified(activation)
+
+        # M5 step 9/9 emit 观测（观测：turn 唯一增量 + 快照 + plastified 事件
+        # + **状态汇总**——规格步骤 9：绝不可静默失败，G 模式以日志可见，
+        # 不阻断返回）。
+        try:
+            _plastified_interval = int(os.environ.get(
+                "LMS_PLASTIFIED_INTERVAL",
+                str(self.config.get("lms_plastified_interval", 10))))
+        except (TypeError, ValueError):
+            _plastified_interval = 10
+        self._record_lifecycle(
+            "emit",
+            turn_count=self.turn_count,
+            auto_snapshot_enabled=bool(
+                self.config.get('auto_snapshot', False)),
+            auto_snapshot_interval=self.config.get(
+                'auto_snapshot_interval', 50),
+            plastified_interval=_plastified_interval,
+        )
+        # 状态汇总（9 步固化判定：broken=False 才合法；fail-open 不阻断返回）。
+        try:
+            self.last_turn_lifecycle = self.lifecycle_trace.summary(
+                self.turn_count)
+        except Exception as e:  # pylint: disable=broad-except
+            logger.warning(
+                "M5 状态汇总失败（fail-open，不阻断返回）: %s", e)
+        # 本轮记录结束：trace 清空——lifecycle_trace 仅在 process_turn 执行
+        # 期间非 None；/recall 与 /react 只读口恒为 None（只读四不变）。
+        self.lifecycle_trace = None
 
         # 8. 返回context
         return memory_context
@@ -1778,6 +2051,20 @@ class LivingMemoryLoop:
         except Exception as e:  # pylint: disable=broad-except
             logger.debug(
                 "get_status allostatic_j 字段组装失败（fail-open）: %s", e)
+
+        # M5（§7.1）：turn 生命周期状态汇总观测（纯增量字段；未跑过
+        # process_turn 时 last_turn_lifecycle 为 None → 提供空汇总提示——
+        # §4.2 独立追加语义，旧客户端忽略）。
+        try:
+            status['lifecycle'] = self.last_turn_lifecycle or {
+                'turns': self.turn_count,
+                'broken': None,
+                'note': '尚未执行 process_turn（无生命周期记录；'
+                        '/recall 与 /react 只读口不产生记录）',
+            }
+        except Exception as e:  # pylint: disable=broad-except
+            logger.debug(
+                "get_status lifecycle 字段组装失败（fail-open）: %s", e)
 
         # 自指回路状态（可选）
         if self.self_ref is not None:

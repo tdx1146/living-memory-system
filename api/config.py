@@ -27,7 +27,7 @@
     LMS_J_ALLOSTATIC      -- allostatic J 滑动设定点开关（默认 0=关，固定 J 不变）
     LMS_J_ALLOSTATIC_WINDOW / _K / _STEP / _PERSIST / _MIN / _MAX /
     LMS_J_ALLOSTATIC_MIN_SAMPLES / _SAT_FRAC / _COL_ACT
-                          -- allostatic 机制参数（详见 runtime/allostatic_j.py）
+                          -- allostatic 机制参数（详见 core/hippocampus/attractor.py）
     LMS_API_HOST          -- 服务监听地址（默认 127.0.0.1，run.py 使用）
     LMS_API_PORT          -- 服务监听端口（默认 8190，run.py 使用）
 """
