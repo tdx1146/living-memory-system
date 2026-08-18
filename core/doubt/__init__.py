@@ -11,7 +11,14 @@ M3-1（核心重建规格 v2 §二，自我怀疑原生机制）新增：
   - rebuttal_field:       rebuttal-consistency 字段原生（§2.3 存取接口 +
                           updated_by 写者守卫铁律）
   - verification_chain:  验证链原生骨架（§2.2 接口/事件类型/幂等键协议/
-                         防伪独立四维脚手架；M3-2 实现三选一判定细节）
+                         防伪独立四维脚手架）
+
+M3-2（同一规格 §2.2 判定细节）：
+  - verification_chain:  矛盾判定三选一（方向/数值/否定）+ 元数据排除
+                         （时间戳碰撞/同义复述/来源互补——P0 假冲突根因
+                         ①②根治）+ 验证链全链（草稿→独立验证→修正：
+                         verify/run_pending + VERIFY-* provenance +
+                         CONFLICT 结果写 [doubt] conflict → labile）
 
 模块（既有）：
   - confidence_field: 置信度场纯函数（更新/重算/强制降权/来源信任）
@@ -29,7 +36,7 @@ from __future__ import annotations
 #: 模块语义 claim 登记（§5.2：machine-readable；实现与 claims.json 同源）
 MODULE_CLAIMS: dict = {
     "module": "core/doubt",
-    "milestone": "M3-1",
+    "milestone": "M3-1/M3-2",
     "rewrite_spec": "四妹-LMS核心重写规格v2-20260817.md §2.1/§2.2/§2.3/§5.2",
     "claims": {
         "retrieval_phase_readonly": {
@@ -103,6 +110,32 @@ MODULE_CLAIMS: dict = {
                            "TestVerificationChainSkeleton::"
                            "test_anti_fraud_independence_dimensions",
         },
+        "contradiction_three_way": {
+            "statement": "矛盾判定三选一（§2.2）：只有方向矛盾（结论相反）/"
+                         "数值矛盾（同量纲区间不相交）/否定矛盾（存在性/"
+                         "成立性否定）三类明确矛盾才判 conflict；未命中"
+                         "三选一一律不判矛盾（P0 假冲突根因①根治）",
+            "verified_by": "tests/test_doubt_m3.py::"
+                           "TestContradictionJudgment::"
+                           "test_directional_contradiction",
+        },
+        "metadata_exclusion_no_false_conflict": {
+            "statement": "元数据排除（P0 假冲突根因②根治）：时间戳/日期前缀"
+                         "碰撞、同义复述、来源互补一律不判矛盾"
+                         "（metadata_excluded=True——假阳性演练红线）",
+            "verified_by": "tests/test_doubt_m3.py::"
+                           "TestMetadataExclusion::"
+                           "test_timestamp_prefix_collision_not_conflict",
+        },
+        "verification_full_chain": {
+            "statement": "验证链全链（草稿→独立验证→修正）：verify/"
+                         "run_pending 驱动，防伪独立四维全程保持，VERIFY-* "
+                         "provenance 全程记录；CONFLICT 结果由写侧应用为 "
+                         "[doubt] conflict → 目标条目 labile（幂等记账）",
+            "verified_by": "tests/test_doubt_m3.py::"
+                           "TestVerificationChainFullChain::"
+                           "test_verify_provenance_full_trail",
+        },
     },
 }
 
@@ -151,6 +184,9 @@ from core.doubt.verification_chain import (  # noqa: E402
     VerificationRequest,
     VerificationResult,
     VerdictType,
+    is_contradiction,
+    judge_contradiction,
+    verdict_for,
     verification_chain_enabled,
     verification_key,
 )
@@ -200,13 +236,16 @@ __all__ = [
     "read_view",
     "record_rebuttal_native",
     "update_consistency",
-    # verification_chain（M3-1）
+    # verification_chain（M3-1/M3-2）
     "ConflictKind",
     "VerificationChain",
     "VerificationEventType",
     "VerificationRequest",
     "VerificationResult",
     "VerdictType",
+    "is_contradiction",
+    "judge_contradiction",
+    "verdict_for",
     "verification_chain_enabled",
     "verification_key",
     # state_machine（M3-1）

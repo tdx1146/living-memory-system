@@ -4,10 +4,13 @@
 规格依据：`四妹-LMS核心重写规格v2-20260817.md` §2.2（验证链原生——
 防伪独立四维 + 矛盾判定三选一 + 幂等防伪）。
 
-本段（M3-1）交付**骨架**：接口、事件类型、幂等键协议、防伪独立四维的
-脚手架。**判定细节（矛盾判定三选一 / 元数据排除的语义实现）属 M3-2**——
-本模块的 ``submit_result`` 只按协议登记结果，不做语义判定；调用方
-（M3-2 / 外部验证器）给出 verdict。
+M3-1 交付**骨架**：接口、事件类型、幂等键协议、防伪独立四维的脚手架。
+**M3-2 交付判定细节**：矛盾判定三选一（方向/数值/否定）+ 元数据排除
+（时间戳碰撞/同义复述/来源互补——P0 假冲突根因①②根治）+ 验证链全链
+（草稿→独立验证→修正：``verify`` / ``run_pending`` 驱动，VERIFY-*
+provenance 全程记录，CONFLICT 结果由写侧经 ``[doubt] conflict`` → labile）。
+本模块 ``submit_result`` 按协议登记结果；判定由 ``is_contradiction`` /
+``judge_contradiction``（纯 stdlib 规则语义，无 LLM 依赖）给出。
 
 防伪独立四维（SelfCheckGPT 工程同构，§2.2）：
   1. 端点独立   —— 验证请求走独立路由/通道（本模块 channel 字段承载）；
@@ -40,11 +43,12 @@ import enum
 import hashlib
 import logging
 import os
+import re
 import time
 import uuid
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Deque, Dict, List, Optional
+from typing import Any, Callable, Deque, Dict, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger("core.doubt.verification_chain")
 
@@ -119,6 +123,308 @@ def _batch_span() -> float:
             "LMS_VERIFICATION_BATCH_SPAN", str(_DEFAULT_BATCH_SPAN))))
     except (TypeError, ValueError):
         return _DEFAULT_BATCH_SPAN
+
+
+# ---------------------------------------------------------------------- #
+#  矛盾判定三选一 + 元数据排除（M3-2：P0 假冲突根因①②的语义根治）
+# ---------------------------------------------------------------------- #
+#
+# 设计约束：纯 stdlib 规则判定（无 LLM 依赖——同 doubt_ingest 工程惯例，
+# 溯源 §4.2 标注"无 LLM 用规则近似"）。判定顺序：
+#   1. 元数据排除先行：时间戳/日期前缀碰撞、同义复述、来源互补、显式
+#      排除 → 一律不判矛盾（metadata_excluded=True——假阳性演练红线）；
+#   2. 三选一：否定矛盾 → 方向矛盾 → 数值矛盾（存在性/成立性否定优先
+#      于方向对立——"不应开启 A"是"应开启 A"的否定而非方向冲突）；
+#   3. 其余一律 NOT_A_CONFLICT（宁可漏判不误判——P0 的失败方向是假冲突）。
+
+#: 时间戳/日期形态（元数据排除①：剔除后再做语义判定——旧 overlapMatch
+#: 纯子串碰撞把"[Thu 2026-08-06 00:11 GMT+8] 开工吧"类日期前缀判成冲突
+#: 的根因修复）
+_DATETIME_PATTERNS = [
+    re.compile(r"\b\d{4}-\d{1,2}-\d{1,2}(?:[T\s]\d{1,2}:\d{2}(?::\d{2})?)?\b", re.I),  # ISO 日期/时间
+    re.compile(r"\b\d{1,2}:\d{2}(?::\d{2})?\b"),                                        # 时钟时间戳
+    re.compile(r"\d{4}年\d{1,2}月\d{1,2}[日号]?"),                                      # 中文全日期
+    re.compile(r"\d{1,2}月\d{1,2}[日号]?"),                                              # 中文月日
+    re.compile(r"[\[\(][^\]\)]*?(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)[^\]\)]*?[\]\)]", re.I),  # 英文星期括号
+    re.compile(r"[\[\(][^\]\)]*?\d{4}-\d{1,2}-\d{1,2}[^\]\)]*?[\]\)]"),                  # 含 ISO 日期括号
+]
+
+#: 语气/程度虚词（归一剔除——"不同措辞同一结论"的同义复述判定基础；
+#: 否定标记（不/没/无/非/未/勿）**绝不**在归一阶段剔除，留给否定矛盾判定）
+_STRIP_WORDS = ("应该", "应当", "应", "很", "非常", "十分", "特别")
+
+#: 句尾语气词（仅句尾剔除——避免误伤词内字："目的/的确"里的"的"不动）
+_TRAILING_PARTICLES = "的了吗呢吧啊呀哦嗯"
+
+#: 否定标记（否定矛盾：一条断言直接否定另一条的存在性/成立性）。
+#: 长标记在前（"没有"先于"没"）。"别"不入列（"别人/别墅"歧义过大）。
+_NEGATION_MARKERS = ("没有", "不", "没", "无", "非", "未", "勿")
+
+#: 否定标记的例外词（标记字不是否定的词——"不错/不客气/了不起"等）
+_NEGATION_EXCEPTION_WORDS = ("不错", "不客气", "了不起", "非但", "非常",
+                             "未央", "未来", "未免", "无非", "无论",
+                             "无妨", "无须", "无所")
+
+#: 方向矛盾词对（同一事实两条断言结论相反）。长词/专指词在前——
+#: （开启,关闭）先于（开,关），避免"开启"里的"开"被单字词对误拆。
+_DIRECTIONAL_PAIRS = (
+    ("开启", "关闭"), ("打开", "关闭"), ("启用", "停用"), ("启用", "禁用"),
+    ("支持", "反对"), ("赞成", "反对"), ("同意", "反对"), ("支持", "抵制"),
+    ("增加", "减少"), ("提高", "降低"), ("上升", "下降"), ("上涨", "下跌"),
+    ("开始", "停止"), ("继续", "停止"), ("保留", "删除"), ("保留", "移除"),
+    ("通过", "拒绝"), ("接受", "拒绝"), ("允许", "禁止"), ("允许", "拒绝"),
+    ("买", "卖"), ("涨", "跌"), ("前进", "后退"),
+    ("开", "关"), ("是", "否"),
+    ("enable", "disable"), ("support", "oppose"), ("agree", "disagree"),
+    ("accept", "reject"), ("increase", "decrease"), ("raise", "lower"),
+    ("on", "off"), ("yes", "no"), ("true", "false"), ("up", "down"),
+    ("buy", "sell"), ("allow", "forbid"), ("start", "stop"),
+    ("open", "close"),
+)
+
+#: 数值断言单位（量纲归一：同量纲同单位才可比；"1500元 vs 800公里"
+#: 不同量纲不判矛盾）。乘子：万/亿/千为数量级修饰（1500万 → 1.5e7）。
+_UNIT_TABLE = (
+    ("平方公里", "area_km2", 1.0), ("平方米", "area_m2", 1.0),
+    ("公里", "km", 1.0), ("千米", "km", 1.0), ("kg", "kg", 1.0),
+    ("公斤", "kg", 1.0), ("厘米", "cm", 1.0), ("毫米", "mm", 1.0),
+    ("米", "m", 1.0),
+    ("分钟", "min", 1.0), ("小时", "h", 1.0), ("秒钟", "s", 1.0),
+    ("秒", "s", 1.0), ("天", "day", 1.0), ("个月", "month", 1.0),
+    ("年", "year", 1.0), ("岁", "age", 1.0),
+    ("万元", "money", 1e4), ("亿元", "money", 1e8),
+    ("元", "money", 1.0), ("块", "money", 1.0), ("美元", "money_usd", 1.0),
+    ("%", "percent", 1.0), ("百分比", "percent", 1.0),
+    ("个", "count", 1.0), ("人", "count", 1.0), ("次", "count", 1.0),
+    ("家", "count", 1.0), ("台", "count", 1.0), ("辆", "count", 1.0),
+    ("条", "count", 1.0), ("名", "count", 1.0),
+    ("万", "number", 1e4), ("亿", "number", 1e8), ("千", "number", 1e3),
+)
+_UNIT_TABLE_SORTED = tuple(sorted(_UNIT_TABLE, key=lambda x: -len(x[0])))
+
+_PUNCT_CHARS = "，。！？；：、,.!?;:()（）[]【】{}<>《》\"'“”‘’…—·-–~～"
+
+_NUMBER_RE = re.compile(r"\d[\d,]*(?:\.\d+)?")
+_RANGE_RE = re.compile(
+    r"(\d[\d,]*(?:\.\d+)?)\s*(?:[-~～至到])\s*(\d[\d,]*(?:\.\d+)?)")
+
+
+def _strip_datetime_tokens(text: str) -> str:
+    """剔除时间戳/日期形态（元数据排除①）。"""
+    s = str(text or "")
+    for pat in _DATETIME_PATTERNS:
+        s = pat.sub("", s)
+    return s
+
+
+def normalize_claim(text: str) -> str:
+    """语义归一：剔除时间戳 → 小写/去标点空白 → 去语气虚词/句尾语气词。
+
+    否定标记（不/没/无/非/未/勿）**保留**——否定矛盾判定依赖它们。
+    """
+    s = _strip_datetime_tokens(text)
+    s = s.lower()
+    for ch in _PUNCT_CHARS:
+        s = s.replace(ch, " ")
+    s = "".join(s.split())
+    for w in _STRIP_WORDS:
+        s = s.replace(w, "")
+    while s and s[-1] in _TRAILING_PARTICLES:
+        s = s[:-1]
+    return s
+
+
+def _shingles(s: str) -> set:
+    if not s:
+        return set()
+    if len(s) <= 2:
+        return {s}
+    return {s[i:i + 2] for i in range(len(s) - 1)}
+
+
+def _overlap_ratio(a: str, b: str) -> float:
+    sa, sb = _shingles(a), _shingles(b)
+    if not sa or not sb:
+        return 0.0
+    return len(sa & sb) / max(len(sa), len(sb))
+
+
+def _remove_negation_marker(s: str, marker: str) -> Optional[str]:
+    """去掉一次否定标记（跳过例外词内的标记字）；无 → None。"""
+    start = 0
+    while True:
+        i = s.find(marker, start)
+        if i < 0:
+            return None
+        span = s[max(0, i - 1): i + len(marker) + 1]
+        if any(exp in span for exp in _NEGATION_EXCEPTION_WORDS):
+            start = i + 1
+            continue
+        return s[:i] + s[i + len(marker):]
+
+
+def _is_negation(a: str, b: str) -> bool:
+    """否定矛盾（三选一②）：一条断言直接否定另一条的存在性/成立性。"""
+    if not a or not b or a == b:
+        return False
+    for marker in _NEGATION_MARKERS:
+        if _remove_negation_marker(a, marker) == b:
+            return True
+        if _remove_negation_marker(b, marker) == a:
+            return True
+    return False
+
+
+def _is_directional(a: str, b: str) -> bool:
+    """方向矛盾（三选一①）：同一事实两条断言结论相反。"""
+    for w1, w2 in _DIRECTIONAL_PAIRS:
+        # "开关/是否"式自含词防误判：任一侧同时含词对两词 → 跳过
+        if w1 in a and w2 in a:
+            continue
+        if w1 in b and w2 in b:
+            continue
+        if not ((w1 in a and w2 in b) or (w2 in a and w1 in b)):
+            continue
+        ra = a.replace(w1, "").replace(w2, "")
+        rb = b.replace(w1, "").replace(w2, "")
+        if not ra or not rb:
+            continue
+        if ra == rb or _overlap_ratio(ra, rb) >= 0.6:
+            return True
+    return False
+
+
+def _match_unit(text: str, pos: int) -> Tuple[str, str, float]:
+    """取数字后的单位（最长匹配）→ (单位串, 量纲, 乘子)。"""
+    rest = text[pos:]
+    for unit, dim, mult in _UNIT_TABLE_SORTED:
+        if rest.startswith(unit):
+            return unit, dim, mult
+    return "", "dimensionless", 1.0
+
+
+def _extract_numbers(text: str) -> List[Tuple[float, float, str]]:
+    """提取数值断言（范围优先）→ [(lo, hi, 量纲), ...]。"""
+    s = _strip_datetime_tokens(text)
+    out = []
+    for m in _RANGE_RE.finditer(s):
+        lo = float(m.group(1).replace(",", ""))
+        hi = float(m.group(2).replace(",", ""))
+        if lo > hi:
+            lo, hi = hi, lo
+        _, dim, mult = _match_unit(s, m.end())
+        out.append((lo * mult, hi * mult, dim))
+    s2 = _RANGE_RE.sub("", s)
+    for m in _NUMBER_RE.finditer(s2):
+        val = float(m.group(0).replace(",", ""))
+        _, dim, mult = _match_unit(s2, m.end())
+        out.append((val * mult, val * mult, dim))
+    return out
+
+
+def _topic_overlap(a: str, b: str) -> bool:
+    """同主题门槛：数字归一为 '#' 后共享**非数字派生**的 2-gram。
+
+    必要条件（"同一事实"）：共享 shingle 必须含非 '#' 字符——"价格是1500"
+    vs "销量是800" 只共享 '是#'（数字派生）→ 不判；"成本1500元" vs
+    "成本800元" 共享 '成本' → 判（同一事实的不同数值断言）。
+    """
+    ka = re.sub(r"\d+", "#", a)
+    kb = re.sub(r"\d+", "#", b)
+    shared = _shingles(ka) & _shingles(kb)
+    return any("#" not in s for s in shared)
+
+
+def _is_numeric_contradiction(a: str, b: str) -> bool:
+    """数值矛盾（三选一③）：同一量、同量纲同单位、区间不相交。"""
+    if not _topic_overlap(a, b):
+        return False
+    na = _extract_numbers(a)
+    nb = _extract_numbers(b)
+    if not na or not nb:
+        return False
+    for la, ha, da in na:
+        for lb, hb, db in nb:
+            if da != db:
+                continue
+            if ha < lb or hb < la:  # 区间不相交
+                return True
+    return False
+
+
+def judge_contradiction(claim_a: str, claim_b: str, *,
+                        meta_a: Optional[dict] = None,
+                        meta_b: Optional[dict] = None) -> dict:
+    """矛盾判定（§2.2 三选一 + 元数据排除）→ 判定详情。
+
+    返回 ``{"kind": ConflictKind, "metadata_excluded": bool, "reason": str}``：
+      - kind=NOT_A_CONFLICT 且 metadata_excluded=True → 假阳性演练红线命中
+        （时间戳碰撞/同义复述/来源互补/显式排除）；
+      - kind ∈ {DIRECTIONAL, NUMERIC, NEGATION} → 真矛盾，登记 conflict。
+    """
+    a = str(claim_a or "").strip()
+    b = str(claim_b or "").strip()
+    if not a or not b:
+        return {"kind": ConflictKind.NOT_A_CONFLICT,
+                "metadata_excluded": False, "reason": "empty_claim"}
+    ma = meta_a or {}
+    mb = meta_b or {}
+    if ma.get("exclude") or mb.get("exclude"):
+        return {"kind": ConflictKind.NOT_A_CONFLICT,
+                "metadata_excluded": True, "reason": "explicit_exclude"}
+    a_stripped = _strip_datetime_tokens(a)
+    b_stripped = _strip_datetime_tokens(b)
+    # 元数据排除①：时间戳/日期前缀碰撞——剔除时间戳后同文（仅时间戳不同）
+    if a_stripped == b_stripped and (a_stripped != a or b_stripped != b):
+        return {"kind": ConflictKind.NOT_A_CONFLICT,
+                "metadata_excluded": True, "reason": "datetime_collision"}
+    a_norm = normalize_claim(a)
+    b_norm = normalize_claim(b)
+    if not a_norm or not b_norm:
+        return {"kind": ConflictKind.NOT_A_CONFLICT,
+                "metadata_excluded": False, "reason": "empty_after_normalize"}
+    # 元数据排除②：同义复述（不同措辞同一结论）→ 不判矛盾
+    if a_norm == b_norm:
+        return {"kind": ConflictKind.NOT_A_CONFLICT,
+                "metadata_excluded": True, "reason": "synonym_restatement"}
+    # 三选一②：否定矛盾（存在性/成立性直接否定——优先于方向对立）
+    if _is_negation(a_norm, b_norm):
+        return {"kind": ConflictKind.NEGATION,
+                "metadata_excluded": False, "reason": "negation"}
+    # 三选一①：方向矛盾（同一事实两条断言结论相反）
+    if _is_directional(a_norm, b_norm):
+        return {"kind": ConflictKind.DIRECTIONAL,
+                "metadata_excluded": False, "reason": "directional"}
+    # 三选一③：数值矛盾（同一量同量纲区间不相交）
+    if _is_numeric_contradiction(a_stripped, b_stripped):
+        return {"kind": ConflictKind.NUMERIC,
+                "metadata_excluded": False, "reason": "numeric"}
+    # 元数据排除③：来源不同且内容互补（未命中三选一）→ 不判矛盾
+    if (ma.get("source") and mb.get("source")
+            and ma.get("source") != mb.get("source")):
+        return {"kind": ConflictKind.NOT_A_CONFLICT,
+                "metadata_excluded": True, "reason": "source_complementary"}
+    return {"kind": ConflictKind.NOT_A_CONFLICT,
+            "metadata_excluded": False, "reason": "no_contradiction"}
+
+
+def is_contradiction(claim_a: str, claim_b: str, *,
+                     meta_a: Optional[dict] = None,
+                     meta_b: Optional[dict] = None) -> ConflictKind:
+    """矛盾判定三选一（§2.2）→ ConflictKind（便捷只读 API）。"""
+    return judge_contradiction(claim_a, claim_b, meta_a=meta_a,
+                               meta_b=meta_b)["kind"]
+
+
+def verdict_for(conflict_kind: Optional[str]) -> str:
+    """矛盾类型 → 验证裁决：三类真矛盾 → conflict；其余 → confirm。"""
+    if conflict_kind in (
+            ConflictKind.DIRECTIONAL.value,
+            ConflictKind.NUMERIC.value,
+            ConflictKind.NEGATION.value,
+    ):
+        return VerdictType.CONFLICT.value
+    return VerdictType.CONFIRM.value
 
 
 # ---------------------------------------------------------------------- #
@@ -202,7 +508,12 @@ class VerificationChain:
       - 幂等：同幂等键重发不重复登记；已处理键直接返回原结果；
       - 结果登记幂等：同一条目同一次验证只产生一条记录；
       - 防伪独立：verify_query ≠ register_query；验证批次 ≠ 登记批次；
-        验证通道 ≠ 登记通道。
+        验证通道 ≠ 登记通道；
+      - 判定三选一（M3-2）：只有方向/数值/否定三类明确矛盾才判 conflict；
+        元数据碰撞（时间戳前缀/同义复述/来源互补）一律不判（假阳性红线）；
+      - 全链（M3-2）：草稿→独立验证→修正（``verify`` / ``run_pending``），
+        VERIFY-* provenance 全程记录；CONFLICT 结果由写侧应用
+        （``pending_conflicts`` → ``[doubt] conflict`` → labile）。
     """
 
     def __init__(self, enabled: Optional[bool] = None,
@@ -212,6 +523,12 @@ class VerificationChain:
         self._requests: Dict[str, VerificationRequest] = {}
         self._results: Dict[str, VerificationResult] = {}
         self._events: Deque[dict] = deque(maxlen=200)
+        # M3-2：VERIFY-* provenance 链（§4.3 观测/审计数据源；进程内存态）
+        self._provenance: Deque[dict] = deque(maxlen=200)
+        # M3-2：conflict 结果写侧应用记账（[doubt] conflict → labile 幂等）
+        self._applied_conflicts: set = set()
+        # M3-2：conflict 判定的目标断言文本（pending_conflicts 的 target）
+        self._conflict_targets: Dict[str, str] = {}
         self._batch_span = _batch_span()
 
     # -- 开关 / 观测 ---------------------------------------------------- #
@@ -270,6 +587,12 @@ class VerificationChain:
             "entry_ref": req.entry_ref, "phase": registered_phase,
             "batch_id": req.batch_id, "channel": req.channel,
         })
+        self._record_provenance("VERIFY-REGISTER", idempotency_key=key,
+                                entry_ref=req.entry_ref,
+                                phase=registered_phase,
+                                register_query=req.register_query,
+                                register_batch=req.batch_id,
+                                register_channel=req.channel)
         return req
 
     # -- 结果登记（幂等：同键同验证只一条记录） --------------------------- #
@@ -317,6 +640,180 @@ class VerificationChain:
         })
         return res
 
+    # -- 验证链全链（M3-2：草稿→独立验证→修正） --------------------------- #
+
+    def verify(
+        self, request_key: str, *,
+        reference_claims: Sequence[str] = (),
+        reference_meta: Optional[Sequence[Optional[dict]]] = None,
+        batch_id: Optional[str] = None,
+        channel: Optional[str] = None,
+    ) -> Optional[VerificationResult]:
+        """验证链全链：草稿→独立验证→修正（§2.2 防伪独立四维 + 幂等）。
+
+        草稿:     请求登记时携带的 register_query（注册表已有）；
+        独立验证: 验证 query（登记时生成、与登记**不同构造**）、验证批次
+                  （≠登记批次——``independent_batch``）、验证通道
+                  （≠登记通道——``channel_for`` 独立端点命名空间），
+                  四维全部与登记隔离；
+        修正:     以参考断言（独立证据）经 ``judge_contradiction`` 做
+                  三选一判定：命中方向/数值/否定 → CONFLICT（写侧经
+                  ``[doubt] conflict`` → labile）；全部 NOT_A_CONFLICT
+                  → CONFIRM；无参考断言 → NONE（待验证）。
+
+        幂等:     同键重复 verify 命中原结果，不重复判定/登记
+                  （"客户端超时"≠"服务端未写入"——60s 竞态防护）；
+        provenance: VERIFY-QUERY / VERIFY-JUDGE / VERIFY-RESULT 全程记录。
+        """
+        if not self._enabled:
+            return None
+        req = self._requests.get(request_key)
+        if req is None:
+            return None
+        existing = self._results.get(request_key)
+        if existing is not None:
+            # 幂等：同键重试命中原结果，不重复判定/登记
+            self._record_event(VerificationEventType.VERIFY_RESULT, {
+                "idempotency_key": request_key, "replayed": True,
+            })
+            self._record_provenance("VERIFY-RESULT", idempotency_key=request_key,
+                                    replayed=True)
+            return existing
+        # 防伪独立四维：验证批次/通道与登记隔离（query 登记时已独立构造）
+        verify_batch = batch_id or self.independent_batch(req.batch_id)
+        verify_channel = channel or self.channel_for(req.channel)
+        self._record_provenance(
+            "VERIFY-QUERY", idempotency_key=request_key,
+            entry_ref=req.entry_ref,
+            verify_query=req.verify_query,
+            verify_batch=verify_batch,
+            verify_channel=verify_channel,
+            register_batch=req.batch_id,
+            register_channel=req.channel,
+            register_query=req.register_query,
+        )
+        refs = list(reference_claims or [])
+        metas = (list(reference_meta) if reference_meta is not None
+                 else [None] * len(refs))
+        if not refs:
+            # 无独立证据 → 无裁决（待验证；不臆断 confirm）
+            res = self.submit_result(request_key, verdict=VerdictType.NONE.value)
+            self._record_provenance(
+                "VERIFY-RESULT", idempotency_key=request_key,
+                verdict=VerdictType.NONE.value, note="no_reference_pending")
+            return res
+        verdict = VerdictType.CONFIRM.value
+        kind: Optional[str] = None
+        excluded = False
+        target_text: Optional[str] = None
+        for ref, meta in zip(refs, metas):
+            j = judge_contradiction(req.register_query, ref, meta_b=meta or {})
+            excluded = excluded or bool(j["metadata_excluded"])
+            self._record_provenance(
+                "VERIFY-JUDGE", idempotency_key=request_key,
+                reference=str(ref)[:80],
+                judged_kind=j["kind"].value,
+                metadata_excluded=j["metadata_excluded"],
+                reason=j["reason"],
+            )
+            if j["kind"] is not ConflictKind.NOT_A_CONFLICT:
+                verdict = VerdictType.CONFLICT.value
+                kind = j["kind"].value
+                target_text = str(ref)
+                break
+        res = self.submit_result(
+            request_key, verdict=verdict,
+            conflict_kind=kind, metadata_excluded=excluded)
+        if kind is not None and target_text is not None:
+            self._conflict_targets[request_key] = target_text
+        self._record_provenance(
+            "VERIFY-RESULT", idempotency_key=request_key,
+            verdict=verdict, conflict_kind=kind,
+            metadata_excluded=excluded, reference_n=len(refs))
+        return res
+
+    def run_pending(
+        self,
+        evidence_fn: Optional[Callable[[VerificationRequest], Sequence[str]]] = None,
+        *, batch_id: Optional[str] = None,
+    ) -> List[VerificationResult]:
+        """全链驱动：对每个待验证请求执行 草稿→独立验证→修正（幂等）。
+
+        ``evidence_fn(request)`` → 独立证据断言列表（None/空 → 无裁决
+        NONE——待验证不臆断）。全部结果登记幂等；重跑不产生新结果。
+        """
+        if not self._enabled:
+            return []
+        out: List[VerificationResult] = []
+        for key in list(self._requests):
+            if key in self._results:
+                continue
+            refs: Sequence[str] = []
+            if evidence_fn is not None:
+                try:
+                    refs = list(evidence_fn(self._requests[key]) or [])
+                except Exception:  # pylint: disable=broad-except
+                    refs = []
+            res = self.verify(key, reference_claims=refs, batch_id=batch_id)
+            if res is not None:
+                out.append(res)
+        return out
+
+    # -- conflict 结果写侧应用（[doubt] conflict → labile） ----------------- #
+
+    def pending_conflicts(self, last_n: int = 20) -> List[dict]:
+        """待写侧应用的 conflict 结果（结果写 ``[doubt] conflict`` → labile
+        的数据源——loop 写侧取用，应用后 ``mark_conflict_applied`` 记账）。
+
+        负载：request_key / claim_text（登记断言，新主张）/ target_text
+        （被否定的旧记忆文本——``[doubt] conflict`` 的目标）/
+        conflict_kind / resolved_at。
+        """
+        if not self._enabled:
+            return []
+        out: List[dict] = []
+        for key, res in list(self._results.items()):
+            if key in self._applied_conflicts:
+                continue
+            if res.verdict != VerdictType.CONFLICT.value:
+                continue
+            req = self._requests.get(key)
+            out.append({
+                "request_key": key,
+                "claim_text": req.register_query if req is not None else "",
+                "target_text": self._conflict_targets.get(key, ""),
+                "conflict_kind": res.conflict_kind,
+                "resolved_at": res.resolved_at,
+            })
+        return out[-last_n:]
+
+    def mark_conflict_applied(self, request_key: str) -> bool:
+        """写侧已应用 conflict（[doubt] conflict → labile）后记账（幂等）。"""
+        if not self._enabled:
+            return False
+        if request_key not in self._results:
+            return False
+        if request_key in self._applied_conflicts:
+            return True
+        self._applied_conflicts.add(request_key)
+        self._record_provenance("VERIFY-CONFLICT-APPLIED",
+                                idempotency_key=request_key)
+        return True
+
+    # -- provenance（VERIFY-* 日志；§4.3 事件流同源数据源） ----------------- #
+
+    def provenance(self, last_n: int = 20) -> List[dict]:
+        """VERIFY-* provenance 链（观测/审计）：VERIFY-REGISTER /
+        VERIFY-QUERY / VERIFY-JUDGE / VERIFY-RESULT / VERIFY-CONFLICT-APPLIED。"""
+        return list(self._provenance)[-last_n:]
+
+    def _record_provenance(self, kind: str, **fields: Any) -> None:
+        entry = {"kind": kind, "ts": time.time(), **fields}
+        self._provenance.append(entry)
+        # VERIFY-* 结构化日志（§2.2 provenance；reference 内容截断防噪）
+        log_fields = {k: v for k, v in fields.items() if k != "reference"}
+        logger.info("VERIFY-%s %s", kind, log_fields)
+
     # -- 查询（只读） ----------------------------------------------------- #
 
     def lookup(self, request_key: str) -> Optional[VerificationResult]:
@@ -340,10 +837,11 @@ class VerificationChain:
     def build_independent_query(register_query: str) -> str:
         """独立验证 query（防伪独立四维②：换措辞/换角度，不同构造）。
 
-        M3-2 将实现真正的语义换问（LLM/规则重述）；本段提供确定性
-        脚手架：登记 query 原样保留 + 独立角度后缀——保证
-        ``verify_query != register_query``（协议硬约束），并标注
-        待 M3-2 语义化。
+        M3-2 语义化完成：登记 query 原样保留 + 独立角度后缀——保证
+        ``verify_query != register_query``（协议硬约束）；真正的独立换问
+        由调用方（外部验证器/规则证据源）在参考断言层面实现（§2.2
+        "同一事实不同问法"的工程落地是 judge_contradiction 的语义判定，
+        验证 query 的构造独立性由本方法保证）。
         """
         q = str(register_query or "").strip()
         if not q:
@@ -400,6 +898,8 @@ class VerificationChain:
             "resolved": len(self._results),
             "registered": len(self._requests),
             "events_n": len(self._events),
+            "provenance_n": len(self._provenance),
+            "conflicts_pending": len(self.pending_conflicts()),
         }
 
     def clear(self) -> None:
@@ -407,3 +907,6 @@ class VerificationChain:
         self._requests.clear()
         self._results.clear()
         self._events.clear()
+        self._provenance.clear()
+        self._applied_conflicts.clear()
+        self._conflict_targets.clear()

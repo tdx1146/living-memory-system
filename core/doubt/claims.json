@@ -1,6 +1,6 @@
 {
   "module": "core/doubt",
-  "milestone": "M3-1",
+  "milestone": "M3-1/M3-2",
   "rewrite_spec": "四妹-LMS核心重写规格v2-20260817.md §2.1/§2.2/§2.3/§5.2",
   "claims": {
     "retrieval_phase_readonly": {
@@ -38,6 +38,18 @@
     "verification_anti_fraud_four_dimensions": {
       "statement": "防伪独立四维：verify_query ≠ register_query；验证批次 ≠ 登记批次；验证通道 ≠ 登记通道（独立端点/query/批次/信号）",
       "verified_by": "tests/test_doubt_m3.py::TestVerificationChainSkeleton::test_anti_fraud_independence_dimensions"
+    },
+    "contradiction_three_way": {
+      "statement": "矛盾判定三选一（§2.2）：只有方向矛盾（结论相反）/数值矛盾（同量纲区间不相交）/否定矛盾（存在性/成立性否定）三类明确矛盾才判 conflict；未命中三选一一律不判矛盾（P0 假冲突根因①根治）",
+      "verified_by": "tests/test_doubt_m3.py::TestContradictionJudgment::test_directional_contradiction"
+    },
+    "metadata_exclusion_no_false_conflict": {
+      "statement": "元数据排除（P0 假冲突根因②根治）：时间戳/日期前缀碰撞、同义复述、来源互补一律不判矛盾（metadata_excluded=True——假阳性演练红线）",
+      "verified_by": "tests/test_doubt_m3.py::TestMetadataExclusion::test_timestamp_prefix_collision_not_conflict"
+    },
+    "verification_full_chain": {
+      "statement": "验证链全链（草稿→独立验证→修正）：verify/run_pending 驱动，防伪独立四维全程保持，VERIFY-* provenance 全程记录；CONFLICT 结果由写侧应用为 [doubt] conflict → 目标条目 labile（幂等记账）",
+      "verified_by": "tests/test_doubt_m3.py::TestVerificationChainFullChain::test_verify_provenance_full_trail"
     }
   }
 }
