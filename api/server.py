@@ -280,7 +280,13 @@ class StoreRequest(BaseModel):
 
 
 class StoreResponse(BaseModel):
-    """/store 响应（H-7：required_fields 补 value_filtered/core_chars）。"""
+    """/store 响应（H-7：required_fields 补 value_filtered/core_chars）。
+
+    P1-1 追加区段（§3.2，独立追加不改既有字段语义）：``process_core`` /
+    ``text_snapshot`` / ``evolution``——条目级过程字段的写侧解析结果
+    （core/store/process_core.py 提取层；与 core.store.ingest 的
+    WriteResult 区段同构）。
+    """
     session_id: str = Field(..., description="会话标识")
     turn_count: int = Field(0, description="该会话累计轮次")
     stored: bool = Field(False, description="是否已落 episodic")
@@ -291,6 +297,13 @@ class StoreResponse(BaseModel):
     surprise: float = Field(0.0, description="本轮惊讶度（FEP 预测误差）")
     info_value: float = Field(0.0, description="价值分数（0.7×surprise_norm+0.3×recall_hit）")
     reason: Optional[str] = Field(None, description="未存储原因（filtered_garbage 等）")
+    # -- P1-1 条目级过程字段区段（独立追加，不改既有字段语义） --------------
+    process_core: Optional[dict] = Field(
+        None, description="条目过程核心（surprise_trace/doubt_events/turns/open_tails/confidence_curve/surprise_source）")
+    text_snapshot: Optional[str] = Field(
+        None, description="派生视图：从过程核心重建的当前结论快照（≤300 字）")
+    evolution: Optional[dict] = Field(
+        None, description="演化史（append-only 状态转移，created 开端）")
 
 
 # ---------------------------------------------------------------------------
@@ -390,6 +403,21 @@ def _store_count_503() -> int:
     with _store_503_lock:
         _store_503_count += 1
         return _store_503_count
+
+
+class _StoreEmbedDegraded(Exception):
+    """写侧 embed 熔断降级信号（P3：503 语义）。
+
+    writer 回调内 process_turn 失败 / 熔断降级 → 抛本异常：
+      - ingest 透传 writer 异常（**写失败不登记幂等键**——窗口内同 payload
+        重试可重写，客户端恢复路径不被 60s 竞态防护吞掉）；
+      - api 层映射 503＋Retry-After:30＋degraded 响应体（C-05 先例）。
+    """
+
+    def __init__(self, reason: str, turn: int):
+        super().__init__(reason)
+        self.reason = reason
+        self.turn = turn
 
 
 def store_503_count() -> int:
@@ -751,15 +779,17 @@ async def store(req: StoreRequest):
     流程（§7.1）：
       1. 会话白名单（LMS_STORE_SESSION_ALLOWLIST，默认 main）→ 非白名单 422
       2. 每会话限流（B7：限流每会话桶；默认 30/分，灰度期建议 10）
-      3. 幂等去重（sha256(user_input,llm_output)，60s 窗口）→ 命中不重复处理
-      4. 提取核心（≤300 字，两段式，S1-5）＋分段标记（S1-3，观测）
-      5. process_turn(user_input, 核心)（embed 3 处全包熔断，S1-7）——
-         内部检索即写侧引用加固（P2-B：count_reference=True 默认路径＋
-         reinforce_turn 刷新，跳过 gray 天然满足）
-      6. 后处理新条目 meta：core/info_value/ts/gray/source（S1-11 字段）
+      3. 提取核心（≤300 字，两段式，S1-5）＋分段标记（S1-3，观测）
+      4. 写侧统一入口（core.store.ingest）：语义解析 → **P1-1 过程核心提取
+         （提取过程核心优先，§3.2）** → 幂等查重（60s 窗口）→ writer 写入
+         → 登记 → 注入时怀疑钩子。writer 回调 = S1-1 流程（process_turn
+         内部检索即写侧引用加固（P2-B）＋条目 meta 后处理）；实际写入的
+         新条目经 ``entry`` 键交给 ingest 附加 process_core/text_snapshot/
+         evolution（P1-1 条目级过程字段接线）。
 
     熔断降级（P3）：写侧 embed 熔断 → 503＋Retry-After:30＋degraded 响应体
-    （插件 fail-open 不重试）；store_503_count 计数（进灰度仪表）。
+    （插件 fail-open 不重试）；**写失败不登记幂等键**（窗口内同 payload
+    重试可重写——ingest 契约）；store_503_count 计数（进灰度仪表）。
 
     M5 语义：永不整轮丢——低价值条目仍存储，value_filtered 只做标记。
     """
@@ -786,24 +816,7 @@ async def store(req: StoreRequest):
     sm = get_session_manager()
     loop = sm.get_or_create(req.session_id)
 
-    # 3. 幂等去重（60s 窗口）
-    dedup_key = _store_dedup_key(req.user_input, req.llm_output)
-    if _store_dedup_hit(req.session_id, dedup_key):
-        logger.info(
-            f"[{req.session_id}] /store 幂等命中（窗口内同 payload，不重复处理）")
-        return StoreResponse(
-            session_id=req.session_id,
-            turn_count=loop.turn_count,
-            stored=True,          # 该内容此前已落库
-            dedup_hit=True,
-            value_filtered=True,
-            core_chars=0,
-            gray=False,
-            surprise=0.0,
-            info_value=0.0,
-        )
-
-    # 4. 提取核心（≤300 字）+ 分段标记（观测）
+    # 3. 提取核心（≤300 字）+ 分段标记（观测）
     from api.extract_core import extract_core
     from api.segment_reply import segment_reply
     core = extract_core(req.llm_output)
@@ -812,7 +825,7 @@ async def store(req: StoreRequest):
     except Exception:  # pylint: disable=broad-except
         segments = []
 
-    # 5. 做梦协调（与 /chat//feed 同等对待，防并发写记忆状态）
+    # 4. 做梦协调（与 /chat//feed 同等对待，防并发写记忆状态）
     scheduler = get_dream_scheduler()
     scheduler.register_session(req.session_id)
     acquired = scheduler.acquire_conversation(req.session_id)
@@ -825,106 +838,152 @@ async def store(req: StoreRequest):
     epi_before = loop.memory.episodic_size()
     gray = _store_gray_enabled()
     try:
-        # 5a. process_turn（embed 3 处全包熔断；核心 ≤300 字塑形）
-        try:
-            await asyncio.get_event_loop().run_in_executor(
-                None, lambda: loop.process_turn(req.user_input, core))
-        except Exception as e:  # pylint: disable=broad-except
-            # 熔断 CLOSED 窗口 embed 裸抛（既有行为）→ 503 fail-open
-            # （C-05 先例：503 属预期失败，插件不重试不进死信）
-            _store_count_503()
-            logger.error(f"[{req.session_id}] /store 塑形失败（503）: {e}")
-            from fastapi.responses import JSONResponse
-            return JSONResponse(
-                status_code=503,
-                content={
-                    "status": "degraded",
-                    "reason": "embed_unavailable",
-                    "turn": loop.turn_count,
-                },
-                headers={"Retry-After": "30"},
-            )
+        # 5. 写侧统一入口（core.store.ingest：语义解析 → P1-1 过程核心提取 →
+        #    幂等查重 → 写 → 登记 → 注入时怀疑钩子）。writer 回调 = 本端点
+        #    S1-1 流程（process_turn + 条目 meta 后处理）；结果 dict 携带
+        #    ``entry`` 键（P1-1 待集成点接线：ingest 把 process_core /
+        #    text_snapshot / evolution 附加到条目，随后弹出该键——entry 含
+        #    torch 张量，不允许进入幂等记录/journal/响应）。
+        from core.store.ingest import (
+            WriteRequest,
+            WriteSemantics,
+            ingest as store_ingest,
+        )
 
-        # 5b. 熔断降级检测（P3 ②）：写侧语义向量失败 → 本轮不落库 → 503
-        if loop.memory.episodic_size() == epi_before and getattr(
-                loop, 'last_turn_degraded', False):
-            _store_count_503()
-            logger.warning(
-                f"[{req.session_id}] /store embed 熔断降级 → 503"
-                "（不落僵尸：无向量条目=检索不可达）")
-            from fastapi.responses import JSONResponse
-            return JSONResponse(
-                status_code=503,
-                content={
-                    "status": "degraded",
-                    "reason": "embed_circuit_open",
-                    "turn": loop.turn_count,
-                },
-                headers={"Retry-After": "30"},
-            )
+        def _store_writer(wreq: WriteRequest) -> dict:
+            """写回调（S1-1）：process_turn（embed 3 处全包熔断）+ 条目 meta 后处理。
 
-        # 6. 后处理新条目 meta（S1-11 字段：core/info_value/ts/gray/source）
-        entries = list(loop.memory.iter_episodic())
-        new_entry = entries[-1] if entries else None
-        stored = False
-        reason = None
-        info_value = 0.0
-        if new_entry is not None and \
-                loop.memory.episodic_size() > epi_before:
-            new_entry.core = core or None
-            new_entry.ts = time.time()
-            if gray:
-                # 灰度标记：三重冻结（不参与重放/聚类/引用加固；
-                # L1 天然不可见：source_filter='external' 过滤 store_gray）
-                new_entry.gray = True
-                new_entry.source = 'store_gray'
-            # 价值分数（论文判据 §6.2；条目已带 process_turn 原生 surprise）
+            返回 JSON 可序列化结果 dict；实际写入的新条目经 ``entry`` 键
+            交给 ingest 附加 P1-1 过程字段（附加后弹出，防序列化炸裂）。
+            embed 熔断 → 抛 ``_StoreEmbedDegraded``（**写失败不登记**——
+            ingest 透传，幂等窗口不吞失败，客户端可重试同 payload）。
+            """
+            # 5a. process_turn（核心 ≤300 字塑形；embed 裸抛 → 503 fail-open，
+            #     C-05 先例：503 属预期失败，插件不重试不进死信）
             try:
-                from api.value_filter import (
-                    compute_info_value, value_filtered,
-                )
-                surprises = [float(getattr(e, 'surprise', 0.0) or 0.0)
-                             for e in entries]
-                refs = [float(getattr(e, 'reference_count', 0) or 0)
-                        for e in entries]
-                info_value = compute_info_value(
-                    surprise=float(getattr(new_entry, 'surprise', 0.0) or 0.0),
-                    reference_count=int(
-                        getattr(new_entry, 'reference_count', 0) or 0),
-                    surprise_max=max(surprises) if surprises else None,
-                    ref_count_max=max(refs) if refs else None,
-                    text=core or req.llm_output,
-                )
-                new_entry.info_value = info_value
+                loop.process_turn(wreq.text, core)
             except Exception as e:  # pylint: disable=broad-except
+                _store_count_503()
+                logger.error(f"[{req.session_id}] /store 塑形失败（503）: {e}")
+                raise _StoreEmbedDegraded("embed_unavailable",
+                                          loop.turn_count) from e
+            # 5b. 熔断降级检测（P3 ②）：写侧语义向量失败 → 本轮不落库 → 503
+            if loop.memory.episodic_size() == epi_before and getattr(
+                    loop, 'last_turn_degraded', False):
+                _store_count_503()
                 logger.warning(
-                    f"[{req.session_id}] /store info_value 计算失败（fail-open）: {e}")
-            stored = True
-        else:
-            # 未落库：垃圾过滤命中 / embedder 无语义编码（非熔断降级）
+                    f"[{req.session_id}] /store embed 熔断降级 → 503"
+                    "（不落僵尸：无向量条目=检索不可达）")
+                raise _StoreEmbedDegraded("embed_circuit_open",
+                                          loop.turn_count)
+
+            # 6. 后处理新条目 meta（S1-11 字段：core/info_value/ts/gray/source）
+            entries = list(loop.memory.iter_episodic())
+            new_entry = entries[-1] if entries else None
             stored = False
-            reason = "filtered_garbage" if not getattr(
-                loop, 'last_turn_degraded', False) else "embed_circuit_open"
+            reason = None
+            info_value = 0.0
+            if new_entry is not None and \
+                    loop.memory.episodic_size() > epi_before:
+                new_entry.core = core or None
+                new_entry.ts = time.time()
+                if gray:
+                    # 灰度标记：三重冻结（不参与重放/聚类/引用加固；
+                    # L1 天然不可见：source_filter='external' 过滤 store_gray）
+                    new_entry.gray = True
+                    new_entry.source = 'store_gray'
+                # 价值分数（论文判据 §6.2；条目已带 process_turn 原生 surprise）
+                try:
+                    from api.value_filter import (
+                        compute_info_value, value_filtered,
+                    )
+                    surprises = [float(getattr(e, 'surprise', 0.0) or 0.0)
+                                 for e in entries]
+                    refs = [float(getattr(e, 'reference_count', 0) or 0)
+                            for e in entries]
+                    info_value = compute_info_value(
+                        surprise=float(getattr(new_entry, 'surprise', 0.0) or 0.0),
+                        reference_count=int(
+                            getattr(new_entry, 'reference_count', 0) or 0),
+                        surprise_max=max(surprises) if surprises else None,
+                        ref_count_max=max(refs) if refs else None,
+                        text=core or req.llm_output,
+                    )
+                    new_entry.info_value = info_value
+                except Exception as e:  # pylint: disable=broad-except
+                    logger.warning(
+                        f"[{req.session_id}] /store info_value 计算失败（fail-open）: {e}")
+                stored = True
+            else:
+                # 未落库：垃圾过滤命中 / embedder 无语义编码（非熔断降级）
+                stored = False
+                reason = "filtered_garbage" if not getattr(
+                    loop, 'last_turn_degraded', False) else "embed_circuit_open"
 
-        vf = True
-        try:
-            from api.value_filter import value_filtered
-            vf = value_filtered(info_value)
-        except Exception:  # pylint: disable=broad-except
-            pass
+            vf = True
+            try:
+                from api.value_filter import value_filtered
+                vf = value_filtered(info_value)
+            except Exception:  # pylint: disable=broad-except
+                pass
 
-        status = loop.get_status()
+            status = loop.get_status()
+            data = {
+                "session_id": req.session_id,
+                "turn_count": loop.turn_count,
+                "stored": stored,
+                "value_filtered": vf,
+                "core_chars": len(core),
+                "gray": gray and stored,
+                "surprise": float(status.get("last_surprise", 0.0) or 0.0),
+                "info_value": round(info_value, 4),
+                "reason": reason,
+            }
+            if stored and new_entry is not None:
+                # P1-1 待集成点：writer 报告新建条目 → ingest 附加过程字段
+                data["entry"] = new_entry
+            return data
+
+        wreq = WriteRequest(
+            semantics=WriteSemantics.STORE,
+            text=req.user_input,
+            session_id=req.session_id,
+            llm_output=req.llm_output,
+            gray=gray,
+        )
+        # 写侧统一入口（同步重活放 executor——与旧 run_in_executor 语义一致，
+        # 不阻塞事件循环；ingest 内部幂等登记/怀疑钩子为线程安全实现）
+        res = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: store_ingest(wreq, _store_writer))
         return StoreResponse(
             session_id=req.session_id,
-            turn_count=loop.turn_count,
-            stored=stored,
-            dedup_hit=False,
-            value_filtered=vf,
-            core_chars=len(core),
-            gray=gray and stored,
-            surprise=float(status.get("last_surprise", 0.0) or 0.0),
-            info_value=round(info_value, 4),
-            reason=reason,
+            turn_count=res.turn_count,
+            stored=res.stored,
+            dedup_hit=res.dedup_hit,
+            value_filtered=res.value_filtered,
+            core_chars=res.core_chars,
+            gray=res.gray,
+            surprise=res.surprise,
+            info_value=res.info_value,
+            reason=res.reason,
+            # -- P1-1 条目级过程字段区段（写侧解析结果；独立追加） --
+            process_core=res.process_core,
+            text_snapshot=res.text_snapshot,
+            evolution=res.evolution,
+        )
+    except _StoreEmbedDegraded as e:
+        # 熔断降级（P3）：写侧 embed 熔断 → 503＋Retry-After:30＋degraded
+        # 响应体（插件 fail-open 不重试）；写失败未登记幂等键——窗口内
+        # 同 payload 重试可重写（ingest 契约：透传 writer 异常不登记）
+        from fastapi.responses import JSONResponse
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "degraded",
+                "reason": e.reason,
+                "turn": e.turn,
+            },
+            headers={"Retry-After": "30"},
         )
     finally:
         scheduler.release_conversation(req.session_id)
