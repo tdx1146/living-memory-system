@@ -56,14 +56,24 @@ round_signals → 每问映射规则（judge 的确定性判据；全部缺省�
       dream_consolidated(bool)       梦期巩固发生
       provenance(bool)               VERIFY-* provenance 存在（验证链记录
                                       侧；等价于 verification_chain_active）
+      readonly_round(bool)           本轮是**只读轮**（无写侧活动——如
+                                      /recall 查询）：Q1 豁免（不判产出
+                                      是否流入活结构——P2-B 目的检查口径
+                                      修正）
+      round_type(str)                轮类型显式声明："readonly"（只读轮）
+                                      或 "write"（写轮）；与 readonly_round
+                                      等效（显式字符串优先；可取值见
+                                      _is_readonly_round）
       conclusion_only(bool)          本轮只记录结论未记录过程 → Q2 判"否"
       memory_idle(bool)              记忆机制"只是存在"本轮没动 → Q3 判"否"
       surprise_display_only(bool)    熵/惊讶只作展示未参与决策 → Q4 判"否"
       not_replayable(bool)           涌现过程不可回放/注入/审计 → Q5 判"否"
-  - Q1 流动：任一写侧活动（episodic_added / reconsolidated /
-      dream_consolidated / suspect_marked）→ 是；本轮无任何写侧活动 → 否
-      （规格：episodic_added 或 consolidated → 是；本轮无任何写侧活动
-      → 否/不确定——本实现取"否"，理由见下方"判定规则"）；
+  - Q1 流动：**只读轮豁免**（readonly_round / round_type="readonly"）→
+      不判（state="exempt"，不计入 verdict——只读轮无写侧活动是只读语义，
+      不是偏离，P2-B 口径修正）；否则任一写侧活动（episodic_added /
+      reconsolidated / dream_consolidated / suspect_marked）→ 是；本轮
+      无任何写侧活动 → 否（规格：episodic_added 或 consolidated → 是；
+      本轮无任何写侧活动 → 否/不确定——本实现取"否"，理由见下方"判定规则"）；
   - Q2 过程：doubt_events>0 或 lifecycle_trace 或 surprise_in_decisions
       → 是；elif conclusion_only → 否；else → 不确定；
   - Q3 活体：doubt_events>0 或 reconsolidated 或 verification_chain_active
@@ -80,13 +90,18 @@ round_signals → 每问映射规则（judge 的确定性判据；全部缺省�
     正信号优先于负信号（一轮确实发生过过程即判"是"，不因补记结论而误否）。
   - **"不确定"= 未判，不是通过**：judge 在无信号时不臆造，返回
     "不确定 + 缺什么信号的理由"——调用方据此**补判**（补齐信号重跑 judge）。
-  - 最终 verdict：存在任一"否" → ``drifted``；全"是" → ``aligned``；
-    其余（含未补判的"不确定"）→ ``uncertain``。
+  - **"豁免"（exempt，ok=None）**：只读轮 Q1 专用——该问**不适用**（不是
+    "未判"也不是"否"），不计入 verdict 判定（P2-B 口径修正：只读轮无写侧
+    活动是只读语义，不是偏离）。
+  - 最终 verdict：存在任一"否"（exempt 除外）→ ``drifted``；全"是"
+    （exempt 除外）→ ``aligned``；其余（含未补判的"不确定"）→ ``uncertain``。
   - 闸门信号 ``purpose_drift`` = (verdict != "aligned")：**drifted 与
     uncertain 都亮闸门**——"不确定"不是通过，必须补判到"是/否"后才算
     对齐（宁可拦错不轻信，写侧默认保守同款）。
-  - Q1 特殊：无任何写侧活动直接判"否"（不是"不确定"）——"本轮什么都没
-    写"本身是确定的负信号（Q1 反例：结论定格/静态档案），不需要补判。
+  - Q1 特殊：非只读轮且无任何写侧活动直接判"否"（不是"不确定"）——"本轮
+    什么都没写"本身是确定的负信号（Q1 反例：结论定格/静态档案），不需要
+    补判；**只读轮豁免**（P2-B）：只读轮（如 /recall 查询）Q1 判 exempt，
+    不因"产出未流入活结构"被判 drifted。
 
 设计约束（M1 core/store 同款：纯 stdlib，可被轻量单测直接 import）：
   - 不 import torch / fastapi / LMS 运行时模块；
@@ -269,6 +284,8 @@ class PurposeDriftPhase:
         reconsolidated = _truthy(sig, "reconsolidated")
         dream_consolidated = _truthy(sig, "dream_consolidated")
         provenance = _truthy(sig, "provenance")
+        # P2-B 口径修正：只读轮（无写侧活动的轮——如 /recall 查询）→ Q1 豁免
+        readonly_round = _is_readonly_round(sig)
         conclusion_only = _truthy(sig, "conclusion_only")
         memory_idle = _truthy(sig, "memory_idle")
         surprise_display_only = _truthy(sig, "surprise_display_only")
@@ -277,10 +294,16 @@ class PurposeDriftPhase:
         # -- 五问判定（映射规则见模块 docstring） ------------------------ #
         answers: Dict[str, Dict[str, Any]] = {}
 
-        # Q1 流动：任一写侧活动 → 是；无任何写侧活动 → 否
+        # Q1 流动：只读轮豁免（P2-B——无写侧活动是只读语义，不是偏离）；
+        # 否则任一写侧活动 → 是；无任何写侧活动 → 否
         write_activity = (episodic_added or reconsolidated
                           or dream_consolidated or suspect_marked)
-        if write_activity:
+        if readonly_round:
+            answers["Q1"] = _exempt(
+                "Q1",
+                "只读轮（readonly_round）——Q1「产出流入活结构」不适用"
+                "（无写侧活动是只读语义，不是偏离）：豁免不判")
+        elif write_activity:
             answers["Q1"] = _yes(
                 "Q1",
                 "本轮有写侧活动（episodic_added / reconsolidated / "
@@ -368,11 +391,13 @@ class PurposeDriftPhase:
                 "缺可回放信号（lifecycle_trace / provenance（VERIFY-*）均无）"
                 "——无法判定涌现过程是否可回放；请补信号后补判")
 
-        # -- 最终 verdict（铁律：任一否→drifted；全是→aligned；其余→uncertain）
+        # -- 最终 verdict（铁律：任一否→drifted；全是→aligned；其余→uncertain；
+        #    豁免（exempt）不计入判定——只读轮 Q1 不适用，P2-B 口径修正）
         states = [answers[q]["state"] for q in QUESTION_IDS]
-        if "no" in states:
+        decided = [s for s in states if s != "exempt"]
+        if "no" in decided:
             verdict = "drifted"
-        elif all(s == "yes" for s in states):
+        elif decided and all(s == "yes" for s in decided):
             verdict = "aligned"
         else:
             verdict = "uncertain"
@@ -438,6 +463,28 @@ def _truthy(sig: dict, key: str) -> bool:
     return bool(sig.get(key, False))
 
 
+def _is_readonly_round(sig: dict) -> bool:
+    """P2-B 口径修正：只读轮判定（Q1 豁免依据）。
+
+    优先级：显式 ``round_type`` 字符串 > ``readonly_round`` 布尔。
+      - round_type ∈ {"readonly", "read-only", "ro", "readonly_round"}
+        → True（只读轮）；
+      - round_type ∈ {"write", "readwrite", "rw", "write_round"} → False；
+      - round_type 其他值/缺失 → 回退 readonly_round 布尔。
+    只读轮 = 无写侧活动的轮（如 /recall 查询）——产出不流入活结构是只读
+    语义，不是偏离；Q1 对只读轮豁免。
+    """
+    try:
+        rt = str(sig.get("round_type", "") or "").strip().lower()
+    except Exception:  # pylint: disable=broad-except
+        rt = ""
+    if rt in ("readonly", "read-only", "ro", "readonly_round"):
+        return True
+    if rt in ("write", "readwrite", "rw", "write_round"):
+        return False
+    return _truthy(sig, "readonly_round")
+
+
 def _count(sig: dict, key: str) -> int:
     """计数信号取值：缺省 0；非法数值按 0（fail-open，不抛）。"""
     try:
@@ -452,6 +499,15 @@ def _yes(q: str, reason: str) -> dict:
 
 def _no(q: str, reason: str) -> dict:
     return {"ok": False, "state": "no", "reason": reason}
+
+
+def _exempt(q: str, reason: str) -> dict:
+    """豁免判定（P2-B）：问不适用（如只读轮 Q1）——不计入 verdict。
+
+    ok=None（同"未判"的取值形态，但 state="exempt" 语义是"不适用"，
+    不是"未判"）；verdict 计算时排除 exempt 状态。
+    """
+    return {"ok": None, "state": "exempt", "reason": reason}
 
 
 def _uncertain(q: str, reason: str) -> dict:
