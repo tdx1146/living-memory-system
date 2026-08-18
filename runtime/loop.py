@@ -265,45 +265,15 @@ class LivingMemoryLoop:
         # 时 is_negative=True（对称性约束：坏消息 PE 不被系统性低估）
         self._pending_negative_evidence: bool = False
 
-        # 论文机制 A（2026-08-17 实施，dandan 拍板）：allostatic J 滑动设定点。
-        # 治理开关 LMS_J_ALLOSTATIC（默认 0=关 → 固定 J 行为完全不变，回滚干净）。
-        # 固定 J=7.0 在生产持续学习下漂移失效（双快照复测实锤：J 内容漂移 →
-        # norm 7 工作点崩塌）——J 从 env 固定值 → surprise 序列统计在线重估的
-        # 滑动设定点（Mehra 1970 innovation 法 + Sterling 2012 allostasis）。
-        # 纯进程内存状态（同 precision_adapt 先例：重启即失、快照不落盘）。
-        from runtime.allostatic_j import (
-            AllostaticJController, allostatic_j_enabled, compute_sigma_stats)
-        self._compute_sigma_stats = compute_sigma_stats  # process_turn 复用
-        if allostatic_j_enabled(config.get('j_allostatic')):
-            self.allostatic_j = AllostaticJController(
-                enabled=True,
-                # 初始设定点 = 当前 env 值（LMS_J_TARGET_NORM），不另设固定值
-                init_target=float(config.get(
-                    'j_target_norm',
-                    os.environ.get('LMS_J_TARGET_NORM', '40.0'))),
-                window=int(config.get('j_allostatic_window', 200)),
-                k=float(config.get('j_allostatic_k', 2.0)),
-                step=float(config.get('j_allostatic_step', 0.5)),
-                persist=int(config.get('j_allostatic_persist', 5)),
-                j_min=float(config.get('j_allostatic_min', 3.0)),
-                j_max=float(config.get('j_allostatic_max', 40.0)),
-                min_samples=int(
-                    config.get('j_allostatic_min_samples', 30)),
-                sat_frac=float(config.get('j_allostatic_sat_frac', 0.9)),
-                col_act=int(config.get('j_allostatic_col_act', 5)),
-            )
-            # 初始设定点立即接管（attractor 的 learn 钳制按动态值执行）
-            self.attractor.j_target_norm = self.allostatic_j.j_target
-            logger.info(
-                "allostatic J 已启用：初始设定点 J_target=%.4f "
-                "（window=%d, k=%.2f, step=%.2f, persist=%d, "
-                "range=[%.2f, %.2f]）",
-                self.allostatic_j.j_target, self.allostatic_j.window,
-                self.allostatic_j.k, self.allostatic_j.step,
-                self.allostatic_j.persist, self.allostatic_j.j_min,
-                self.allostatic_j.j_max)
-        else:
-            self.allostatic_j = None
+        # 论文机制 A（M4 原生并入，2026-08-18）：allostatic J 滑动设定点已原生
+        # 并入 core/hippocampus/attractor.py——attractor 在 __init__ 按 env
+        # （LMS_J_ALLOSTATIC，默认 0=关 → 固定 J 行为完全不变，回滚干净）自建
+        # AllostaticJController 并写回 j_target_norm（learn 钳制按动态值执行）。
+        # 原外挂 runtime/allostatic_j.py 已删除——loop 不再 import 外挂，
+        # process_turn/get_status 均走 attractor 原生方法。
+        # 兼容引用：loop.allostatic_j = attractor.allostatic（None = 关；
+        # getattr 防御外部注入的 attractor 缺该属性）。
+        self.allostatic_j = getattr(self.attractor, 'allostatic', None)
 
         # 元可塑性控制器（可选，根据 config 决定是否启用）
         self.meta = None
@@ -501,17 +471,15 @@ class LivingMemoryLoop:
             initial_state=initial_state,
         )
 
-        # 2.5 论文机制 A（默认关）：allostatic J 滑动设定点
-        # 用本轮 surprise + σ 统计更新 J_target，并在 learn 前写入
+        # 2.5 论文机制 A（默认关）：allostatic J 滑动设定点（M4 原生）
+        # 用本轮 surprise + σ 激活态更新 J_target，并在 learn 前写回
         # attractor.j_target_norm——learn() 的范数钳制按动态设定点执行
-        # （attractor 本体零改动；开关关时零参与）。fail-open。
-        if self.allostatic_j is not None:
-            try:
-                sigma_stats = self._compute_sigma_stats(activation.state)
-                self.attractor.j_target_norm = self.allostatic_j.update(
-                    activation.surprise, sigma_stats)
-            except Exception as e:  # pylint: disable=broad-except
-                logger.warning("allostatic J 更新失败（fail-open）: %s", e)
+        # （attractor 原生持有控制器；开关关时零参与）。fail-open。
+        try:
+            self.attractor.update_allostatic(
+                activation.surprise, activation.state)
+        except Exception as e:  # pylint: disable=broad-except
+            logger.warning("allostatic J 更新失败（fail-open）: %s", e)
 
         # 3. FEP学习（E-P2-5: 通过 override 参数传递元调整后的权重）
         self.attractor.learn(
@@ -625,6 +593,11 @@ class LivingMemoryLoop:
                     logger.warning(
                         "M3-1 注入时怀疑检查失败（fail-open）: %s", e)
 
+        # M3-2 验证链全链写侧（§2.2）：验证结果 CONFLICT → [doubt] conflict
+        # 事件 → 目标旧记忆 labile（写侧时相）。fail-open；开关默认关
+        # （LMS_VERIFICATION_CHAIN_ENABLED=0）→ 零参与。
+        self._apply_verification_conflicts()
+
         # 阶段 3：precision 动态校准观测（HGF 波动性 → 全局怀疑基线；
         # 逐试次更新，Mathys 2011 / Behrens 2007）。is_negative 由本轮
         # 证伪事件（conflict/去稳定化）标记，对称性约束补偿坏消息 PE。
@@ -656,6 +629,31 @@ class LivingMemoryLoop:
 
         # 8. 返回context
         return memory_context
+
+    def _apply_verification_conflicts(self) -> None:
+        """验证链 conflict 结果写侧应用（M3-2 §2.2 全链收尾）。
+
+        验证结果 CONFLICT → 以 ``[doubt] conflict: <目标旧记忆文本>`` 事件
+        走 doubt_ingest 结构化摄入（写侧：目标条目 mark_labile + gap 登记）
+        ——与人工 [doubt] conflict 同一条证伪路径，不另造机制。幂等：
+        应用后 ``chain.mark_conflict_applied`` 记账，同键不再重复应用。
+        开关默认关（LMS_VERIFICATION_CHAIN_ENABLED=0）→ 零参与；fail-open
+        （G 模式：异常以日志可见，不以静默吞掉）。
+        """
+        chain = getattr(self, "verification_chain", None)
+        if chain is None or not chain.enabled:
+            return
+        try:
+            from core.doubt.doubt_ingest import ingest as doubt_ingest
+            for payload in chain.pending_conflicts():
+                target = (payload.get("target_text") or "").strip()
+                if not target:
+                    chain.mark_conflict_applied(payload["request_key"])
+                    continue
+                doubt_ingest(self, f"[doubt] conflict: {target}")
+                chain.mark_conflict_applied(payload["request_key"])
+        except Exception as e:  # pylint: disable=broad-except
+            logger.warning("验证链 conflict 写侧应用失败（fail-open）: %s", e)
 
     # ================================================================== #
     #  私有辅助方法（由 process_turn / query_llm 拆分而来，保持行为不变）
@@ -1770,15 +1768,16 @@ class LivingMemoryLoop:
             logger.debug(
                 "get_status doubt_native 字段组装失败（fail-open）: %s", e)
 
-        # 论文机制 A：allostatic J 滑动设定点观测（纯增量字段；开关关 → {}）
+        # 论文机制 A：allostatic J 滑动设定点观测（纯增量字段；开关关 →
+        # {'enabled': False}——§4.2 独立追加语义，旧客户端忽略）。
         # 灵魂指标②③：j_history 序列动态（非固定）+ events 越界触发可观测。
-        if self.allostatic_j is not None:
-            try:
-                status['allostatic_j'] = self.allostatic_j.snapshot(
-                    turn_count=self.turn_count)
-            except Exception as e:  # pylint: disable=broad-except
-                logger.debug(
-                    "get_status allostatic_j 字段组装失败（fail-open）: %s", e)
+        # M4：原生并入 attractor 后由 attractor.allostatic_snapshot 提供。
+        try:
+            status['allostatic_j'] = self.attractor.allostatic_snapshot(
+                turn_count=self.turn_count)
+        except Exception as e:  # pylint: disable=broad-except
+            logger.debug(
+                "get_status allostatic_j 字段组装失败（fail-open）: %s", e)
 
         # 自指回路状态（可选）
         if self.self_ref is not None:

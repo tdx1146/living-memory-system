@@ -1,6 +1,7 @@
 """allostatic J 滑动设定点（论文机制 A）单元测试。
 
-被测模块: runtime/allostatic_j.py
+被测模块: core/hippocampus/attractor.py（M4 原生并入；原外挂
+runtime/allostatic_j.py 已删除，本测试同步迁移导入路径）。
 
 覆盖:
   1. 治理开关解析（默认关 / env 开 / 显式参数）      (TestSwitch)
@@ -9,8 +10,10 @@
   4. surprise 带漂移（Mehra 1970 innovation）        (TestSurpriseBand)
   5. 设定点护栏 [j_min, j_max]                       (TestBounds)
   6. σ 统计计算 + NaN/空中性                         (TestSigmaStats)
-  7. 全链路：controller 驱动 attractor 钳制（动态设定点）(TestAttractorIntegration)
-  8. 关时零参与                                       (TestDisabled)
+  7. 原生并入：attractor 持有控制器、update_allostatic 驱动钳制、
+     冷启动不滑动、观测块保留（M4 核心）            (TestNativeIntegration)
+  8. 全链路：controller 驱动 attractor 钳制（动态设定点）(TestAttractorIntegration)
+  9. 关时零参与                                       (TestDisabled)
 
 设计约束:
   - 不改动其他源文件；仅新增本测试文件
@@ -22,7 +25,8 @@ import os
 import pytest
 import torch
 
-from runtime.allostatic_j import (
+from core.hippocampus.attractor import (
+    AttractorNetwork,
     AllostaticJController,
     SigmaStats,
     allostatic_j_enabled,
@@ -279,53 +283,178 @@ class TestSigmaStats:
 
 
 # ================================================================== #
-#  7. 全链路：controller 驱动 attractor 钳制（动态设定点）
+#  7. M4 原生并入：attractor 持有控制器、update_allostatic 驱动滑动设定点
+# ================================================================== #
+
+def _neutral_state(n: int = 32) -> torch.Tensor:
+    """中性 σ：|σ|=0.1 → 无饱和（frac_gt0.9=0）、无崩塌（act05=n>5）。"""
+    return torch.full((n,), 0.1)
+
+
+def _saturated_state(n: int = 32) -> torch.Tensor:
+    """饱和 σ：|σ|=0.95 → frac_gt0.9=1.0（饱和信号）。"""
+    return torch.full((n,), 0.95)
+
+
+def _collapsed_state(n: int = 32) -> torch.Tensor:
+    """崩塌 σ：全 0 → act05=0（崩塌信号）。"""
+    return torch.zeros(n)
+
+
+def _strong_net(seed: int = 42):
+    """构造 J 范数远超设定点的吸引子网络（模拟长期学习后的强 J）。"""
+    from core.hippocampus.attractor import AttractorNetwork
+    net = AttractorNetwork(num_nodes=32, input_dim=16, seed=seed)
+    net.J = torch.randn(32, 32) * 3.0
+    net.J = (net.J + net.J.T) / 2
+    net.J.fill_diagonal_(0)
+    return net
+
+
+class TestNativeIntegration:
+    """M4 原生并入核心：attractor 自建控制器、update_allostatic 全链路。"""
+
+    def test_default_off_zero_participation(self, monkeypatch):
+        """默认（无 env）→ allostatic=None、设定点固定、观测降级（回滚干净）。"""
+        monkeypatch.delenv("LMS_J_ALLOSTATIC", raising=False)
+        monkeypatch.delenv("LMS_J_TARGET_NORM", raising=False)
+        net = AttractorNetwork(num_nodes=32, input_dim=16)
+        assert net.allostatic is None
+        assert net.allostatic_snapshot() == {"enabled": False}
+        # 即使 σ 饱和信号在场也零参与：返回固定值不变
+        assert net.update_allostatic(123.0, _saturated_state()) == \
+            pytest.approx(40.0)
+
+    def test_enabled_via_env(self, monkeypatch):
+        """LMS_J_ALLOSTATIC=1 → attractor 原生持有控制器，初始设定点接管。"""
+        monkeypatch.setenv("LMS_J_ALLOSTATIC", "1")
+        monkeypatch.setenv("LMS_J_TARGET_NORM", "7.0")
+        net = AttractorNetwork(num_nodes=32, input_dim=16)
+        assert net.allostatic is not None
+        assert net.allostatic.enabled is True
+        assert net.j_target_norm == pytest.approx(7.0)  # learn 钳制按动态值执行
+
+    def test_cold_start_no_slide(self, monkeypatch):
+        """冷启动（<min_samples=30）：即使 σ 饱和在场也不滑动（任务书核心）。"""
+        monkeypatch.setenv("LMS_J_ALLOSTATIC", "1")
+        monkeypatch.setenv("LMS_J_TARGET_NORM", "7.0")
+        net = AttractorNetwork(num_nodes=32, input_dim=16)
+        for _ in range(29):
+            t = net.update_allostatic(5.0, _saturated_state())
+            assert t == pytest.approx(7.0)
+        snap = net.allostatic_snapshot()
+        assert snap["window_n"] == 29
+        assert snap["cold"] is True
+        assert net.j_target_norm == pytest.approx(7.0)
+        # 第 30 样本补齐 → 饱和生效 → 下降
+        t = net.update_allostatic(5.0, _saturated_state())
+        assert t == pytest.approx(6.5)
+
+    def test_saturation_down(self, monkeypatch):
+        """饱和 → 设定点降：7.0 → 6.5 → 6.0（原生路径）。"""
+        monkeypatch.setenv("LMS_J_ALLOSTATIC", "1")
+        monkeypatch.setenv("LMS_J_TARGET_NORM", "7.0")
+        net = AttractorNetwork(num_nodes=32, input_dim=16)
+        for _ in range(35):
+            net.update_allostatic(5.0, _neutral_state())  # 暖机过冷启动
+        t = net.update_allostatic(5.0, _saturated_state())
+        assert t == pytest.approx(6.5)
+        t = net.update_allostatic(5.0, _saturated_state())
+        assert t == pytest.approx(6.0)
+
+    def test_collapse_up(self, monkeypatch):
+        """崩塌 → 设定点升：7.0 → 7.5（原生路径）。"""
+        monkeypatch.setenv("LMS_J_ALLOSTATIC", "1")
+        monkeypatch.setenv("LMS_J_TARGET_NORM", "7.0")
+        net = AttractorNetwork(num_nodes=32, input_dim=16)
+        for _ in range(35):
+            net.update_allostatic(5.0, _neutral_state())
+        t = net.update_allostatic(5.0, _collapsed_state())
+        assert t == pytest.approx(7.5)
+
+    def test_dynamic_stable(self, monkeypatch):
+        """动态（健康波动 + 中性 σ）→ 设定点稳定、无越界事件（原生路径）。"""
+        monkeypatch.setenv("LMS_J_ALLOSTATIC", "1")
+        monkeypatch.setenv("LMS_J_TARGET_NORM", "7.0")
+        net = AttractorNetwork(num_nodes=32, input_dim=16)
+        for _ in range(100):
+            t = net.update_allostatic(5.0, _neutral_state())
+            assert t == pytest.approx(7.0)
+        snap = net.allostatic_snapshot()
+        assert snap["j_target"] == pytest.approx(7.0)
+        assert snap["events"] == []
+
+    def test_surprise_band_native(self, monkeypatch):
+        """原生全链路：持续越上带（persist=5 轮）→ 设定点降。"""
+        monkeypatch.setenv("LMS_J_ALLOSTATIC", "1")
+        monkeypatch.setenv("LMS_J_TARGET_NORM", "7.0")
+        net = AttractorNetwork(num_nodes=32, input_dim=16)
+        for _ in range(35):
+            net.update_allostatic(5.0, _neutral_state())
+        for i in range(5):
+            t = net.update_allostatic(50.0, _neutral_state())
+            if i < 4:
+                assert t == pytest.approx(7.0)  # 未达 persist，不动
+            else:
+                assert t == pytest.approx(6.5)  # 第 5 轮触发
+
+    def test_snapshot_block_native(self, monkeypatch):
+        """观测块保留：/status allostatic_j 结构（灵魂指标②/③，原生路径）。"""
+        monkeypatch.setenv("LMS_J_ALLOSTATIC", "1")
+        monkeypatch.setenv("LMS_J_TARGET_NORM", "7.0")
+        monkeypatch.setenv("LMS_J_ALLOSTATIC_MIN_SAMPLES", "1")
+        net = AttractorNetwork(num_nodes=32, input_dim=16)
+        for _ in range(3):
+            net.update_allostatic(5.0, _saturated_state())  # 饱和 ×3
+        snap = net.allostatic_snapshot(turn_count=42)
+        assert snap["enabled"] is True
+        assert snap["j_target"] == pytest.approx(5.5)  # 7.0→6.5→6.0→5.5
+        assert snap["j_initial"] == pytest.approx(7.0)
+        assert len(snap["j_history"]) == 3
+        assert snap["j_history"] == [6.5, 6.0, 5.5]  # 非固定序列（指标②）
+        assert len(snap["events"]) == 3
+        assert snap["events"][-1]["reason"] == "saturation"  # 越界可观测（指标③）
+        assert snap["events"][-1]["ts_turn"] == 42
+        assert snap["params"]["step"] == 0.5
+
+
+# ================================================================== #
+#  8. 全链路：update_allostatic → 写 j_target_norm → learn 按动态值钳制
 # ================================================================== #
 
 class TestAttractorIntegration:
-    """loop 契约：update → 写 attractor.j_target_norm → learn 按动态值钳制。"""
+    """loop 契约（M4 原生）：update_allostatic 驱动动态设定点 → learn 钳制。"""
 
-    @staticmethod
-    def _strong_net(seed=42):
-        """构造 J 范数远超设定点的吸引子网络（模拟长期学习后的强 J）。"""
-        from core.hippocampus.attractor import AttractorNetwork
-        net = AttractorNetwork(num_nodes=32, input_dim=16, seed=seed)
-        net.J = torch.randn(32, 32) * 3.0
-        net.J = (net.J + net.J.T) / 2
-        net.J.fill_diagonal_(0)
-        return net
-
-    def test_learn_clamps_to_rising_target(self):
+    def test_learn_clamps_to_rising_target(self, monkeypatch):
         """崩塌升：设定点 7.0→7.5，learn 按 7.5 钳制（动态而非固定 7）。"""
-        net = self._strong_net()
-        ctl = AllostaticJController(
-            enabled=True, init_target=7.0, min_samples=1,
-            persist=1, step=0.5)
-        # 崩塌信号 → 设定点上升
-        target = ctl.update(0.1, SigmaStats(frac_gt0_9=0.0, act05=2))
+        monkeypatch.setenv("LMS_J_ALLOSTATIC", "1")
+        monkeypatch.setenv("LMS_J_TARGET_NORM", "7.0")
+        monkeypatch.setenv("LMS_J_ALLOSTATIC_MIN_SAMPLES", "1")
+        net = _strong_net()
+        # 崩塌信号 → 设定点上升（原生 update_allostatic 写回 j_target_norm）
+        target = net.update_allostatic(0.1, _collapsed_state())
         assert target == pytest.approx(7.5)
-        net.j_target_norm = target
         act = net.infer(torch.randn(16) * 0.5, torch.ones(16))
         net.learn(act, torch.randn(16) * 0.5, learning_rate=0.1)
         j_norm = float(torch.norm(net.J, p="fro").item())
         assert j_norm <= 7.5 * (1 + 1e-3), f"‖J‖_F={j_norm} 未按动态设定点 7.5 钳制"
 
-    def test_learn_clamps_to_falling_target(self):
+    def test_learn_clamps_to_falling_target(self, monkeypatch):
         """饱和降：设定点 7.0→6.5，learn 按 6.5 钳制。"""
-        net = self._strong_net()
-        ctl = AllostaticJController(
-            enabled=True, init_target=7.0, min_samples=1,
-            persist=1, step=0.5)
-        target = ctl.update(5.0, SigmaStats(frac_gt0_9=1.0, act05=32))
+        monkeypatch.setenv("LMS_J_ALLOSTATIC", "1")
+        monkeypatch.setenv("LMS_J_TARGET_NORM", "7.0")
+        monkeypatch.setenv("LMS_J_ALLOSTATIC_MIN_SAMPLES", "1")
+        net = _strong_net()
+        target = net.update_allostatic(5.0, _saturated_state())
         assert target == pytest.approx(6.5)
-        net.j_target_norm = target
         act = net.infer(torch.randn(16) * 0.5, torch.ones(16))
         net.learn(act, torch.randn(16) * 0.5, learning_rate=0.1)
         j_norm = float(torch.norm(net.J, p="fro").item())
         assert j_norm <= 6.5 * (1 + 1e-3), f"‖J‖_F={j_norm} 未按动态设定点 6.5 钳制"
 
-    def test_snapshot_exposes_dynamic_sequence(self):
-        """灵魂指标②/③：j_history 动态（非固定）+ events 越界触发可观测。"""
+    def test_snapshot_exposes_dynamic_sequence(self, monkeypatch):
+        """灵魂指标②/③（控制器级回归）：j_history 动态 + events 越界可观测。"""
+        monkeypatch.setenv("LMS_J_ALLOSTATIC_MIN_SAMPLES", "1")
         ctl = AllostaticJController(
             enabled=True, init_target=7.0, min_samples=1,
             persist=1, step=0.5)
