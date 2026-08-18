@@ -40,6 +40,16 @@ from .idempotency import (
     generate_idempotency_key,
     normalize_key,
 )
+from .process_core import (
+    PROCESS_CORE_FIELDS,
+    attach_entry_fields,
+    build_text_snapshot,
+    empty_process_core,
+    extract_process_core_for_request,
+    init_evolution,
+    make_transition,
+    record_transition,
+)
 from .semantics import (
     FeedChannel,
     SemanticViolation,
@@ -71,7 +81,9 @@ class WriteRequest:
         登记时生成/回传（见 WriteResult.idempotency_key），重试必须带同一键；
       - ``gray``：store 灰度（None → 读 env ``LMS_STORE_GRAY`` 默认）；
         feed 语义下强制 False（语义违规直接拒绝）；
-      - ``source``：条目来源（None → 按语义推导默认值；feed 禁止不可召回源）。
+      - ``source``：条目来源（None → 按语义推导默认值；feed 禁止不可召回源）；
+      - ``process_core``：P1-1 调用方预提取的过程核心（可选）。None → 本层
+        按"提取过程核心优先"从 text/llm_output/metadata 启发式提取。
     """
 
     semantics: WriteSemantics
@@ -84,10 +96,16 @@ class WriteRequest:
     feed_channel: FeedChannel = FeedChannel.PRIMARY
     #: 观测透传字段（sender 等，仅日志/观测用，不参与幂等语义）
     metadata: Dict[str, Any] = field(default_factory=dict)
+    #: P1-1 调用方预提取的过程核心（可选；None → ingest 时本层提取）
+    process_core: Optional[Dict[str, Any]] = None
 
     # -- 本层解析结果（writer 必须采用；只读，勿手动覆盖） -------------------
     resolved_source: Optional[str] = None
     resolved_gray: bool = False
+    #: P1-1 过程核心解析结果（提取过程核心优先；见 process_core.py）
+    resolved_process_core: Optional[Dict[str, Any]] = None
+    resolved_text_snapshot: Optional[str] = None
+    resolved_evolution: Optional[Dict[str, Any]] = None
 
     def resolve(self) -> "WriteRequest":
         """语义解析：校验 + 推导 source/gray（幂等；可重复调用）。
@@ -116,6 +134,10 @@ class WriteResult:
     core_chars / gray / surprise / info_value / reason）；新增
     ``idempotency_key`` 与 ``replayed`` 为**独立追加区段**（§4.2 语义：
     只允许追加在既有结构之后，不得改动既有字段语义）。
+
+    P1-1 追加区段（§3.2，独立追加不改既有字段）：``process_core`` /
+    ``text_snapshot`` / ``evolution``——提取过程核心优先的产物，供
+    writer（api 层落条目）与观测消费。
     """
 
     ok: bool = False
@@ -132,11 +154,17 @@ class WriteResult:
     info_value: float = 0.0
     reason: Optional[str] = None
     replayed: bool = False
+    #: P1-1 过程核心（提取过程核心优先产物；写侧解析结果，见 process_core.py）
+    process_core: Optional[Dict[str, Any]] = None
+    #: P1-1 派生视图（从过程核心重建的当前结论快照）
+    text_snapshot: Optional[str] = None
+    #: P1-1 演化史（append-only 状态转移）
+    evolution: Optional[Dict[str, Any]] = None
     #: writer 原始结果 dict（api 层可直接搬运响应字段，血管不换）
     data: Dict[str, Any] = field(default_factory=dict)
 
     def to_response(self) -> Dict[str, Any]:
-        """转端点响应 dict（与现有响应同构；幂等键区段追加在末尾）。"""
+        """转端点响应 dict（与现有响应同构；追加区段依次排在末尾）。"""
         return {
             "session_id": self.session_id,
             "turn_count": self.turn_count,
@@ -151,6 +179,10 @@ class WriteResult:
             # -- 幂等键区段（独立追加，不改既有字段语义） --
             "idempotency_key": self.idempotency_key,
             "replayed": self.replayed,
+            # -- P1-1 过程核心区段（独立追加，不改既有字段语义） --
+            "process_core": self.process_core,
+            "text_snapshot": self.text_snapshot,
+            "evolution": self.evolution,
         }
 
 
@@ -240,22 +272,82 @@ def _build_result(req: WriteRequest, data: Dict[str, Any],
         info_value=float(data.get("info_value", 0.0) or 0.0),
         reason=data.get("reason"),
         replayed=bool(record.replayed) if record else False,
+        # P1-1：过程核心区段（写侧解析结果；dedup_hit 路径同样携带）
+        process_core=req.resolved_process_core,
+        text_snapshot=req.resolved_text_snapshot,
+        evolution=req.resolved_evolution,
         data=dict(data),
     )
 
 
+def _resolve_process_core(req: WriteRequest) -> None:
+    """P1-1：提取过程核心优先（§3.2）——写侧统一入口内建，fail-open。
+
+    优先级：调用方预提取（``req.process_core``）> 本层从 text/llm_output/
+    metadata 启发式提取（process_core.extract_process_core_for_request）。
+    解析结果写入 ``req.resolved_*`` 只读字段，供 writer（api 层落条目）与
+    WriteResult（观测）共同消费；演化史以 ``created`` 转移为起点
+    （append-only 演化史的可审计开端）。全程 fail-open：提取/解析异常 →
+    空过程核心 + 文本回退快照，绝不阻断写侧（G 模式以日志可见）。
+    """
+    try:
+        if isinstance(req.process_core, dict):
+            pc = {f: list(req.process_core.get(f, []) or [])
+                  for f in PROCESS_CORE_FIELDS}
+        else:
+            pc = extract_process_core_for_request(req)
+        req.resolved_process_core = pc
+        req.resolved_text_snapshot = build_text_snapshot(
+            pc, text=req.text, core=req.llm_output)
+        ev = init_evolution(updated_by="ingest")
+        record_transition(ev, make_transition("created", detail="ingest"))
+        req.resolved_evolution = ev
+    except Exception as e:  # pylint: disable=broad-except
+        logger.warning("过程核心解析失败（fail-open→空结构）：%s", e)
+        req.resolved_process_core = empty_process_core()
+        req.resolved_text_snapshot = build_text_snapshot(
+            None, text=req.text, core=req.llm_output)
+        req.resolved_evolution = init_evolution(updated_by="ingest")
+
+
+def _attach_process_core_to_entry(req: WriteRequest, data: Dict[str, Any]) -> None:
+    """把 P1-1 新字段附加到 writer 报告的新条目（严格增量，fail-open）。
+
+    writer 结果 dict 若携带 ``entry`` 键（待集成点：api 层 writer 把新建
+    条目放进结果），本层把 process_core/text_snapshot/evolution 附加到
+    该条目并**弹出**该键——entry 对象含 torch 张量，非 JSON 可序列化，
+    不允许进入幂等记录/journal/响应（防 journal 序列化炸裂）。附加失败
+    仅告警（条目仍在写侧缓冲区，只是缺过程字段），绝不阻断写侧。
+    """
+    if not isinstance(data, dict) or "entry" not in data:
+        return
+    entry = data.pop("entry")
+    try:
+        attach_entry_fields(
+            entry,
+            process_core=req.resolved_process_core,
+            text_snapshot=req.resolved_text_snapshot,
+            evolution=req.resolved_evolution,
+        )
+    except Exception as e:  # pylint: disable=broad-except
+        logger.warning(
+            "过程核心附加条目失败（fail-open，条目已写但缺过程字段）：%s", e)
+
+
 def ingest(req: WriteRequest, writer: Writer,
            registry: Optional[IdempotencyRegistry] = None) -> WriteResult:
-    """写侧统一入口：语义校验 → 幂等查重 → 写 → 登记 → 怀疑钩子。
+    """写侧统一入口：语义校验 → 过程核心解析 → 幂等查重 → 写 → 登记 → 怀疑钩子。
 
     Args:
         req: 写请求（semantics 决定 feed/store 语义分离）。
         writer: 实际写回调（api 层注入；内部走 loop.process_turn + 条目
-            meta 后处理；返回 JSON 可序列化结果 dict）。
+            meta 后处理；返回 JSON 可序列化结果 dict）。writer 结果若带
+            ``entry`` 键，本层把 P1-1 过程字段附加到该条目（待集成点）。
         registry: 幂等注册表（默认进程内单例；测试注入隔离实例）。
 
     Returns:
         WriteResult（dedup_hit=True 时原样返回首次结果，不重复写）。
+        P1-1：结果携带 process_core / text_snapshot / evolution（§3.2）。
 
     Raises:
         SemanticViolation: 语义违规（api 层映射 422）。
@@ -264,14 +356,20 @@ def ingest(req: WriteRequest, writer: Writer,
     Claim（§5.2 machine-readable，见 claims.json）：
       - 幂等：同键重发不双写；已处理键原样返回原结果；
       - 无副作用：dedup_hit 命中路径零写入、零状态变更；
-      - 写成功才登记：writer 异常 → 不登记。
+      - 写成功才登记：writer 异常 → 不登记；
+      - P1-1 提取过程核心优先：过程核心解析/附加全程 fail-open，绝不阻断
+        写侧；旧条目读取走 getattr 默认值，迁移数据不崩溃。
     """
     req.resolve()  # 语义校验 + source/gray 口径解析（违规抛 SemanticViolation）
     registry = registry or get_default_registry()
     key = _resolve_idempotency_key(req)
+    # P1-1：提取过程核心优先（fail-open；结果进 req.resolved_* 与 WriteResult）
+    _resolve_process_core(req)
 
     def do_write() -> Dict[str, Any]:
-        return writer(req)
+        data = writer(req)
+        _attach_process_core_to_entry(req, data)
+        return data
 
     result, dedup_hit, record = registry.run_idempotent(key, do_write)
     res = _build_result(req, result, key, dedup_hit=dedup_hit,
