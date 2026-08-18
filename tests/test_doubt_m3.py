@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
-"""M3-1 单测：三时相怀疑状态机 + rebuttal-consistency 字段原生 + 验证链骨架
+"""M3-1/M3-2 单测：三时相怀疑状态机 + rebuttal-consistency 字段原生 +
+验证链（骨架 + 矛盾判定三选一/元数据排除/幂等/全链）
 （核心重建规格 v2 §2.1 / §2.2 / §2.3 / §5.2 / §6.2）。
 
 本文件是 ``core/doubt/claims.json`` / ``MODULE_CLAIMS`` 全部 claim 的机器
@@ -12,7 +13,13 @@
   2. rebuttal-consistency 字段 → TestRebuttalConsistencyField
        （检索只读该字段；写入口仅 ingest/consolidation；非法写者被拒）
   3. 验证链骨架（幂等/防伪四维/开关默认关）→ TestVerificationChainSkeleton
-  4. loop 集成（原生字段初始化 / 注入时怀疑 / 冲突同步 / labile 窗口）
+  4. 矛盾判定三选一（方向/数值/否定各一例）→ TestContradictionJudgment
+  5. 元数据排除假阳性演练（时间戳前缀/同义复述/来源互补不触发）
+     → TestMetadataExclusion
+  6. 验证链全链（草稿→独立验证→修正 + provenance + 幂等 60s 竞态）
+     → TestVerificationChainFullChain
+  7. 验证链写侧（CONFLICT → [doubt] conflict → labile）→ TestVerificationWriteSide
+  8. loop 集成（原生字段初始化 / 注入时怀疑 / 冲突同步 / labile 窗口）
      → TestLoopIntegrationM3
 
 运行方式：pytest rewrite-ws/tests/test_doubt_m3.py -v（生产 venv）。
@@ -51,7 +58,12 @@ from core.doubt.verification_chain import (
     ConflictKind,
     VerificationChain,
     VerificationEventType,
+    VerificationRequest,
+    VerificationResult,
     VerdictType,
+    is_contradiction,
+    judge_contradiction,
+    verdict_for,
     verification_chain_enabled,
     verification_key,
 )
@@ -499,6 +511,396 @@ class TestVerificationChainSkeleton:
         types = [ev["type"] for ev in events]
         assert VerificationEventType.VERIFY_REQUESTED.value in types
         assert VerificationEventType.VERIFY_RESULT.value in types
+
+
+# ===========================================================================
+# 3.5 矛盾判定三选一（§2.2 / §6.2 假阳性演练：真矛盾各一例触发）
+# ===========================================================================
+
+class TestContradictionJudgment:
+    """矛盾判定三选一：方向/数值/否定三类**明确矛盾**才判 conflict。"""
+
+    def test_directional_contradiction(self):
+        """方向矛盾：同一事实两条断言结论相反（规格用例"应开启 A vs 应关闭 A"）。"""
+        assert is_contradiction("应开启方案A", "应关闭方案A") == \
+            ConflictKind.DIRECTIONAL
+
+    def test_directional_opposite_words(self):
+        """方向矛盾：支持 vs 反对（同事实同宾语）。"""
+        assert is_contradiction("支持采用方案B", "反对采用方案B") == \
+            ConflictKind.DIRECTIONAL
+
+    def test_directional_english(self):
+        """方向矛盾（英文词对）：enable vs disable。"""
+        assert is_contradiction("enable module A", "disable module A") == \
+            ConflictKind.DIRECTIONAL
+
+    def test_directional_requires_same_core(self):
+        """方向矛盾必须同一事实：开启方案A vs 关闭方案B 核心不同 → 不判。"""
+        assert is_contradiction("开启方案A", "关闭方案B") == \
+            ConflictKind.NOT_A_CONFLICT
+
+    def test_numeric_contradiction(self):
+        """数值矛盾：同一量同量纲区间不相交（规格用例 1500 vs 800）。"""
+        assert is_contradiction("成本为1500元", "成本为800元") == \
+            ConflictKind.NUMERIC
+
+    def test_numeric_range_disjoint(self):
+        """数值矛盾：范围断言 1500-1800 vs 800 区间不相交。"""
+        assert is_contradiction("价格1500-1800元", "价格800元") == \
+            ConflictKind.NUMERIC
+
+    def test_numeric_overlapping_interval_not_conflict(self):
+        """区间相交 → 不判矛盾（1500-1800 与 1600 相交）。"""
+        assert is_contradiction("价格1500-1800元", "价格1600元") == \
+            ConflictKind.NOT_A_CONFLICT
+
+    def test_numeric_different_dimension_not_conflict(self):
+        """不同量纲同单位不判：1500元 vs 800公里（规格"同量纲同单位"门槛）。"""
+        assert is_contradiction("成本1500元", "距离800公里") == \
+            ConflictKind.NOT_A_CONFLICT
+
+    def test_numeric_no_shared_topic_not_conflict(self):
+        """无共享主题的孤立数字不判（无"同一事实"基础）。"""
+        assert is_contradiction("价格是1500", "销量是800") == \
+            ConflictKind.NOT_A_CONFLICT
+
+    def test_negation_existence(self):
+        """否定矛盾：存在 vs 不存在（存在性直接否定）。"""
+        assert is_contradiction("存在蓝色小橘猫", "不存在蓝色小橘猫") == \
+            ConflictKind.NEGATION
+
+    def test_negation_validity(self):
+        """否定矛盾：可行 vs 不可行（成立性直接否定）。"""
+        assert is_contradiction("方案A可行", "方案A不可行") == \
+            ConflictKind.NEGATION
+
+    def test_negation_preference(self):
+        """否定矛盾：喜欢 vs 不喜欢。"""
+        assert is_contradiction("我喜欢蓝色", "我不喜欢蓝色") == \
+            ConflictKind.NEGATION
+
+    def test_unrelated_claims_not_conflict(self):
+        """无关断言（无主题重叠）不判矛盾。"""
+        assert is_contradiction("今天天气很好", "股票涨了3个点") == \
+            ConflictKind.NOT_A_CONFLICT
+
+    def test_verdict_for_maps_three_way(self):
+        """verdict_for：三类真矛盾 → conflict；其余 → confirm。"""
+        assert verdict_for(ConflictKind.DIRECTIONAL.value) == \
+            VerdictType.CONFLICT.value
+        assert verdict_for(ConflictKind.NUMERIC.value) == \
+            VerdictType.CONFLICT.value
+        assert verdict_for(ConflictKind.NEGATION.value) == \
+            VerdictType.CONFLICT.value
+        assert verdict_for(ConflictKind.NOT_A_CONFLICT.value) == \
+            VerdictType.CONFIRM.value
+        assert verdict_for(None) == VerdictType.CONFIRM.value
+
+
+# ===========================================================================
+# 3.6 元数据排除（P0 假冲突根因②根治——假阳性演练红线）
+# ===========================================================================
+
+class TestMetadataExclusion:
+    """元数据碰撞一律不判矛盾（§2.2 元数据排除 / §6.2 假阳性演练固化）。"""
+
+    def test_timestamp_prefix_collision_not_conflict(self):
+        """时间戳前缀碰撞（P0 事故残留形态——"开工吧 vs System Gate"用例）：
+        两条文本仅日期/星期前缀不同 → 不判矛盾 + metadata_excluded。"""
+        a = "[Thu 2026-08-06 00:11 GMT+8] 开工吧，我还夜猫子"
+        b = "[Fri 2026-08-07 00:11 GMT+8] 开工吧，我还夜猫子"
+        j = judge_contradiction(a, b)
+        assert j["kind"] is ConflictKind.NOT_A_CONFLICT
+        assert j["metadata_excluded"] is True
+        assert j["reason"] == "datetime_collision"
+
+    def test_iso_date_prefix_collision_not_conflict(self):
+        """ISO 日期前缀碰撞（旧 overlapMatch 纯子串碰撞会误判的形态）。"""
+        assert is_contradiction("2026-08-06 开工", "2026-08-07 开工") == \
+            ConflictKind.NOT_A_CONFLICT
+
+    def test_chinese_date_prefix_collision_not_conflict(self):
+        """中文日期前缀碰撞（8月6日 vs 8月7日）。"""
+        assert is_contradiction("8月6日 开工", "8月7日 开工") == \
+            ConflictKind.NOT_A_CONFLICT
+
+    def test_synonymous_restatement_not_conflict(self):
+        """同义复述（不同措辞同一结论）不判矛盾。"""
+        j = judge_contradiction("应开启方案A", "应该开启方案A")
+        assert j["kind"] is ConflictKind.NOT_A_CONFLICT
+        assert j["metadata_excluded"] is True
+        assert j["reason"] == "synonym_restatement"
+
+    def test_synonym_degree_adverb_not_conflict(self):
+        """程度副词差异（很可爱 vs 可爱）不判矛盾。"""
+        assert is_contradiction("方案A很可行", "方案A可行") == \
+            ConflictKind.NOT_A_CONFLICT
+
+    def test_source_complementary_not_conflict(self):
+        """来源不同但内容互补（不是对立）不判矛盾（元数据排除③）。"""
+        j = judge_contradiction(
+            "产品支持中文", "产品支持英文",
+            meta_a={"source": "s1"}, meta_b={"source": "s2"})
+        assert j["kind"] is ConflictKind.NOT_A_CONFLICT
+        assert j["metadata_excluded"] is True
+        assert j["reason"] == "source_complementary"
+
+    def test_explicit_exclude_wins(self):
+        """显式排除（meta.exclude=True）优先于一切判定。"""
+        j = judge_contradiction(
+            "应开启A", "应关闭A",
+            meta_a={"exclude": True}, meta_b={})
+        assert j["kind"] is ConflictKind.NOT_A_CONFLICT
+        assert j["metadata_excluded"] is True
+
+    def test_both_retrieved_rebuttal_not_conflict(self):
+        """hRepro && eRepro 只证"双方都被检索到"，不证矛盾——须落三选一。"""
+        j = judge_contradiction("我喜欢蓝色小橘猫", "今天天气不错")
+        assert j["kind"] is ConflictKind.NOT_A_CONFLICT
+        assert j["metadata_excluded"] is False
+
+
+# ===========================================================================
+# 3.7 验证链全链（M3-2：草稿→独立验证→修正 + provenance + 幂等 60s 竞态）
+# ===========================================================================
+
+class TestVerificationChainFullChain:
+    """验证链全链：verify / run_pending / pending_conflicts / provenance。"""
+
+    def _register(self, chain, text="应开启方案A", ref="e1"):
+        return chain.register(entry_ref=ref, register_query=text)
+
+    def test_verify_confirm_when_no_conflict(self):
+        """无冲突参考断言 → CONFIRM（验证通过）。"""
+        chain = _fresh_chain()
+        req = self._register(chain)
+        res = chain.verify(req.idempotency_key,
+                           reference_claims=["应开启方案B"])
+        assert res is not None
+        assert res.verdict == VerdictType.CONFIRM.value
+        assert res.conflict_kind is None
+        assert chain.pending_count() == 0
+
+    def test_verify_conflict_directional(self):
+        """方向矛盾参考断言 → CONFLICT + conflict_kind + 待应用负载。"""
+        chain = _fresh_chain()
+        req = self._register(chain)
+        res = chain.verify(req.idempotency_key,
+                           reference_claims=["应关闭方案A"])
+        assert res.verdict == VerdictType.CONFLICT.value
+        assert res.conflict_kind == ConflictKind.DIRECTIONAL.value
+        pend = chain.pending_conflicts()
+        assert len(pend) == 1
+        assert pend[0]["claim_text"] == "应开启方案A"
+        assert pend[0]["target_text"] == "应关闭方案A"
+        assert pend[0]["conflict_kind"] == ConflictKind.DIRECTIONAL.value
+
+    def test_verify_conflict_negation(self):
+        """否定矛盾参考断言 → CONFLICT + NEGATION。"""
+        chain = _fresh_chain()
+        req = self._register(chain, "存在蓝色小橘猫")
+        res = chain.verify(req.idempotency_key,
+                           reference_claims=["不存在蓝色小橘猫"])
+        assert res.verdict == VerdictType.CONFLICT.value
+        assert res.conflict_kind == ConflictKind.NEGATION.value
+
+    def test_verify_idempotent_same_key(self):
+        """"客户端超时重试"同键不双写：重复 verify 命中原结果对象
+        （60s 竞态用例——验证结果登记幂等的全链版本）。"""
+        chain = _fresh_chain()
+        req = self._register(chain)
+        first = chain.verify(req.idempotency_key,
+                             reference_claims=["应关闭方案A"])
+        second = chain.verify(req.idempotency_key,
+                              reference_claims=["应关闭方案A"])
+        assert first is second
+        # 同键同验证只一条结果记录（pending_conflicts 仍 1 条——写侧应用
+        # 是独立步骤，幂等不重复产生结果也不清空待应用清单）
+        assert len(chain.pending_conflicts()) == 1
+        events = chain.events()
+        replays = [ev for ev in events
+                   if ev.get("replayed") is True]
+        assert len(replays) >= 1, "重试必须命中幂等（replayed 事件）"
+
+    def test_verify_unknown_key_none(self):
+        """未登记键验证 → None（拒绝"空降"验证）。"""
+        chain = _fresh_chain()
+        assert chain.verify("verif_unknown",
+                            reference_claims=["x"]) is None
+
+    def test_verify_no_reference_pending(self):
+        """无独立证据 → 无裁决 NONE（待验证不臆断 confirm）。"""
+        chain = _fresh_chain()
+        req = self._register(chain)
+        res = chain.verify(req.idempotency_key)
+        assert res is not None
+        assert res.verdict == VerdictType.NONE.value
+        assert chain.pending_count() == 0
+
+    def test_verify_default_off_zero_participation(self):
+        """验证链默认关（写侧默认保守）：verify/run_pending 零参与。"""
+        chain = VerificationChain()  # 默认关
+        assert chain.verify("verif_x",
+                            reference_claims=["应关闭方案A"]) is None
+        assert chain.run_pending() == []
+        assert chain.pending_conflicts() == []
+
+    def test_verify_anti_fraud_dimensions_kept(self):
+        """全链保持防伪独立四维：验证批次/通道 ≠ 登记批次/通道。"""
+        chain = _fresh_chain()
+        req = self._register(chain)
+        chain.verify(req.idempotency_key,
+                     reference_claims=["应关闭方案A"])
+        queries = [p for p in chain.provenance()
+                   if p["kind"] == "VERIFY-QUERY"]
+        assert queries
+        q = queries[-1]
+        assert q["verify_batch"] != q["register_batch"]
+        assert q["verify_channel"] != q["register_channel"]
+        assert q["verify_channel"].startswith("verify.")
+        assert q["verify_query"] != q["register_query"]
+
+    def test_verify_provenance_full_trail(self):
+        """VERIFY-* provenance 全程：REGISTER → QUERY → JUDGE → RESULT。"""
+        chain = _fresh_chain()
+        req = self._register(chain)
+        chain.verify(req.idempotency_key,
+                     reference_claims=["应关闭方案A"])
+        kinds = [p["kind"] for p in chain.provenance()]
+        assert "VERIFY-REGISTER" in kinds
+        assert "VERIFY-QUERY" in kinds
+        assert "VERIFY-JUDGE" in kinds
+        assert "VERIFY-RESULT" in kinds
+        # JUDGE 记录判定详情（judged_kind/reason）
+        judge_ev = [p for p in chain.provenance()
+                    if p["kind"] == "VERIFY-JUDGE"][-1]
+        assert judge_ev["judged_kind"] == ConflictKind.DIRECTIONAL.value
+        assert judge_ev["reason"] == "directional"
+
+    def test_run_pending_drives_full_chain(self):
+        """run_pending 驱动全链：有证据 → 判定；无证据 → NONE；重跑幂等。"""
+        chain = _fresh_chain()
+        req1 = self._register(chain, "应开启方案A", ref="e1")
+        req2 = self._register(chain, "今天天气不错", ref="e2")
+
+        def evidence(r):
+            return {"应开启方案A": ["应关闭方案A"],
+                    "今天天气不错": []}.get(r.register_query, [])
+
+        out = chain.run_pending(evidence)
+        by_key = {r.idempotency_key: r for r in out}
+        assert by_key[req1.idempotency_key].verdict == \
+            VerdictType.CONFLICT.value
+        assert by_key[req2.idempotency_key].verdict == \
+            VerdictType.NONE.value  # 无证据 → 待验证
+        assert chain.run_pending(evidence) == [], "重跑不产生新结果（幂等）"
+
+    def test_mark_conflict_applied_idempotent(self):
+        """写侧应用记账幂等：同键只记一次 VERIFY-CONFLICT-APPLIED。"""
+        chain = _fresh_chain()
+        req = self._register(chain)
+        chain.verify(req.idempotency_key,
+                     reference_claims=["应关闭方案A"])
+        assert len(chain.pending_conflicts()) == 1
+        assert chain.mark_conflict_applied(req.idempotency_key) is True
+        assert chain.pending_conflicts() == []
+        assert chain.mark_conflict_applied(req.idempotency_key) is True
+        kinds = [p["kind"] for p in chain.provenance()]
+        assert kinds.count("VERIFY-CONFLICT-APPLIED") == 1
+
+    def test_snapshot_includes_m32_metrics(self):
+        """观测块含 provenance / 待应用冲突计数。"""
+        chain = _fresh_chain()
+        snap = chain.snapshot()
+        assert snap["provenance_n"] == 0
+        assert snap["conflicts_pending"] == 0
+        req = self._register(chain)
+        chain.verify(req.idempotency_key,
+                     reference_claims=["应关闭方案A"])
+        snap = chain.snapshot()
+        assert snap["provenance_n"] >= 4
+        assert snap["conflicts_pending"] == 1
+
+
+# ===========================================================================
+# 3.8 验证链写侧（M3-2：CONFLICT 结果 → [doubt] conflict → labile）
+# ===========================================================================
+
+class TestVerificationWriteSide:
+    """验证链全链写侧：结果写 [doubt] conflict → 目标条目 labile（写侧）。"""
+
+    def _make_loop(self, tmp_path):
+        from runtime.config import default_config
+        from runtime.loop import LivingMemoryLoop
+        cfg = default_config()
+        cfg.update(num_nodes=32, input_dim=16, num_infer_steps=5,
+                   embedder=TestLoopIntegrationM3._MockEmbedder(16),
+                   auto_snapshot=False, snapshot_dir=str(tmp_path / "s"),
+                   archive_enabled=False)
+        return LivingMemoryLoop(cfg)
+
+    def test_loop_conflict_result_marks_labile(self, tmp_path, monkeypatch):
+        """CONFLICT 验证结果写侧应用：目标旧记忆 labile + rebuttal_count+1
+        （与人工 [doubt] conflict 同一条证伪路径——写侧时相）。"""
+        monkeypatch.setenv("LMS_VERIFICATION_CHAIN_ENABLED", "1")
+        loop = self._make_loop(tmp_path)
+        loop.process_turn("用户: 蓝色小橘猫很可爱")  # 旧记忆
+        entry = list(loop.memory.iter_episodic())[-1]
+        # 新断言与旧记忆否定冲突 → verify 判 CONFLICT(NEGATION)
+        req = loop.verification_chain.register(
+            entry_ref="e-new", register_query="蓝色小橘猫不可爱")
+        res = loop.verification_chain.verify(
+            req.idempotency_key, reference_claims=["蓝色小橘猫很可爱"])
+        assert res.verdict == VerdictType.CONFLICT.value
+        assert res.conflict_kind == ConflictKind.NEGATION.value
+        assert len(loop.verification_chain.pending_conflicts()) == 1
+        # 写侧应用：[doubt] conflict → 目标条目 labile（mark_labile 写侧）
+        loop._apply_verification_conflicts()
+        assert entry.labile is True
+        assert entry.rebuttal_count == 1
+        assert loop.verification_chain.pending_conflicts() == []
+        assert getattr(entry, "doubt_state", "stable") == "stable"
+
+    def test_loop_process_turn_applies_conflicts(self, tmp_path, monkeypatch):
+        """process_turn 自动应用：CONFLICT 结果 → [doubt] conflict → labile。"""
+        monkeypatch.setenv("LMS_VERIFICATION_CHAIN_ENABLED", "1")
+        loop = self._make_loop(tmp_path)
+        loop.process_turn("用户: 蓝色小橘猫很可爱")
+        entry = list(loop.memory.iter_episodic())[-1]
+        req = loop.verification_chain.register(
+            entry_ref="e-new", register_query="蓝色小橘猫不可爱")
+        loop.verification_chain.verify(
+            req.idempotency_key, reference_claims=["蓝色小橘猫很可爱"])
+        assert loop.verification_chain.pending_conflicts(), "待应用"
+        loop.process_turn("用户: 无关内容")
+        assert entry.labile is True
+        assert loop.verification_chain.pending_conflicts() == []
+
+    def test_loop_write_side_default_off(self, tmp_path):
+        """开关默认关：写侧应用零参与（无异常、无 pending）。"""
+        loop = self._make_loop(tmp_path)
+        assert loop.verification_chain.enabled is False
+        loop.process_turn("用户: 蓝色小橘猫很可爱")
+        loop._apply_verification_conflicts()
+        assert loop.verification_chain.pending_conflicts() == []
+        for e in loop.memory.iter_episodic():
+            assert e.labile is False
+
+    def test_loop_verify_confirm_no_labile(self, tmp_path, monkeypatch):
+        """CONFIRM 验证结果不触发证伪（目标条目保持 stable 非 labile）。"""
+        monkeypatch.setenv("LMS_VERIFICATION_CHAIN_ENABLED", "1")
+        loop = self._make_loop(tmp_path)
+        loop.process_turn("用户: 蓝色小橘猫很可爱")
+        entry = list(loop.memory.iter_episodic())[-1]
+        req = loop.verification_chain.register(
+            entry_ref="e-new", register_query="蓝色小橘猫很可爱")
+        res = loop.verification_chain.verify(
+            req.idempotency_key, reference_claims=["蓝色小橘猫很可爱"])
+        assert res.verdict == VerdictType.CONFIRM.value
+        loop._apply_verification_conflicts()
+        assert entry.labile is False
+        assert entry.rebuttal_count == 0
 
 
 # ===========================================================================
