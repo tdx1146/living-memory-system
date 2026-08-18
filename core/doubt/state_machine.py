@@ -51,6 +51,7 @@ import os
 import time
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
+from core.doubt.purpose_drift import PurposeDriftPhase
 from core.doubt.rebuttal_field import (
     get_rebuttal_consistency,
     update_consistency,
@@ -132,6 +133,20 @@ def _labile_ttl() -> float:
         return _DEFAULT_LABILE_TTL
 
 
+def _neutral_purpose_gate() -> dict:
+    """目的检查双保险 fail-open 的中性闸门（不判是/否，闸门不亮）。"""
+    from core.doubt.purpose_drift import _DEFAULT_PURPOSE_TEXT
+    return {
+        "purpose_drift": False,
+        "verdict": "uncertain",
+        "answers": {q: {"ok": None, "state": "uncertain",
+                        "reason": "目的检查委托失败（fail-open）——闸门中性"}
+                    for q in ("Q1", "Q2", "Q3", "Q4", "Q5")},
+        "reasons": ["目的检查委托失败（fail-open）——闸门中性，未判"],
+        "purpose": _DEFAULT_PURPOSE_TEXT,
+    }
+
+
 # ---------------------------------------------------------------------- #
 #  纯函数：注入时判定
 # ---------------------------------------------------------------------- #
@@ -204,7 +219,8 @@ class DoubtStateMachine:
     def __init__(self, enabled: Optional[bool] = None,
                  verification_chain: Optional[VerificationChain] = None,
                  labile_ttl: Optional[float] = None,
-                 surprise_factor: Optional[float] = None) -> None:
+                 surprise_factor: Optional[float] = None,
+                 purpose_drift: Optional[PurposeDriftPhase] = None) -> None:
         # 治理开关：显式参数 > 环境变量（默认 1=开；0 → 零参与）
         self.enabled = doubt_injection_enabled(enabled)
         self.verification_chain = verification_chain
@@ -212,6 +228,10 @@ class DoubtStateMachine:
         self.surprise_factor = (
             _surprise_factor() if surprise_factor is None
             else max(0.0, float(surprise_factor)))
+        # 目的检查时相（总任务书 §二.5：每轮 [doubt] purpose-drift 判定）。
+        # None → 内部懒建（首次 purpose_drift_check / snapshot 时创建）；
+        # 显式传入可注入共享实例或带自定义开关/目的源的实例。
+        self.purpose_drift_phase = purpose_drift
         # labile 窗口（内存态，不落库）：id(entry) -> {entry, entered_at, score}
         self._labile_window: Dict[int, Dict[str, Any]] = {}
         # 观测计数
@@ -219,6 +239,39 @@ class DoubtStateMachine:
         self.injection_suspect_marked: int = 0
         self.consolidation_outcomes: Dict[str, int] = {}
         self._last_consolidation: Optional[dict] = None
+
+    # ================================================================== #
+    #  目的检查时相（总任务书 §二.5：每轮 [doubt] purpose-drift 判定）
+    # ================================================================== #
+
+    def _ensure_purpose_drift(self) -> PurposeDriftPhase:
+        """内部懒建（None → 首次使用时创建；显式注入实例原样返回）。"""
+        if self.purpose_drift_phase is None:
+            self.purpose_drift_phase = PurposeDriftPhase()
+        return self.purpose_drift_phase
+
+    def purpose_drift_check(self, round_signals: dict,
+                            purpose_text: str = "") -> dict:
+        """每轮目的检查：委托 ``PurposeDriftPhase.judge``，返回闸门信号。
+
+        闸门信号（Pan 警示：**无任何可被优化的分数**，只有是否偏离+理由）：
+          ``{purpose_drift, verdict, answers{Q1..Q5}, reasons, purpose}``
+        ——verdict 为 "drifted"/"uncertain" 时闸门亮（purpose_drift=True）；
+        "uncertain"= 未判不是通过，reasons 说明缺什么信号，调用方据此补判。
+
+        ``round_signals`` 键表与五问映射规则见 ``purpose_drift.py`` 模块
+        docstring（Q1 流动 / Q2 过程 / Q3 活体 / Q4 熵核 / Q5 可回放——
+        避免跑偏方案 §2.1 判据表）。
+
+        fail-open：judge 自身已静默降级；此处再兜一层，异常绝不阻断调用方。
+        """
+        try:
+            return self._ensure_purpose_drift().judge(
+                round_signals, purpose_text)
+        except Exception:  # pylint: disable=broad-except
+            # 双保险 fail-open：目的检查异常 → 中性闸门（不阻断）
+            logger.error("目的检查委托失败（fail-open）", exc_info=True)
+            return _neutral_purpose_gate()
 
     # ================================================================== #
     #  检索时相（只读投影——绝不 setattr 条目）
@@ -506,6 +559,7 @@ class DoubtStateMachine:
             "verification_chain": (
                 self.verification_chain.snapshot()
                 if self.verification_chain is not None else {"enabled": False}),
+            "purpose_drift": self._ensure_purpose_drift().snapshot(),
             "params": {
                 "surprise_factor": self.surprise_factor,
                 "labile_window_ttl": self._labile_ttl,

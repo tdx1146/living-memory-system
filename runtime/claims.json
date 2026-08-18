@@ -22,6 +22,10 @@
     "readonly_four_invariants_hold_after_m5": {
       "statement": "M5 重组后只读四不变仍成立：一次 recall（/recall 与 /react 检索段）执行前后 turn/episodic 条目集/J/σ 零增量；四不变守卫强制开启",
       "verified_by": "tests/test_loop_m5.py::TestReadonlyFourInvariantsAfterM5"
+    },
+    "purpose_drift_gate_in_doubt_check": {
+      "statement": "目的时相（总任务书 §二.5）并入 9 步生命周期 doubt_check 步（不加步——9 步固化红线不变）：每轮 purpose_drift_check 消费本轮活动信号 → 闸门信号「是否偏离+理由」（Pan 警示：无符合度分数）；verdict=drifted 时登记 [doubt] purpose-drift（gap A 类登记，可审计）；uncertain=未判（只进观测待补判，不登记）；开关关/异常 → 中性/None 零参与（fail-open）",
+      "verified_by": "tests/test_purpose_drift.py + tests/test_loop_m5.py::TestNineStepLifecycle"
     }
   }
 }

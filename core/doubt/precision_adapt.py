@@ -43,6 +43,31 @@ LMS_J_TARGET_NORM）。状态为纯进程内存（同 gap_registry 先例，重�
 即失，快照不落盘——回滚干净）。
 
 fail-open：本模块所有方法异常静默（不阻塞调用方主路径）。
+
+ABC §S3「B 落地（precision 学习化）」新增（四妹-ABC操作规划-20260817.md
+§S3）：`PrecisionLearnState` —— **π = 1/Var(surprise) 滑动窗口估计**
+（EMA 低通），与 baseline（`PrecisionAdaptState`，全局怀疑强度）**并行**、
+独立治理开关（LMS_PRECISION_LEARN，默认 0=关；关 → 零参与，行为与开关
+引入前完全一致）。理论依据：Ofner 2021「precision 加权 = natural
+gradient」；PredProp 2021 直接实现先例。loop learn 侧 `lr_multiplier`
+跟随 π 的接线由管理者统一处理（预留接口点：loop.py:631 `attractor.learn`
+的 effective_lr 乘 `lr_multiplier()`），本模块只提供估计器，不改快照字段
+名/语义（P1-4 影响面兼容性要求）。
+
+π̄ 估计（数学定义，详见 PrecisionLearnState docstring）:
+    var_raw(t)  = (1/N)·Σ_{i∈尾窗} (s_i − mean(尾窗))²   # 尾窗样本方差
+    var_ema(t)  = (1−α)·var_ema(t−1) + α·var_raw(t)      # EMA 低通（α=LMS_PRECISION_VAR_EMA）
+    π̄(t)       = clamp(1/var_ema(t), MIN, MAX)
+                  （var_ema 退化 = 0/非有限（如全等序列）→ MIN 保护——
+                    源规格原文：「var 过小（如全等序列）→ 用 MIN 保护」）
+    lr_multiplier = π̄（effective_lr = prev_lr × π̄；π̄=1 → 不变）
+
+env 参数表（**LMS_PRECISION_* 为唯一权威**；显式构造参数 > env > 默认值）:
+    LMS_PRECISION_LEARN       默认 0（主开关；1/true/yes/on 视为开）
+    LMS_PRECISION_VAR_WINDOW  默认 200（尾窗长度）
+    LMS_PRECISION_VAR_EMA     默认 0.02（方差低通学习率）
+    LMS_PRECISION_VAR_MIN     默认 0.05（π 下钳）
+    LMS_PRECISION_VAR_MAX     默认 5.0 （π 上钳）
 """
 
 from __future__ import annotations
@@ -72,6 +97,41 @@ def precision_adapt_enabled(explicit: Optional[bool] = None) -> bool:
         return bool(explicit)
     raw = os.environ.get('LMS_PRECISION_ADAPT', '1')
     return raw.strip().lower() not in ('0', 'false', 'no', 'off')
+
+
+def precision_learn_enabled(explicit: Optional[bool] = None) -> bool:
+    """治理开关解析：显式参数 > 环境变量 LMS_PRECISION_LEARN（默认 0=关）。
+
+    ABC §S3「B 落地（precision 学习化）」主开关：默认关（零参与，行为与
+    开关引入前完全一致）；开 → π = 1/Var(surprise) 估计 + lr_multiplier
+    跟随 π。布尔接受同 precision_adapt_enabled 先例（1/true/yes/on 为开）。
+    """
+    if explicit is not None:
+        return bool(explicit)
+    raw = os.environ.get('LMS_PRECISION_LEARN', '0')
+    return raw.strip().lower() not in ('0', 'false', 'no', 'off')
+
+
+def _env_float(name: str, default: float) -> float:
+    """env 浮点参数读取（缺失/非法 → 默认值，fail-open 风格）。"""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw.strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    """env 整数参数读取（缺失/非法 → 默认值；容忍 "200.0" 形态）。"""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(float(raw.strip()))
+    except (TypeError, ValueError):
+        return default
 
 
 # ================================================================== #
@@ -606,3 +666,169 @@ class PrecisionAdaptState:
             }
         except Exception:
             return {'enabled': True}
+
+
+# ================================================================== #
+#  ABC §S3：π = 1/Var(surprise) 估计（precision 学习化，与 baseline 并行）
+# ================================================================== #
+
+class PrecisionLearnState:
+    """π = 1/Var(surprise) 滑动窗口估计（ABC §S3「B 落地（precision 学习化）」）。
+
+    与 PrecisionAdaptState（全局怀疑强度 baseline：管"该不该怀疑"）**并行**
+    的独立估计器：本类管"学习步长该多大"——precision 加权 = natural
+    gradient（Ofner 2021；PredProp 2021 直接实现先例），供 loop learn 侧
+    `lr_multiplier()` 跟随 π。
+
+    数学定义:
+        var_raw(t)  = (1/N)·Σ_{i∈尾窗} (s_i − mean(尾窗))²
+                      # 尾窗（LMS_PRECISION_VAR_WINDOW 默认 200）样本方差；
+                      # 样本 < 2 时方差未定义（EMA 保持，冷启动填充不污染）
+        var_ema(t)  = (1−α)·var_ema(t−1) + α·var_raw(t)
+                      # EMA 低通（α = LMS_PRECISION_VAR_EMA 默认 0.02）
+        π̄(t)       = clamp(1/var_ema(t), MIN, MAX)
+                      # MIN/MAX = LMS_PRECISION_VAR_MIN/MAX（默认 0.05/5.0，
+                      # 防除零/爆值）。退化方差（=0/非有限，如全等序列）→
+                      # MIN 保护——源规格原文：「var 过小（如全等序列）→ 用
+                      # MIN 保护」：1/0 无定义，保守低 precision，防自然梯度
+                      # 步长放大失控；非退化小方差 → 高 π（钳 MAX）。
+
+    lr_multiplier（自然梯度语义，方向）:
+        effective_lr = prev_lr × π̄
+            # π̄ = 1 → 倍率 = 1（行为不变）；π̄ 高（环境稳定/惊讶方差小）→
+            # 倍率 > 1（预测误差可信，步长放大）；π̄ 低（环境剧烈波动）→
+            # 倍率 < 1（步长缩小，防对噪声 PE 过响应）。
+        开关关 / 样本不足（冷启动）→ 原样返回 prev_lr（零参与，行为与
+        现状完全一致）。
+
+    治理开关：LMS_PRECISION_LEARN（默认 0=关；关 → 零参与：observe 可被
+    调用但不记录、estimate 返回 None、lr_multiplier 原样返回、snapshot
+    标记 enabled=False）。env 参数表见模块顶部 docstring（LMS_PRECISION_*
+    为唯一权威）。状态为纯进程内存（同 PrecisionAdaptState 先例：重启即失、
+    快照不落盘、回滚干净）。纯 stdlib（无 torch）。fail-open：所有方法
+    异常静默（不阻塞调用方）。
+    """
+
+    def __init__(self, enabled: Optional[bool] = None,
+                 var_window: Optional[int] = None,
+                 ema: Optional[float] = None,
+                 pi_min: Optional[float] = None,
+                 pi_max: Optional[float] = None,
+                 min_samples: int = 5) -> None:
+        # 治理开关：显式参数 > 环境变量 LMS_PRECISION_LEARN（默认 0=关）
+        self.enabled = precision_learn_enabled(enabled)
+        # 机制参数：显式参数 > env（LMS_PRECISION_VAR_*，唯一权威）> 默认值
+        self.var_window = max(2, int(
+            var_window if var_window is not None
+            else _env_int('LMS_PRECISION_VAR_WINDOW', 200)))
+        self.ema = min(1.0, max(1e-9, float(
+            ema if ema is not None
+            else _env_float('LMS_PRECISION_VAR_EMA', 0.02))))
+        self.pi_min = float(pi_min if pi_min is not None
+                            else _env_float('LMS_PRECISION_VAR_MIN', 0.05))
+        self.pi_max = float(pi_max if pi_max is not None
+                            else _env_float('LMS_PRECISION_VAR_MAX', 5.0))
+        # 参数合法性（fail-safe：非法 env/参数回退默认或保证 min<=max，不抛）
+        if not (self.pi_min > 0.0) or not (self.pi_max > 0.0):
+            self.pi_min, self.pi_max = 0.05, 5.0
+        if self.pi_min > self.pi_max:
+            self.pi_min, self.pi_max = self.pi_max, self.pi_min
+        self.min_samples = max(1, int(min_samples))
+
+        # 状态：尾窗 surprise + EMA 平滑方差（纯进程内存）
+        self._window: Deque[float] = deque(maxlen=self.var_window)
+        self._var_ema: Optional[float] = None
+
+    # ------------------------------------------------------------------ #
+    #  输入接口
+    # ------------------------------------------------------------------ #
+
+    def observe(self, surprise: float) -> None:
+        """每轮惊讶观测（loop 侧每轮喂 activation.surprise）。
+
+        尾窗滑动窗口追加 → 重算尾窗样本方差 → EMA 低通。开关关 → no-op
+        （零参与，不记录）。非数值/非有限输入（NaN/inf）静默丢弃
+        （fail-open：不抛、不污染方差估计）。
+        """
+        if not self.enabled:
+            return
+        try:
+            s = float(surprise)
+        except (TypeError, ValueError):
+            return  # fail-open：非数值输入静默丢弃
+        if not math.isfinite(s):
+            return  # NaN/inf 无信号：丢弃（不污染方差）
+        self._window.append(s)
+        if len(self._window) >= 2:
+            win = list(self._window)
+            mean_s = sum(win) / len(win)
+            var_raw = sum((v - mean_s) ** 2 for v in win) / len(win)
+            if self._var_ema is None:
+                self._var_ema = var_raw
+            else:
+                self._var_ema += self.ema * (var_raw - self._var_ema)
+        # 样本 < 2 时方差未定义：EMA 保持上一状态（冷启动填充期不污染）
+
+    # ------------------------------------------------------------------ #
+    #  估计
+    # ------------------------------------------------------------------ #
+
+    def estimate(self) -> Optional[float]:
+        """当前 π̄ = 1/Var(surprise) 估计（钳制后）；开关关或样本不足 → None。"""
+        if not self.enabled:
+            return None
+        try:
+            if len(self._window) < self.min_samples or self._var_ema is None:
+                return None  # 冷启动保护：样本不足不给估计
+            return self._pi_from_var(self._var_ema)
+        except Exception:
+            return None  # fail-open
+
+    def _pi_from_var(self, var: float) -> float:
+        """π = 1/var 钳制；退化方差（=0/非有限，如全等序列）→ MIN 保护。"""
+        if not (var > 0.0):  # var==0 / var<0 / NaN 一律走 MIN 保护
+            return self.pi_min
+        return max(self.pi_min, min(self.pi_max, 1.0 / var))
+
+    # ------------------------------------------------------------------ #
+    #  学习率倍率（loop learn 侧调用）
+    # ------------------------------------------------------------------ #
+
+    def lr_multiplier(self, prev_lr: float) -> float:
+        """π 加权学习率倍率 = π̄（自然梯度：effective_lr = prev_lr × π̄）。
+
+        开关关 / 样本不足（冷启动）/ 异常 → 原样返回 prev_lr（零参与，
+        行为与现状完全一致）。方向：π̄ 高（惊讶方差小，环境稳定）→ 倍率
+        > 1；π̄ 低（惊讶剧烈波动）→ 倍率 < 1（见类 docstring）。
+        """
+        try:
+            pi = self.estimate()
+            if pi is None:
+                return prev_lr
+            return prev_lr * pi
+        except Exception:
+            return prev_lr  # fail-open
+
+    # ------------------------------------------------------------------ #
+    #  观测
+    # ------------------------------------------------------------------ #
+
+    def snapshot(self) -> dict:
+        """观测块：{enabled, var_window, ema, pi_estimate, variance, samples}。
+
+        pi_estimate / variance 冷启动或开关关时为 None；开关关时 samples = 0
+        （零参与，未记录任何观测）。
+        """
+        try:
+            return {
+                'enabled': self.enabled,
+                'var_window': self.var_window,
+                'ema': self.ema,
+                'pi_estimate': self.estimate(),
+                'variance': self._var_ema,
+                'samples': len(self._window),
+            }
+        except Exception:
+            return {'enabled': self.enabled, 'var_window': self.var_window,
+                    'ema': self.ema, 'pi_estimate': None, 'variance': None,
+                    'samples': 0}
