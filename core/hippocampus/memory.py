@@ -632,6 +632,13 @@ class MemoryManager:
                     and _DOUBT_EVENT_RE.match(
                         getattr(entry, 'text', '') or '')):
                 continue
+            # M6（规格 v2 §2.4 supersedes 流程，与 M3 状态机衔接）：原条目
+            # 已标持久态 superseded（梦期 resolve_labile supersedes 分支产物）
+            # → 不进 external 检索面（被证伪的事实不再作为权威召回；条目
+            # 保留不抹除——更新而非抹除，Schiller 2010 B2）。
+            if (source_filter == 'external'
+                    and getattr(entry, 'doubt_state', 'stable') == 'superseded'):
+                continue
             v = entry.semantic_vector.detach().cpu().float()
             if v.dim() > 1:
                 v = v.squeeze()  # 防御性处理，统一为 1-D

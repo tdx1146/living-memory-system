@@ -925,6 +925,9 @@ class LivingMemoryLoop:
                     continue
                 doubt_ingest(self, f"[doubt] conflict: {target}")
                 chain.mark_conflict_applied(payload["request_key"])
+            # M6（规格 v2 §4.3）：验证链事件发布（verify_requested/result/
+            # resolved + 计数——落沙必发事件，坑 7 根治；静默降级）
+            self._maybe_publish_verification_events()
         except Exception as e:  # pylint: disable=broad-except
             logger.warning("验证链 conflict 写侧应用失败（fail-open）: %s", e)
 
@@ -1162,6 +1165,49 @@ class LivingMemoryLoop:
             })
         except Exception as e:
             logger.debug("Phase 4 dream_complete 发布跳过（静默降级）: %s", e)
+
+    def _maybe_publish_doubt_consolidation(self, result: dict) -> None:
+        """M6（规格 v2 §2.4/§4.3）钩子：发布 lms.doubt_consolidation。
+
+        梦期巩固时相（resolve_labile confirm/supersedes 两分支）结果事件：
+        复核报告（reviewed/rewritten/kept/downgraded）+ supersedes 记录
+        明细 + 验证链快照——§4.3 落沙必发事件（坑 7 根治：梦期完成/状态
+        更新一律发事件；此前落沙路径不发布事件 → 事件流断流 5 天）。
+        只发数值摘要与少量改写记录；任何异常静默降级，绝不影响做梦结果
+        返回（熔断由 bus_events 内部管理，断流以日志 + 熔断状态告警）。
+        """
+        try:
+            from runtime.bus_events import publish_doubt_consolidation
+            publish_doubt_consolidation({
+                "status": result.get("status") or "dreamed",
+                "mode": result.get("mode") or "mvp",
+                "steps": int(result.get("steps", 0) or 0),
+                "doubt_review": result.get("doubt_review"),
+                "consolidation": result.get("consolidation"),
+            })
+        except Exception as e:
+            logger.debug(
+                "M6 doubt_consolidation 发布跳过（静默降级）: %s", e)
+
+    def _maybe_publish_verification_events(self) -> None:
+        """M6（规格 v2 §4.3）钩子：发布 lms.verification（验证链事件）。
+
+        验证链事件（verify_requested / verify_result / verify_resolved）
+        一律发事件（坑 7 根治）+ 待应用冲突/已登记计数。开关默认关
+        （LMS_VERIFICATION_CHAIN_ENABLED=0）→ 链零参与，本钩子直接返回；
+        任何异常静默降级，绝不影响写侧主流程（熔断由 bus_events 管理）。
+        """
+        try:
+            chain = getattr(self, "verification_chain", None)
+            if chain is None or not chain.enabled:
+                return
+            from runtime.bus_events import publish_verification_events
+            publish_verification_events({
+                "events": chain.events(last_n=10),
+                "snapshot": chain.snapshot(),
+            })
+        except Exception as e:
+            logger.debug("M6 verification 事件发布跳过（静默降级）: %s", e)
 
     def _encode_query_vector(
         self, text: str
@@ -2112,6 +2158,12 @@ class LivingMemoryLoop:
             # 阶段 3：precision 动态化状态传入做梦引擎（doubt_review 的
             # 低置信复核阈值改用 conformal 分位怀疑线；None=开关关，回退 0.3）
             dream_config['precision_adapt'] = self.precision_adapt
+            # M6（规格 v2 §2.4）：三时相怀疑状态机 + 验证链注入做梦引擎
+            # ——梦期巩固时相（_consolidation_phase）对 labile/suspect 条目
+            # 走 consolidation_resolve（confirm/supersedes 两分支，写侧唯一
+            # 转移入口）。缺省 None=独立使用，回退纯函数 resolve_labile。
+            dream_config['doubt_state'] = self.doubt_state
+            dream_config['verification_chain'] = self.verification_chain
             self.dream_engine = DreamEngine(
                 attractor=self.attractor,
                 purpose=self.purpose,
@@ -2174,5 +2226,11 @@ class LivingMemoryLoop:
 
         # ★ Phase 4 钩子：做梦完成反哺总线（外围、静默降级，绝不影响主循环）
         self._maybe_publish_dream_complete(result, _dream_duration)
+
+        # ★ M6（规格 v2 §2.4/§4.3）钩子：梦期巩固时相结果发布
+        # （lms.doubt_consolidation——confirm/supersedes 结果 + supersedes
+        # 记录 + 验证链快照；落沙必发事件，坑 7 根治。静默降级，绝不影响
+        # 做梦结果返回）
+        self._maybe_publish_doubt_consolidation(result)
 
         return result

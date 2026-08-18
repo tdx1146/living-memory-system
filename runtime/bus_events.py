@@ -45,6 +45,8 @@ __all__ = [
     "get_publisher",
     "publish_plastified",
     "publish_dream_complete",
+    "publish_doubt_consolidation",
+    "publish_verification_events",
     "publish_self_ref",
     "reset_publisher_for_test",
     "get_publisher_status",
@@ -391,6 +393,37 @@ class BusEventPublisher:
             detail="LMS 做梦完成通知（可观测性信号，软参考）",
         )
 
+    # -- lms.doubt_consolidation（梦期巩固结果；M6 §2.4/§4.3）------------
+    def publish_doubt_consolidation(self, stats: dict) -> bool:
+        """发布 lms.doubt_consolidation：梦期 resolve_labile confirm/
+        supersedes 两分支结果（复核报告 + supersedes 记录 + 验证链快照）。
+
+        M6（规格 v2 §2.4/§4.3）：落沙必发事件——梦期完成/状态更新一律发
+        事件（坑 7 根治：事件流断流 5 天、契约假红被当误报）。只发数值
+        摘要与少量改写记录；绝不影响做梦主循环。
+        """
+        safe = _sanitize(stats)
+        return self.publish(
+            "lms.doubt_consolidation",
+            payload=safe,
+            detail="LMS 梦期巩固（resolve_labile confirm/supersedes）结果事件",
+        )
+
+    # -- lms.verification（验证链事件摘要；M6 §4.3）-----------------------
+    def publish_verification_events(self, payload: dict) -> bool:
+        """发布 lms.verification：验证链事件摘要（verify_requested /
+        verify_result / verify_resolved + 待应用冲突/已登记计数）。
+
+        M6（规格 v2 §4.3）：验证链事件一律发事件（坑 7 根治）。只发
+        数值摘要；绝不影响验证链本体。
+        """
+        safe = _sanitize(payload)
+        return self.publish(
+            "lms.verification",
+            payload=safe,
+            detail="LMS 验证链事件摘要（软参考信号）",
+        )
+
     # -- lms.self_ref（自我认知透视，最敏感，默认关闭 + 限频）-------------
     def publish_self_ref(self, summary: str, guard: Optional[dict] = None) -> bool:
         """发布 lms.self_ref：蒸馏后文本摘要（≤200 字）+ 护栏状态。
@@ -482,6 +515,46 @@ def publish_dream_complete(stats: dict) -> bool:
         return get_publisher().publish_dream_complete(stats)
     except Exception as e:
         logger.warning("[bus_events] publish_dream_complete 静默降级: %s", e)
+        return False
+
+
+def publish_doubt_consolidation(stats: dict) -> bool:
+    """模块级便捷函数：发布 lms.doubt_consolidation（永不抛异常）。
+
+    M6（规格 v2 §2.4/§4.3）：梦期巩固时相结果事件——resolve_labile
+    confirm/supersedes 两分支的 outcome 计数 + supersedes 记录明细 +
+    验证链快照。落沙必发事件（坑 7 根治：梦期完成/状态更新一律发事件）；
+    只发数值摘要与少量改写记录（_sanitize 裁剪），绝不影响做梦主循环。
+    """
+    try:
+        return get_publisher().publish(
+            "lms.doubt_consolidation",
+            payload=_sanitize(stats or {}),
+            detail="LMS 梦期巩固（resolve_labile confirm/supersedes）结果事件",
+        )
+    except Exception as e:
+        logger.warning(
+            "[bus_events] publish_doubt_consolidation 静默降级: %s", e)
+        return False
+
+
+def publish_verification_events(payload: dict) -> bool:
+    """模块级便捷函数：发布 lms.verification（永不抛异常）。
+
+    M6（规格 v2 §4.3）：验证链事件摘要——verify_requested / verify_result
+    / verify_resolved 事件 + 待应用冲突/已登记计数（验证链事件一律发事件，
+    坑 7 根治）。开关默认关（LMS_VERIFICATION_CHAIN_ENABLED=0）时链零参与，
+    本函数也只在链开启时由 loop 调用。
+    """
+    try:
+        return get_publisher().publish(
+            "lms.verification",
+            payload=_sanitize(payload or {}),
+            detail="LMS 验证链事件摘要（软参考信号）",
+        )
+    except Exception as e:
+        logger.warning(
+            "[bus_events] publish_verification_events 静默降级: %s", e)
         return False
 
 
@@ -607,6 +680,34 @@ def quick_test():
         dc = [r for r in recs if r["event_type"] == "lms.dream_complete"]
         assert len(dc) == 1 and dc[0]["payload"]["steps"] == 20
         print("✅ lms.dream_complete 发布成功")
+
+        # ── 6. M6：doubt_consolidation + verification 事件 ──
+        ok7 = pub5.publish_doubt_consolidation({
+            "status": "dreamed", "mode": "mvp", "steps": 20,
+            "doubt_review": {"reviewed": 3, "rewritten": 1,
+                             "kept": 2, "downgraded": 0},
+            "consolidation": {
+                "supersedes": [{"original": "旧记忆…",
+                                "violated_by": "矛盾证据",
+                                "conf_before": 0.9, "conf_after": 0.1}],
+                "verification": {"enabled": False},
+            },
+        })
+        assert ok7
+        ok8 = pub5.publish_verification_events({
+            "events": [{"type": "verify_requested", "ts": 1.0},
+                       {"type": "verify_result", "ts": 1.1}],
+            "pending": 0, "resolved": 1,
+        })
+        assert ok8
+        recs = pub5._get_writer().read_all()
+        assert any(r["event_type"] == "lms.doubt_consolidation"
+                   for r in recs), "doubt_consolidation 事件应已发布"
+        assert any(r["event_type"] == "lms.verification"
+                   for r in recs), "verification 事件应已发布"
+        dc2 = [r for r in recs if r["event_type"] == "lms.doubt_consolidation"]
+        assert dc2[0]["payload"]["doubt_review"]["rewritten"] == 1
+        print("✅ lms.doubt_consolidation + lms.verification 发布成功")
 
     print("=" * 50)
     print("✅ bus_events.py 快速自测通过")

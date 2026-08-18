@@ -274,6 +274,18 @@ class DreamEngine:
         # 的低置信复核阈值用 conformal 分位怀疑线（零固定阈值）
         self.precision_adapt = config.get('precision_adapt')
 
+        # M6（核心重建规格 v2 §2.4）：巩固时相状态机 + 验证链注入
+        # （loop.get_dream_engine 传入；缺省 None=独立使用/开关关）——
+        # _consolidation_phase 对 labile/suspect 条目走三时相状态机的
+        # consolidation_resolve（confirm/supersedes 两分支 + 原生字段
+        # updated_by='consolidation' 写侧溯源）；无状态机时回退纯函数
+        # resolve_labile（standalone 兼容既有行为，可回滚）。
+        self.doubt_state = config.get('doubt_state')
+        self.verification_chain = config.get('verification_chain')
+        # M6：本轮梦期巩固时相观测（supersedes 记录明细；dream 结果 +
+        # event 流发布数据源——§4.3 落沙必发事件）
+        self.last_consolidation_supersedes: list = []
+
         # 阶段 4（做梦时怀疑延伸，2026-08-14）：治理开关 DREAM_DOUBT_ENABLED
         # （默认 1=开；0=关 → doubt_review 回退阶段 1 基础行为，可回滚）。
         # 定位（主 AI 修正）：怀疑是本能——本开关控制的是"怀疑本能（precision
@@ -349,6 +361,8 @@ class DreamEngine:
         self.last_doubt_review = {'reviewed': 0, 'downgraded': 0,
                                   'rewritten': 0, 'kept': 0, 'flagged': 0}
         self.last_doubt_review_detail = []
+        # M6：一轮做梦开始重置巩固时相观测（防跨梦膨胀）
+        self.last_consolidation_supersedes = []
 
         # 保存初始 J 矩阵（用于计算 j_change）
         J_initial = self.attractor.J.clone()
@@ -422,6 +436,15 @@ class DreamEngine:
             'doubt_review': dict(self.last_doubt_review),
             # 阶段 4：逐条复核明细（观测；最多最近 5 条，防结果膨胀）
             'doubt_review_detail': self.last_doubt_review_detail[-5:],
+            # M6（§2.4/§4.3）：梦期巩固时相观测（supersedes 记录 +
+            # 验证链快照——event 流发布数据源，落沙必发事件）
+            'consolidation': {
+                'supersedes': self.last_consolidation_supersedes[-5:],
+                'verification': (
+                    self.verification_chain.snapshot()
+                    if self.verification_chain is not None
+                    else {'enabled': False}),
+            },
             # 提取层 v1.4（S1-13）：价值重放观测（S1-9 汇总进 dream_state.json）
             'value_replay': value_replay,
         }
@@ -469,6 +492,8 @@ class DreamEngine:
         self.last_doubt_review = {'reviewed': 0, 'downgraded': 0,
                                   'rewritten': 0, 'kept': 0, 'flagged': 0}
         self.last_doubt_review_detail = []
+        # M6：一轮做梦开始重置巩固时相观测（防跨梦膨胀）
+        self.last_consolidation_supersedes = []
 
         # 提取层 v1.4（S1-13）：价值重放——PER 概率采样 → 加固 → 聚类
         # （fail-open）→ 代表幸存加固（每周期一次，§2.6）
@@ -523,6 +548,15 @@ class DreamEngine:
             'doubt_review': dict(self.last_doubt_review),
             # 阶段 4：逐条复核明细（观测；最多最近 5 条，防结果膨胀）
             'doubt_review_detail': self.last_doubt_review_detail[-5:],
+            # M6（§2.4/§4.3）：梦期巩固时相观测（supersedes 记录 +
+            # 验证链快照——event 流发布数据源，落沙必发事件）
+            'consolidation': {
+                'supersedes': self.last_consolidation_supersedes[-5:],
+                'verification': (
+                    self.verification_chain.snapshot()
+                    if self.verification_chain is not None
+                    else {'enabled': False}),
+            },
             # 提取层 v1.4（S1-13）：价值重放观测（S1-9 汇总进 dream_state.json）
             'value_replay': value_replay,
         }
@@ -1280,9 +1314,14 @@ class DreamEngine:
         翻译，溯源 §4.2 标注——论文支持睡眠做重放/整合/遗忘/去虚假吸引子，
         不支持逐条打分-裁决流程，故裁决逻辑做成纯函数、乘子保守、独立
         可回滚）：
-          ① labile 窗口裁决：改写=新增 source='doubt' supersedes 条目 /
-             无证据 confidence×1.02 重巩固 / 超时 ×0.98 折损
-             （reconsolidation.resolve_labile 纯函数）
+          ① 梦期巩固时相（M6，规格 v2 §2.4）：labile/suspect 条目
+             resolve_labile——confirm/supersedes 两分支，梦期**唯一**批量
+             改写点；有 doubt_state（三时相状态机，loop 注入）→
+             consolidation_resolve（写侧唯一转移入口：superseded/stable +
+             原生字段 updated_by='consolidation'）；无 → 纯函数
+             resolve_labile（standalone 兼容）；改写=新增 source='doubt'
+             supersedes 记录 + 原条目标 superseded（superseded_by 衔接），
+             不抹除原文（Schiller 2010 B2）
           ② 低置信（conformal 分位怀疑线 / 冷启动回退 0.3）复核——阶段 4
              升级：不完全线索再巩固式复核（B3，Sinclair & Barense 2019：
              完全重复反而稳定旧记忆，绝不复述原文——线索=文本前缀截断 +
@@ -1322,21 +1361,18 @@ class DreamEngine:
                 self.last_doubt_review = stats
                 self.last_doubt_review_detail = detail
                 return
-            from core.doubt.reconsolidation import resolve_labile
             from core.doubt.confidence_field import is_low_confidence
 
-            # ① labile 窗口裁决（不变；labile 条目本轮不再进 ②/③，
-            # 避免同一轮双重处理）
-            was_labile = {id(e) for e in entries if getattr(e, 'labile', False)}
-            for e in entries:
-                if getattr(e, 'labile', False):
-                    outcome = resolve_labile(e)
-                    stats[outcome] = stats.get(outcome, 0) + 1
-                    stats['reviewed'] += 1
-                    if outcome == 'rewritten':
-                        # 改写 = 新增 source='doubt' supersedes 条目
-                        # （更新而非抹除，Schiller 2010 B2）
-                        self._add_doubt_supersede(e)
+            # ① 梦期巩固时相（M6，规格 v2 §2.4）：labile/suspect 条目
+            # resolve_labile（confirm/supersedes 两分支——梦期**唯一**批量
+            # 改写点；有 doubt_state 状态机 → consolidation_resolve 写侧
+            # 唯一转移入口）。labile/suspect 条目本轮不再进 ②/③，避免
+            # 同一轮双重处理（was_consolidated 排除）。
+            was_consolidated = {
+                id(e) for e in entries
+                if getattr(e, 'labile', False)
+                or getattr(e, 'doubt_state', 'stable') == 'suspect'}
+            self._consolidation_phase(entries, stats, detail)
 
             if not self.doubt_enabled:
                 # 回退阶段 1 基础行为（DREAM_DOUBT_ENABLED=0 可回滚路径）：
@@ -1365,7 +1401,8 @@ class DreamEngine:
                 stats['flagged'] += len(high_freq)
             else:
                 # 阶段 4 延伸路径（默认）：不完全线索再巩固式复核。
-                # 候选 = 已被怀疑底座标注的条目（labile 已由 ① 处理，排除）。
+                # 候选 = 已被怀疑底座标注的条目（labile/suspect 已由 ①
+                # 巩固时相处理，排除）。
                 low_thr = 0.3
                 pa = self.precision_adapt
                 if pa is not None and not pa.is_cold():
@@ -1375,7 +1412,7 @@ class DreamEngine:
                         pass
                 reviewed_ids: set = set()
                 cands = [e for e in entries
-                         if id(e) not in was_labile
+                         if id(e) not in was_consolidated
                          and (is_low_confidence(e, threshold=low_thr)
                               or int(getattr(e, 'rebuttal_count', 0) or 0) >= 1)]
                 for e in cands[:self.doubt_review_max]:
@@ -1404,6 +1441,127 @@ class DreamEngine:
             logger.warning("doubt_review 复核异常（fail-open）: %s", e)
         self.last_doubt_review = stats
         self.last_doubt_review_detail = detail[-50:]
+
+    def _consolidation_phase(self, entries, stats: dict, detail: list) -> None:
+        """梦期巩固时相（M6，核心重建规格 v2 §2.4）——resolve_labile
+        confirm/supersedes 两分支（梦期**唯一**批量改写点）。
+
+        候选 = labile（写侧去稳定化标记）∪ suspect（注入时高 surprise /
+        rebuttal 命中的持久怀疑态）。每条目裁决（幂等、独立四维由
+        verification_chain 承载；开关默认关 → 回退证伪证据判定）：
+          - 验证链已裁决（注入时登记 + 结果登记，``LMS_VERIFICATION_CHAIN_
+            ENABLED=1`` 时）：CONFLICT → supersedes 分支；CONFIRM →
+            confirm 分支；
+          - 无验证链裁决 → 证伪证据 ``violated_by`` 在场 = 冲突
+            （supersedes 分支）；否则 = 验证通过近似（confirm 分支：
+            窗口内重巩固 ×1.02 / 超时折损 ×0.98——纯函数语义，
+            溯源 §4.2 标注：无 LLM 依赖的工程近似）。
+
+        写侧执行：
+          - 有 ``doubt_state``（三时相状态机，loop.get_dream_engine 注入）
+            → ``consolidation_resolve``（写侧唯一转移入口：superseded/
+            stable + 原生 rebuttal_consistency 以 ``updated_by='consolidation'``
+            更新——§2.3 合法写者铁律）；
+          - 无 → 纯函数 ``resolve_labile``（standalone 兼容既有行为，
+            可回滚）。
+        ``outcome == 'rewritten'`` → ``_add_doubt_supersede``：写
+        source='doubt' supersedes 记录 + 原条目 ``superseded_by`` 衔接
+        （不抹除原文，Schiller 2010 B2 更新而非抹除）。
+
+        全部动作：写侧日志 + 复核报告（stats/detail——§4.3 event 流发布
+        数据源；loop.dream 落 sandglass 事件流）。任何异常只记日志不阻断
+        做梦（fail-open，G 模式以日志可见）。
+        """
+        if not entries:
+            return
+        try:
+            from core.doubt.verification_chain import (
+                VerdictType, verification_key)
+        except Exception:  # pylint: disable=broad-except
+            return
+        for e in entries:
+            if not (getattr(e, 'labile', False)
+                    or getattr(e, 'doubt_state', 'stable') == 'suspect'):
+                continue
+            conf_before = float(getattr(e, 'confidence', 1.0) or 1.0)
+            # 验证链裁决优先（幂等；链开关默认关 → 回退证伪证据判定）
+            verdict = None
+            chain = self.verification_chain
+            if chain is not None and getattr(chain, 'enabled', False):
+                try:
+                    key = verification_key(
+                        str(id(e)), getattr(e, 'text', '') or '', 'injection')
+                    res = chain.lookup(key)
+                    if res is not None and \
+                            res.verdict != VerdictType.NONE.value:
+                        verdict = res.verdict
+                except Exception:  # pylint: disable=broad-except
+                    verdict = None
+            sm = self.doubt_state
+            if sm is not None:
+                # 三时相状态机（M3 衔接）：写侧唯一转移入口——superseded/
+                # stable + 原生字段 updated_by='consolidation'（§2.3）
+                try:
+                    outcome = sm.consolidation_resolve(
+                        e, verdict=verdict).get('outcome', 'kept')
+                except Exception as exc:  # pylint: disable=broad-except
+                    logger.warning(
+                        "梦期 consolidation_resolve 失败（fail-open）: %s",
+                        exc)
+                    outcome = 'kept'
+            else:
+                # standalone（无状态机注入）：纯函数 resolve_labile
+                try:
+                    from core.doubt.reconsolidation import resolve_labile
+                    outcome = resolve_labile(e)
+                except Exception as exc:  # pylint: disable=broad-except
+                    logger.warning(
+                        "梦期 resolve_labile 失败（fail-open）: %s", exc)
+                    outcome = 'kept'
+            stats['reviewed'] = stats.get('reviewed', 0) + 1
+            stats[outcome] = stats.get(outcome, 0) + 1
+            conf_after = float(
+                getattr(e, 'confidence', conf_before) or conf_before)
+            detail.append({
+                'ts': round(time.time(), 1),
+                'category': 'consolidation',
+                'outcome': outcome,
+                'verdict': verdict or (
+                    'conflict' if getattr(e, 'violated_by', None)
+                    else 'confirm'),
+                'alt': False,
+                'conf_before': round(conf_before, 3),
+                'conf_after': round(conf_after, 3),
+            })
+            if outcome == 'rewritten':
+                # 改写 = supersedes 流程（§2.4 ②）：写 supersedes 记录 +
+                # 原条目标 superseded（superseded_by 衔接，不抹除原文）
+                new_entry = self._add_doubt_supersede(e)
+                if new_entry is not None:
+                    self.last_consolidation_supersedes.append({
+                        'ts': round(time.time(), 1),
+                        'original': str(getattr(e, 'text', '') or '')[:60],
+                        'superseded_by': str(
+                            getattr(new_entry, 'text', '') or '')[:80],
+                        'violated_by': str(
+                            getattr(e, 'violated_by', '') or '')[:80],
+                        'conf_before': round(conf_before, 3),
+                        'conf_after': round(conf_after, 3),
+                    })
+                    logger.info(
+                        "梦期巩固: supersedes 记录已写 "
+                        "(turn=%s, conf %.2f→%.2f, violated_by=%s)",
+                        getattr(e, 'turn', '?'), conf_before, conf_after,
+                        str(getattr(e, 'violated_by', '') or '')[:40])
+                else:
+                    logger.warning(
+                        "梦期巩固: supersedes 记录写入失败（fail-open）: %s",
+                        str(getattr(e, 'text', '') or '')[:40])
+            else:
+                logger.info(
+                    "梦期巩固: 条目 %s（conf %.2f→%.2f, verdict=%s）",
+                    outcome, conf_before, conf_after,
+                    detail[-1].get('verdict'))
 
     def _build_incomplete_clue(self, entry, keep_ratio: float = 0.5,
                                max_len: int = 60) -> str:
@@ -1576,26 +1734,49 @@ class DreamEngine:
         except Exception:
             return False
 
-    def _add_doubt_supersede(self, entry) -> None:
-        """改写 = 新增 source='doubt' supersedes 条目（不抹除原文）。
+    def _add_doubt_supersede(self, entry):
+        """改写 = supersedes 流程落库（M6 规格 v2 §2.4 ②；不抹除原文）。
 
-        fail-open：任何异常静默（不阻断做梦）。
+        - 新增 source='doubt' + ``[doubt-supersedes]`` 前缀的记录条目
+          （Schiller 2010 B2 更新而非抹除；检索面排除——既有口径，
+          test_doubt_recall_exclusion）；
+        - 原条目 supersedes 衔接：``superseded_by`` 指向新记录文本 +
+          ``superseded_at`` 时间戳；``doubt_state`` 兜底标 ``superseded``
+          （有状态机路径已由 consolidation_resolve 标记，本处不覆盖）。
+
+        返回:
+            新记录条目（供调用方观测/联动）；失败返回 None（fail-open，
+            不阻断做梦）。
         """
         try:
             vec = getattr(entry, 'semantic_vector', None)
             if vec is None:
-                return
+                return None
             text = getattr(entry, 'text', '') or ''
             violated_by = getattr(entry, 'violated_by', None)
             new_text = (
                 "[doubt-supersedes] 原记忆被证伪: "
                 f"{violated_by or '（无证据记录）'} —— 原: {text[:80]}")
+            before = self.memory.episodic_size()
             self.memory.store_episodic(
-                new_text, vec, surprise=float(getattr(entry, 'surprise', 0.0) or 0.0),
+                new_text, vec,
+                surprise=float(getattr(entry, 'surprise', 0.0) or 0.0),
                 turn=int(getattr(entry, 'turn', 0) or 0),
                 source='doubt')
+            new_entry = None
+            if self.memory.episodic_size() > before:
+                new_entry = list(self.memory.iter_episodic())[-1]
+            # 原条目 supersedes 衔接（状态机已标记则不覆盖）
+            try:
+                if getattr(entry, 'doubt_state', 'stable') != 'superseded':
+                    entry.doubt_state = 'superseded'
+                entry.superseded_by = new_text
+                entry.superseded_at = time.time()
+            except Exception:  # pylint: disable=broad-except
+                pass
+            return new_entry
         except Exception:  # pylint: disable=broad-except
-            pass
+            return None
 
     def _save_snapshot(self) -> Optional[str]:
         """保存做梦后的状态快照。
