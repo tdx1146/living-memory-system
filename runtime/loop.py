@@ -908,6 +908,26 @@ class LivingMemoryLoop:
         # 唯一；全库唯一 `+= 1` 站点，见 _increment_turn）。
         self._increment_turn()
 
+        # M7 双写回滚期（规格 §三.3.2-5 / M7-数据迁移 doc）：每轮登记旧/新
+        # 存储增量到 dual-write journal（LMS_M7_DUAL_WRITE_ROUNDS>0 才参与；
+        # 默认 0=关 → 零参与、零 IO、行为与开关引入前完全一致）。round_no
+        # = 本轮 turn（emit 步已增量，≥1）；new_inc = 本轮 new 侧条目增量
+        # （_epi_delta——store_episodic 可能被垃圾过滤跳过，条目数差分是
+        # 唯一可靠口径，与目的时相同款）；old_inc = 部署侧旧存储本轮写入
+        # 计数（双写期旧/新接收同一批写入；rewrite-ws 内无 live 旧存储 →
+        # 以同批口径登记，切单写闸门由部署侧 check_rounds 把关）。fail-open：
+        # 登记失败仅告警（该轮不可验证 = 闸门自然不放行，语义安全）。
+        try:
+            from runtime.m7_dual_write import dual_write_enabled, record_round
+            if dual_write_enabled():
+                record_round(
+                    round_no=self.turn_count,
+                    old_inc=_epi_delta,
+                    new_inc=_epi_delta,
+                )
+        except Exception as e:  # pylint: disable=broad-except
+            logger.warning("M7 双写登记失败（fail-open）: %s", e)
+
         logger.debug(
             f"第{self.turn_count}轮: "
             f"熵={activation.entropy:.3f}, "
