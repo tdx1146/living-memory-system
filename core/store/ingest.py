@@ -272,7 +272,9 @@ def _build_result(req: WriteRequest, data: Dict[str, Any],
         info_value=float(data.get("info_value", 0.0) or 0.0),
         reason=data.get("reason"),
         replayed=bool(record.replayed) if record else False,
-        # P1-1：过程核心区段（写侧解析结果；dedup_hit 路径同样携带）
+        # P1-1：过程核心区段（写侧解析结果；dedup_hit 路径同样携带——
+        # 解析为确定性产物（process_core/text_snapshot 同文本同结果）；
+        # 演化史 at 时间戳为本次解析值——幂等记录仍 = 纯 writer 结果）
         process_core=req.resolved_process_core,
         text_snapshot=req.resolved_text_snapshot,
         evolution=req.resolved_evolution,

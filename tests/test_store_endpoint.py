@@ -322,3 +322,87 @@ class TestStoreRateLimit:
                 assert "Retry-After" in r3.headers
         finally:
             _restore_globals(*orig)
+
+
+class TestStoreProcessCoreWiring:
+    """P1-1 条目级过程字段接线（api/server.py /store writer 路径 → ingest）：
+
+    验收（目的性审计 §3.2 / P1-1 待集成点接线）：
+      1. /store 响应携带 process_core / text_snapshot / evolution 区段；
+      2. 落库条目携带 process_core 字段（has_process_core=True），演化史以
+         created 为开端（append-only）；
+      3. 幂等去重命中路径同样携带过程字段（WriteResult 原样返回首次结果）。
+    """
+
+    def test_store_response_carries_process_fields(self, client):
+        """响应 + 条目双双携带 P1-1 过程字段（提取过程核心优先）。"""
+        resp = client.post("/store", json={
+            "session_id": "main",
+            "user_input": "这让我很惊讶：方案被推翻了，需要修正，"
+                          "现在认为应该转向新立场。",
+            "llm_output": "确实出乎意料，我们改变了主意。",
+        })
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["stored"] is True
+        # 响应 P1-1 区段
+        pc = data["process_core"]
+        assert isinstance(pc, dict)
+        assert sorted(pc.keys()) == sorted([
+            "surprise_trace", "doubt_events", "turns",
+            "open_tails", "confidence_curve", "surprise_source",
+        ])
+        assert isinstance(data["text_snapshot"], str)
+        assert data["text_snapshot"]
+        assert isinstance(data["evolution"], dict)
+        assert data["evolution"]["updated_by"] == "ingest"
+        states = [t["state"] for t in data["evolution"]["history"]]
+        assert states == ["created"]
+        # 条目级：episodic 尾部条目携带过程字段（M7 旧条目兼容由
+        # process_core 层保证——getattr 兜底）
+        from core.store.process_core import (
+            PROCESS_CORE_FIELDS,
+            get_evolution,
+            get_process_core,
+            has_process_core,
+        )
+        entries = list(_loop_of("main").memory.iter_episodic())
+        assert entries
+        e = entries[-1]
+        assert has_process_core(e) is True
+        entry_pc = get_process_core(e)
+        assert sorted(entry_pc.keys()) == sorted(PROCESS_CORE_FIELDS)
+        # 含惊讶/转向信号 → 提取过程核心优先（§3.2 断言非空段）
+        assert entry_pc["surprise_trace"]
+        assert entry_pc["turns"]
+        ev = get_evolution(e)
+        assert ev["updated_by"] == "ingest"
+        assert ev["history"][0]["state"] == "created"
+
+    def test_store_dedup_hit_carries_process_fields(self, client):
+        """幂等去重命中：dedup_hit=True 且过程字段同构返回（不重复写）。
+
+        process_core/text_snapshot 为确定性解析产物（同文本同结果）；
+        演化史 at 时间戳为本次解析值（幂等记录 = 纯 writer 结果——
+        core.store 既有契约），断言 created 开端与写者即可。
+        """
+        payload = {
+            "session_id": "main",
+            "user_input": "幂等过程字段测试",
+            "llm_output": "我们决定采用方案F。",
+        }
+        r1 = client.post("/store", json=payload)
+        assert r1.status_code == 200
+        d1 = r1.json()
+        assert d1["stored"] is True
+        assert d1["process_core"] is not None
+        r2 = client.post("/store", json=payload)
+        assert r2.status_code == 200
+        d2 = r2.json()
+        assert d2["dedup_hit"] is True
+        assert d2["turn_count"] == d1["turn_count"]
+        # 幂等命中路径同样携带过程字段（确定性产物一致）
+        assert d2["process_core"] == d1["process_core"]
+        assert d2["text_snapshot"] == d1["text_snapshot"]
+        assert d2["evolution"]["updated_by"] == "ingest"
+        assert [t["state"] for t in d2["evolution"]["history"]] == ["created"]
