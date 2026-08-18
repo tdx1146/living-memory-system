@@ -1,7 +1,7 @@
 {
   "module": "core/store",
   "milestone": "M1-1",
-  "rewrite_spec": "四妹-LMS核心重写规格v2-20260817.md §1.5 / §2.2 / §5.2",
+  "rewrite_spec": "四妹-LMS核心重写规格v2-20260817.md §1.5 / §2.2 / §5.2；四妹-更新版目的性审计-20260818.md §三（P1-1：存储主体是过程，结论是派生视图）",
   "claims": {
     "idempotency": {
       "statement": "写侧所有入口（ingest/feed/store）幂等：同键重发不双写，已处理键原样返回原结果",
@@ -38,6 +38,26 @@
     "journal_replay_survives_restart": {
       "statement": "journal 配置时窗口内重启后重放：重启后同键重试不双写（写侧默认保守）",
       "verified_by": "tests/test_store_m1.py::test_journal_replay_after_restart"
+    },
+    "process_core_extraction_priority": {
+      "statement": "/store 提取层'提取过程核心优先'：惊讶来源/怀疑轨迹/转向/悬案/置信度曲线/thought 链接进 process_core，text_snapshot 为派生视图（非本体）",
+      "verified_by": "tests/test_p1_1_process_core.py::TestExtractProcessCorePriority::test_extraction_captures_process_traces"
+    },
+    "old_entry_getattr_compat": {
+      "statement": "M7 旧条目（无 process_core/text_snapshot/evolution）必须仍可读：新字段访问走 getattr 默认值——空结构 + text_snapshot 回退 text，迁移数据读取不崩溃",
+      "verified_by": "tests/test_p1_1_process_core.py::TestOldEntryCompat::test_old_entry_readable_via_getattr_defaults"
+    },
+    "evolution_append_only": {
+      "statement": "evolution.history 为 append-only 状态转移：只追加，绝不覆盖历史（每条记忆演化史可回放可审计）",
+      "verified_by": "tests/test_p1_1_process_core.py::TestEvolutionAppendOnly::test_history_grows_without_overwrite"
+    },
+    "process_core_fail_open": {
+      "statement": "过程核心提取/解析/附加全程 fail-open：异常绝不阻断写侧（空过程核心 + 文本回退兜底）",
+      "verified_by": "tests/test_p1_1_process_core.py::TestFailOpen::test_extraction_failure_never_blocks_write"
+    },
+    "strict_incremental_no_breakage": {
+      "statement": "P1-1 严格增量：不删除/不破坏既有字段（text/confidence/source/gray/doubt_state 等写侧既有语义保持）；幂等记录/响应不被过程字段污染（entry 弹出，不进幂等记录）",
+      "verified_by": "tests/test_p1_1_process_core.py::TestExistingStoreBehaviorRegression::test_existing_store_semantics_untouched"
     }
   }
 }

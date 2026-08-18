@@ -5,13 +5,18 @@
 重写总纲：**核心重建，血管不换**——本包是写侧唯一入口（ingest/feed/store
 语义分离 + 幂等键机制），api 层端点签名与返回结构不变，只换内部实现。
 
-包结构（M1 第一段交付）：
+包结构（M1 第一段交付 + P1-1 过程核心）：
   - ``semantics.py``  写语义定义：feed（知识补存双通道·可召回）/
                       store（普通存储·含 store_gray 灰度口径）——语义唯一权威；
   - ``idempotency.py`` 幂等键机制：查重 → 写 → 登记（写成功才登记）、
                       60s 竞态防护、同键并发串行化、journal 窗口内重启重放；
   - ``ingest.py``      写侧统一入口：ingest()/feed()/store() 分派 +
-                      注入时怀疑钩子（M3 接入点）+ 写侧默认保守。
+                      注入时怀疑钩子（M3 接入点）+ 写侧默认保守 +
+                      P1-1 提取过程核心优先（§3.2）；
+  - ``process_core.py`` P1-1 过程核心提取层：条目新字段
+                      （process_core / text_snapshot / evolution）的提取、
+                      派生、append-only 演化史与 getattr 兜底读取
+                      （规格 `四妹-更新版目的性审计-20260818.md` §三）。
 
 依赖注入设计：本包**不 import 任何 LMS 运行时模块**（纯 stdlib）——
 可被 python 直接 import/运行；落库由 api 层注入的 writer 回调完成
@@ -87,6 +92,44 @@ MODULE_CLAIMS: dict = {
             "verified_by": "tests/test_store_m1.py::"
                            "test_journal_replay_after_restart",
         },
+        # -- P1-1 过程核心（目的性审计 §三：存储主体是过程，结论是派生视图）--
+        "process_core_extraction_priority": {
+            "statement": "/store 提取层'提取过程核心优先'：惊讶来源/怀疑轨迹/"
+                         "转向/悬案/置信度曲线/thought 链接进 process_core，"
+                         "text_snapshot 为派生视图（非本体）",
+            "verified_by": "tests/test_p1_1_process_core.py::"
+                           "TestExtractProcessCorePriority::"
+                           "test_extraction_captures_process_traces",
+        },
+        "old_entry_getattr_compat": {
+            "statement": "M7 旧条目（无 process_core/text_snapshot/evolution）"
+                         "必须仍可读：新字段访问走 getattr 默认值——空结构 + "
+                         "text_snapshot 回退 text，迁移数据读取不崩溃",
+            "verified_by": "tests/test_p1_1_process_core.py::"
+                           "TestOldEntryCompat::"
+                           "test_old_entry_readable_via_getattr_defaults",
+        },
+        "evolution_append_only": {
+            "statement": "evolution.history 为 append-only 状态转移：只追加，"
+                         "绝不覆盖历史（每条记忆演化史可回放可审计）",
+            "verified_by": "tests/test_p1_1_process_core.py::"
+                           "TestEvolutionAppendOnly::"
+                           "test_history_grows_without_overwrite",
+        },
+        "process_core_fail_open": {
+            "statement": "过程核心提取/解析/附加全程 fail-open：异常绝不阻断"
+                         "写侧（空过程核心 + 文本回退兜底）",
+            "verified_by": "tests/test_p1_1_process_core.py::"
+                           "TestFailOpen::test_extraction_failure_never_blocks_write",
+        },
+        "strict_incremental_no_breakage": {
+            "statement": "P1-1 严格增量：不删除/不破坏既有字段（text/confidence/"
+                         "source/gray/doubt_state 等写侧既有语义保持）；幂等记录/"
+                         "响应不被过程字段污染（entry 弹出，不进幂等记录）",
+            "verified_by": "tests/test_p1_1_process_core.py::"
+                           "TestExistingStoreBehaviorRegression::"
+                           "test_existing_store_semantics_untouched",
+        },
     },
 }
 
@@ -106,6 +149,25 @@ from .idempotency import (  # noqa: E402
     fingerprint_key,
     generate_idempotency_key,
     normalize_key,
+)
+from .process_core import (  # noqa: E402
+    DEFAULT_SNAPSHOT_MAX_CHARS,
+    DEFAULT_TRACE_MAX_CHARS,
+    EVOLUTION_WRITERS,
+    PROCESS_CORE_FIELDS,
+    append_transition,
+    attach_entry_fields,
+    build_text_snapshot,
+    empty_process_core,
+    extract_process_core,
+    extract_process_core_for_request,
+    get_evolution,
+    get_process_core,
+    get_text_snapshot,
+    has_process_core,
+    init_evolution,
+    make_transition,
+    record_transition,
 )
 from .ingest import (  # noqa: E402
     DoubtHook,
@@ -134,6 +196,23 @@ __all__ = [
     "fingerprint_key",
     "generate_idempotency_key",
     "normalize_key",
+    "DEFAULT_SNAPSHOT_MAX_CHARS",
+    "DEFAULT_TRACE_MAX_CHARS",
+    "EVOLUTION_WRITERS",
+    "PROCESS_CORE_FIELDS",
+    "append_transition",
+    "attach_entry_fields",
+    "build_text_snapshot",
+    "empty_process_core",
+    "extract_process_core",
+    "extract_process_core_for_request",
+    "get_evolution",
+    "get_process_core",
+    "get_text_snapshot",
+    "has_process_core",
+    "init_evolution",
+    "make_transition",
+    "record_transition",
     "DoubtHook",
     "Writer",
     "WriteRequest",

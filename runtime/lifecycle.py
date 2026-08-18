@@ -102,8 +102,10 @@ TURN_LIFECYCLE_9: Tuple[LifecycleStep, ...] = (
     LifecycleStep(
         idx=6,
         name="doubt_check",
-        spec="验证链判定（§2.3）：矛盾三选一 / 元数据排除 / 幂等——此处只登记，不改条目",
-        anchor="injection_check（注入时怀疑登记 suspect→验证链）+ _apply_verification_conflicts（验证结果 CONFLICT 写侧应用，幂等记账）",
+        spec="验证链判定（§2.3）：矛盾三选一 / 元数据排除 / 幂等——此处只登记，不改条目；"
+             "目的时相（总任务书 §二.5）：每轮 [doubt] purpose-drift 判定并入本步"
+             "（目的五问闸门信号「是否偏离+理由」，drifted 登记 gap——不加步，9 步红线不变）",
+        anchor="injection_check（注入时怀疑登记 suspect→验证链）+ _apply_verification_conflicts（验证结果 CONFLICT 写侧应用，幂等记账）+ purpose_drift_check（目的五问闸门信号，drifted 登记 [doubt] purpose-drift）",
         writes=("entry 怀疑态", "fok_unresolved"),
         reads=("doubt_state", "verification_chain"),
     ),

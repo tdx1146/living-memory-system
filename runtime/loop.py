@@ -98,6 +98,17 @@ MODULE_CLAIMS: dict = {
             "verified_by": "tests/test_loop_m5.py::"
                            "TestReadonlyFourInvariantsAfterM5",
         },
+        "purpose_drift_gate_in_doubt_check": {
+            "statement": "目的时相（总任务书 §二.5）并入 9 步生命周期 "
+                         "doubt_check 步（不加步——9 步固化红线不变）：每轮 "
+                         "purpose_drift_check 消费本轮活动信号 → 闸门信号"
+                         "「是否偏离+理由」（Pan 警示：无符合度分数）；"
+                         "verdict=drifted 时登记 [doubt] purpose-drift（gap "
+                         "A 类登记，可审计）；uncertain=未判（只进观测待补判，"
+                         "不登记）；开关关/异常 → 中性/None 零参与（fail-open）",
+            "verified_by": "tests/test_purpose_drift.py + "
+                           "tests/test_loop_m5.py::TestNineStepLifecycle",
+        },
     },
 }
 
@@ -459,7 +470,9 @@ class LivingMemoryLoop:
         step 5  integrate     结果并入工作记忆（decoder.decode + 自指观测；
                               反流畅性：来源与内容分开评估）
         step 6  doubt_check   验证链判定登记（注入时怀疑 + conflict 应用，
-                              只登记不改条目）
+                              只登记不改条目）+ 目的时相判定（每轮
+                              [doubt] purpose-drift 判定——闸门信号「是否
+                              偏离+理由」，drifted 登记 gap；§二.5）
         step 7  commit        写侧提交（store_episodic——store 提取层统一
                               出口；写侧默认保守）
         step 8  state_update  allostatic J 滑动设定点 + J/σ 更新（learn）+
@@ -486,6 +499,13 @@ class LivingMemoryLoop:
         _j_norm_before = float(torch.norm(self.attractor.J, p='fro').item())
         _sigma_norm_before = float(torch.norm(self.attractor.sigma).item())
         _precision_mean_before = float(self.purpose.get_precision().mean())
+
+        # 目的时相（总任务书 §二.5）：本轮怀疑计数基准——doubt_state 的
+        # injection_checks / injection_suspect_marked 是**累计**计数，
+        # purpose-drift 判定用差分取本轮增量（含本轮 [doubt] 摄入事件），
+        # 与 commit 步条目数基准同款口径（观测 = 本轮增量）。
+        _injection_checks_before = self.doubt_state.injection_checks
+        _suspect_marked_before = self.doubt_state.injection_suspect_marked
 
         # ────────────────────────────────────────────────────────── #
         # M5 step 1/9 ingest —— 写侧入口（输入进入 + 注入时怀疑前置）
@@ -785,18 +805,47 @@ class LivingMemoryLoop:
         # （LMS_VERIFICATION_CHAIN_ENABLED=0）→ 零参与。
         self._apply_verification_conflicts()
 
+        # 目的时相（总任务书 §二.5）：每轮 [doubt] purpose-drift 判定——
+        # 与质疑系统同处 doubt_check 步（9 步生命周期不加步——"目的时相与
+        # 质疑系统融合"）。消费本轮活动信号 → 闸门信号「是否偏离+理由」
+        # （Pan 警示：只输出是否偏离+理由，不输出可优化分数）；verdict=
+        # drifted 时登记 [doubt] purpose-drift（gap A 类登记，可审计）。
+        # 开关关/异常 → None（fail-open，绝不阻断主循环）。
+        _purpose_gate = self._purpose_drift_check(
+            episodic_added=bool(_epi_delta > 0),
+            doubt_events=(self.doubt_state.injection_checks
+                          - _injection_checks_before
+                          + (1 if _doubt_action is not None else 0)),
+            suspect_marked=bool(self.doubt_state.injection_suspect_marked
+                                > _suspect_marked_before),
+        )
+
         # M5 step 6/9 doubt_check 观测（验证链判定：矛盾三选一/元数据排除/
-        # 幂等——只登记，不改条目；应用由写侧时相驱动）。
+        # 幂等——只登记，不改条目；应用由写侧时相驱动。目的时相判定与验证
+        # 链同处本步——观测含 purpose 闸门信号（verdict/是否偏离/理由）。
         try:
             _chain_pending = len(self.verification_chain.pending_conflicts())
         except Exception:
             _chain_pending = 0
+        _purpose_obs: dict = {}
+        if _purpose_gate is not None:
+            # 观测值须为标量（M5 生命周期观测契约：int/float/str/bool/None
+            # ——原因列表 join 为字符串，可回放可审计）。
+            _purpose_obs = {
+                "purpose_verdict": _purpose_gate.get("verdict"),
+                "purpose_drift_gate": bool(
+                    _purpose_gate.get("purpose_drift")),
+                "purpose_reasons": " | ".join(
+                    _purpose_gate.get("reasons", []) or [])[:500],
+                "purpose_text": str(_purpose_gate.get("purpose", "") or ""),
+            }
         self._record_lifecycle(
             "doubt_check",
             chain_enabled=bool(self.verification_chain.enabled),
             chain_pending_conflicts=_chain_pending,
             injection_checks=self.doubt_state.injection_checks,
             injection_suspect_marked=self.doubt_state.injection_suspect_marked,
+            **_purpose_obs,
         )
 
         # 阶段 3：precision 动态校准观测（HGF 波动性 → 全局怀疑基线；
@@ -858,6 +907,26 @@ class LivingMemoryLoop:
         # M5 step 9/9 emit —— turn 计数**唯一增量点**（§1.2：process_turn
         # 唯一；全库唯一 `+= 1` 站点，见 _increment_turn）。
         self._increment_turn()
+
+        # M7 双写回滚期（规格 §三.3.2-5 / M7-数据迁移 doc）：每轮登记旧/新
+        # 存储增量到 dual-write journal（LMS_M7_DUAL_WRITE_ROUNDS>0 才参与；
+        # 默认 0=关 → 零参与、零 IO、行为与开关引入前完全一致）。round_no
+        # = 本轮 turn（emit 步已增量，≥1）；new_inc = 本轮 new 侧条目增量
+        # （_epi_delta——store_episodic 可能被垃圾过滤跳过，条目数差分是
+        # 唯一可靠口径，与目的时相同款）；old_inc = 部署侧旧存储本轮写入
+        # 计数（双写期旧/新接收同一批写入；rewrite-ws 内无 live 旧存储 →
+        # 以同批口径登记，切单写闸门由部署侧 check_rounds 把关）。fail-open：
+        # 登记失败仅告警（该轮不可验证 = 闸门自然不放行，语义安全）。
+        try:
+            from runtime.m7_dual_write import dual_write_enabled, record_round
+            if dual_write_enabled():
+                record_round(
+                    round_no=self.turn_count,
+                    old_inc=_epi_delta,
+                    new_inc=_epi_delta,
+                )
+        except Exception as e:  # pylint: disable=broad-except
+            logger.warning("M7 双写登记失败（fail-open）: %s", e)
 
         logger.debug(
             f"第{self.turn_count}轮: "
@@ -930,6 +999,74 @@ class LivingMemoryLoop:
             self._maybe_publish_verification_events()
         except Exception as e:  # pylint: disable=broad-except
             logger.warning("验证链 conflict 写侧应用失败（fail-open）: %s", e)
+
+    def _purpose_drift_check(
+        self,
+        *,
+        episodic_added: bool,
+        doubt_events: int,
+        suspect_marked: bool,
+    ) -> Optional[dict]:
+        """目的时相（总任务书 §二.5）：每轮 [doubt] purpose-drift 判定。
+
+        消费本轮活动信号（写侧活动/怀疑事件/验证链参与/熵参与决策/生命周期
+        记录）→ 目的五问（Q1-Q5，core/doubt/purpose_drift.py 判据）→ 闸门
+        信号「是否偏离 + 理由」——**只输出是否偏离+理由，不输出任何可被优化
+        的分数**（Pan 警示硬约束；无分数保证由 tests/test_purpose_drift.py
+        递归断言）。
+
+        - verdict == "drifted"（任一问判否）→ 登记 ``[doubt] purpose-drift``
+          （gap_registry A 类登记——可审计；与人工 [doubt] event 同款登记面）；
+        - verdict == "uncertain"（"不确定"=未判，不是通过）→ 闸门亮但**不
+          登记**（只进生命周期观测 + /status purpose 块，暴露待补判信号——
+          防 gap 泛滥）；
+        - 开关关（LMS_PURPOSE_DRIFT_ENABLED=0）→ 中性闸门零参与；任何异常
+          → fail-open 返回 None（G 模式以日志可见，绝不阻断主循环）。
+        """
+        try:
+            chain = getattr(self, "verification_chain", None)
+            chain_active = bool(
+                chain is not None and chain.enabled
+                and (suspect_marked or doubt_events > 0))
+            round_signals = {
+                "episodic_added": bool(episodic_added),
+                "doubt_events": int(doubt_events),
+                "verification_chain_active": chain_active,
+                #: VERIFY-* provenance 等价于验证链本轮活跃（docstring 同源）
+                "provenance": chain_active,
+                "suspect_marked": bool(suspect_marked),
+                # 本轮熵/惊讶真实参与决策：allostatic J 滑动设定点 + 注入时
+                # 怀疑（surprise>factor）+ π 调整 + 元可塑性/在线熵管理——
+                # 不是只作展示（诚实信号，非凑分）。
+                "surprise_in_decisions": True,
+                "lifecycle_trace": bool(self.lifecycle_trace is not None),
+                "reconsolidated": False,
+                "dream_consolidated": False,
+                "conclusion_only": False,
+                "memory_idle": False,
+                "surprise_display_only": False,
+                "not_replayable": False,
+            }
+            gate = self.doubt_state.purpose_drift_check(
+                round_signals,
+                purpose_text=str(self.config.get("purpose_text", "") or ""),
+            )
+            # [doubt] purpose-drift 登记：仅真实偏离（drifted）——uncertain
+            # 是"未判"（记观测待补判），不是偏离（不登记，防 gap 泛滥）。
+            if gate.get("verdict") == "drifted":
+                try:
+                    self.gap_registry.register_fok_unresolved(
+                        topic="purpose-drift: drifted",
+                        detail=" | ".join(
+                            gate.get("reasons", []) or [])[:300],
+                    )
+                except Exception as e:  # pylint: disable=broad-except
+                    logger.warning(
+                        "目的偏离 gap 登记失败（fail-open）: %s", e)
+            return gate
+        except Exception as e:  # pylint: disable=broad-except
+            logger.warning("目的时相判定失败（fail-open）: %s", e)
+            return None
 
     # ================================================================== #
     #  私有辅助方法（由 process_turn / query_llm 拆分而来，保持行为不变）

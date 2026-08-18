@@ -20,6 +20,13 @@ M3-2（同一规格 §2.2 判定细节）：
                          verify/run_pending + VERIFY-* provenance +
                          CONFLICT 结果写 [doubt] conflict → labile）
 
+目的检查时相（总任务书 §二.5，dandan 16:57 指示——目的时相与质疑系统
+融合）：
+  - purpose_drift:  每轮 [doubt] purpose-drift 判定（消费 dsh-goal 目的
+                    + 目的手册五问 Q1-Q5）——输出「是否偏离+理由」闸门
+                    信号，不输出可被优化的分数（Pan 警示）；经
+                    DoubtStateMachine.purpose_drift_check 委托接入
+
 模块（既有）：
   - confidence_field: 置信度场纯函数（更新/重算/强制降权/来源信任）
   - reconsolidation:  惊讶度双角色-角色2（去稳定化，labile 标记）
@@ -198,6 +205,14 @@ from core.doubt.state_machine import (  # noqa: E402
     doubt_injection_enabled,
     is_high_surprise,
 )
+from core.doubt.purpose_drift import (  # noqa: E402
+    PurposeDriftPhase,
+    purpose_drift_enabled,
+)
+from core.doubt.precision_adapt import (  # noqa: E402
+    PrecisionLearnState,
+    precision_learn_enabled,
+)
 
 __all__ = [
     "MODULE_CLAIMS",
@@ -255,4 +270,10 @@ __all__ = [
     "compute_rebuttal_hit",
     "doubt_injection_enabled",
     "is_high_surprise",
+    # purpose_drift（总任务书 §二.5：目的检查时相）
+    "PurposeDriftPhase",
+    "purpose_drift_enabled",
+    # precision_learn（ABC §S3：π = 1/Var 估计 + lr_multiplier 跟随 π）
+    "PrecisionLearnState",
+    "precision_learn_enabled",
 ]

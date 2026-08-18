@@ -388,7 +388,8 @@ class AttractorNetwork:
                  seed: int = 42,
                  temperature: float = 0.05,
                  device: Union[str, torch.device] = "auto",
-                 norm_surprise: Optional[bool] = None) -> None:
+                 norm_surprise: Optional[bool] = None,
+                 ewc: Optional["EwcPenalty"] = None) -> None:
         """初始化吸引子网络。
 
         参数:
@@ -400,6 +401,12 @@ class AttractorNetwork:
                 使正交化学习规则能够发挥作用。设为 0 则退化为纯平均场推断。
             device: 计算设备（E-P2-1）。支持 "auto"/"cpu"/"cuda"/"cuda:0"
                 或 torch.device。所有张量（J、bias、sigma）将创建在该设备上。
+            ewc: EWC 持续学习保护（S4 C 条件触发，默认 None=不启用，向后
+                兼容）。显式传入 core.continual.ewc.EwcPenalty 对象优先；
+                为 None 时按环境变量 LMS_EWC_ENABLE（默认 0=关）决定——
+                开则内部构造（对角 Fisher 于健康窗口 EMA 累积 + 缩放不变
+                二次罚项，挂载 learn()，见 learn() docstring）。关 → 零参与，
+                行为与开关引入前逐字节一致。
         """
         assert input_dim <= num_nodes, (
             f"input_dim({input_dim}) 不能大于 num_nodes({num_nodes})"
@@ -520,6 +527,32 @@ class AttractorNetwork:
                 f"(mean_target={self.precision_recalib_mean}, "
                 f"strength={self.precision_recalib_strength})——"
                 "阶段1 弥散态修复 A 级，env 可回滚")
+
+        # ── S4（2026-08-18）：EWC 持续学习保护（C 条件触发，ABC 操作规划
+        # §S4，默认关）──
+        # 治理开关 LMS_EWC_ENABLE（默认 0=关 → 零参与，行为与现状逐字节
+        # 一致；learn() 的 EWC 块整体跳过）。显式传入 ewc 对象优先（如测试
+        # 注入 enabled=False 的 EwcPenalty 验证零参与）；未传且 env 开 →
+        # 内部构造（对角 Fisher 于健康窗口 EMA 累积 + 缩放不变二次罚项，
+        # 详见 core/continual/ewc.py）。懒 import：本文件顶部依赖保持
+        # 不变（只 torch 与 core.types），避免循环依赖；关路径不 import。
+        # EWC 状态为纯进程内存（同 allostatic 先例：重启即失、快照不落盘、
+        # 回滚干净）。
+        self.ewc: Optional["EwcPenalty"] = None
+        if ewc is not None:
+            self.ewc = ewc
+        elif os.environ.get("LMS_EWC_ENABLE", "0").strip().lower() in (
+                "1", "true", "yes", "on"):
+            from core.continual.ewc import EwcPenalty  # 懒 import（S4）
+            self.ewc = EwcPenalty(shape=self.J.shape, device=self.device)
+            logger.info(
+                "EWC 保护已启用（LMS_EWC_ENABLE=1）: λ=%.4f, "
+                "fisher_window=%d, ema=%.4f",
+                self.ewc.lam, self.ewc.fisher_window, self.ewc.ema)
+        else:
+            logger.debug(
+                "EWC 保护未启用（LMS_EWC_ENABLE=0）：learn() 零参与，"
+                "行为与开关引入前一致")
 
     # ------------------------------------------------------------------ #
     #  推断
@@ -737,6 +770,29 @@ class AttractorNetwork:
             恢复"实例属性。覆盖值仅在本次调用内生效，不修改 self.orth_weight
             / self.complexity_weight。为 None 时使用实例属性（向后兼容）。
 
+        S4（2026-08-18）：EWC 持续学习保护（C 条件触发，ABC 操作规划 §S4，
+        默认关）——**只做加法**，开关关时本块整体跳过，行为与开关引入前
+        逐字节一致。开关开（self.ewc is not None 且 enabled）时：
+
+        1. Fisher 对角累积（健康窗口 EMA）——healthy 由 σ 统计判定
+           （compute_sigma_stats：valid 且非崩塌 act05>col_act 且非饱和
+           frac_gt0_9<sat_frac；col_act/sat_frac 复用 allostatic 语义，
+           allostatic 关时用其默认 5/0.9）。崩塌/过渡态 → healthy=False →
+           不更新 Fisher（关键约束：绝不在坏工作点计算 Fisher）。
+           累积对象 grads = 对称化 ΔJ（= −∂F/∂J；平方后与 ∂F/∂J 同）。
+           首个健康更新定格保护锚点 θ* = 当时的 J。
+        2. EWC 罚项梯度（缩放不变方向罚）并入 ΔJ——**挂载点**：对称化更新
+           J += η·sym(ΔJ) 之前，罚项梯度与 Hebbian/复杂性同乘 η
+           （Kirkpatrick 2017 标准：罚项梯度与数据梯度同学习率）：
+
+               ΔJ ← ΔJ − ∂P/∂J
+               P = λ·ΣFᵢ(θ̂ᵢ − θ̂*ᵢ)²，θ̂ = J/‖J‖_F，θ̂* = J*/‖J*‖_F
+               ∂P/∂J = (2λ/‖J‖)·[F⊙(θ̂−θ̂*) − ⟨F⊙(θ̂−θ̂*), θ̂⟩·θ̂]
+
+           θ̂ 归一（scale-invariant）使罚项对 A 重锚（标量乘 J，只改 ‖J‖
+           不改方向）不变——C 豁免 A 的重锚缩放方向，保护不变成阻碍。
+           ∂P/∂J 径向分量为 0，EWC 力永不沿整体缩放方向施加。
+
         参数:
             activation: 推断得到的激活态。
             sensory_input: 产生该激活态的感官输入。
@@ -785,6 +841,33 @@ class AttractorNetwork:
         #          ∂F_complexity/∂J = +complexity_grad（正号因为复杂性增加自由能）
         #          ΔJ = -(∂F_accuracy + ∂F_complexity) = Hebbian - complexity_grad
         delta_J = hebbian - complexity_grad
+
+        # ── S4（2026-08-18）：EWC 持续学习保护（C 条件触发，只做加法）──
+        # 开关关（self.ewc is None 或 enabled=False）→ 本块整体跳过，零参与，
+        # 行为与开关引入前逐字节一致。开关开时：
+        #   1. Fisher 对角累积（健康窗口 EMA）——healthy 由 σ 统计判定
+        #      （valid 且非崩塌 act05>col_act 且非饱和 frac_gt0_9<sat_frac；
+        #      col_act/sat_frac 复用 allostatic 语义，allostatic 关时用默认
+        #      5/0.9）；崩塌/过渡态 → healthy=False → 不更新 Fisher（绝不在
+        #      坏工作点计算）；grads = 对称化 ΔJ（= −∂F/∂J，平方后同）。
+        #   2. EWC 罚项梯度（缩放不变方向罚）并入 ΔJ：
+        #      ΔJ ← ΔJ − ∂P/∂J，P = λ·ΣFᵢ(θ̂ᵢ−θ̂*ᵢ)²，θ̂ = J/‖J‖_F
+        #      （挂载点：对称化更新 J += η·sym(ΔJ) 之前；罚项梯度与
+        #      Hebbian/复杂性同乘 η，Kirkpatrick 2017 标准）。θ̂ 归一使罚项
+        #      对 A 重锚（标量乘 J，只改 ‖J‖ 不改方向）不变——C 豁免 A 的
+        #      重锚缩放方向。公式与推导见本方法 docstring。
+        ewc = self.ewc
+        if ewc is not None and ewc.enabled:
+            stats = compute_sigma_stats(activation.state)
+            col_act = (self.allostatic.col_act
+                       if self.allostatic is not None else 5)
+            sat_frac = (self.allostatic.sat_frac
+                        if self.allostatic is not None else 0.9)
+            healthy = (stats.valid and stats.act05 > col_act
+                       and stats.frac_gt0_9 < sat_frac)
+            ewc.update(weights=self.J, grads=(delta_J + delta_J.T) / 2,
+                       healthy=healthy)
+            delta_J = delta_J - ewc.gradient(self.J)
 
         # 对称化（非序列模式）
         self.J = self.J + learning_rate * (delta_J + delta_J.T) / 2
