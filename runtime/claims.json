@@ -24,8 +24,12 @@
       "verified_by": "tests/test_loop_m5.py::TestReadonlyFourInvariantsAfterM5"
     },
     "purpose_drift_gate_in_doubt_check": {
-      "statement": "目的时相（总任务书 §二.5）并入 9 步生命周期 doubt_check 步（不加步——9 步固化红线不变）：每轮 purpose_drift_check 消费本轮活动信号 → 闸门信号「是否偏离+理由」（Pan 警示：无符合度分数）；verdict=drifted 时登记 [doubt] purpose-drift（gap A 类登记，可审计）；uncertain=未判（只进观测待补判，不登记）；开关关/异常 → 中性/None 零参与（fail-open）",
+      "statement": "目的时相（总任务书 §二.5）并入 9 步生命周期 doubt_check 步（不加步——9 步固化红线不变）：每轮 purpose_drift_check 消费本轮活动信号 → 闸门信号「是否偏离+理由」（Pan 警示：无符合度分数）；verdict=drifted 时登记 [doubt] purpose-drift（gap A 类登记，可审计）；uncertain=未判（只进观测待补判，不登记）；P2-B 口径修正：只读轮（无写侧活动）Q1 豁免不判 drifted；开关关/异常 → 中性/None 零参与（fail-open）",
       "verified_by": "tests/test_purpose_drift.py + tests/test_loop_m5.py::TestNineStepLifecycle"
+    },
+    "reconsolidation_wired_in_consolidation_phase": {
+      "statement": "R3（C1 接线，语义决策 D-2026-08-18-01 运行时落地）：loop 巩固期（doubt_check 后、state_update 前——9 步固化不加步）调用 reconsolidation_queue.maybe_rewrite（三闸门机器防线 G1 候选在队/G2 巩固期时相/G3 写侧委托 state_machine 巩固时相入口）；入队只允许写侧时相（注入 suspect 标记后 / 去稳定化 labile 登记，写侧入队即落盘）；检索路径零改写保持（只读四不变不破坏——/recall 与 /react 只读口不经过巩固期）",
+      "verified_by": "tests/test_loop_reconsolidation_labile.py"
     }
   }
 }

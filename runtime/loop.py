@@ -105,9 +105,22 @@ MODULE_CLAIMS: dict = {
                          "「是否偏离+理由」（Pan 警示：无符合度分数）；"
                          "verdict=drifted 时登记 [doubt] purpose-drift（gap "
                          "A 类登记，可审计）；uncertain=未判（只进观测待补判，"
-                         "不登记）；开关关/异常 → 中性/None 零参与（fail-open）",
+                         "不登记）；P2-B 口径修正：只读轮（无写侧活动）Q1 "
+                         "豁免不判 drifted；开关关/异常 → 中性/None 零参与"
+                         "（fail-open）",
             "verified_by": "tests/test_purpose_drift.py + "
                            "tests/test_loop_m5.py::TestNineStepLifecycle",
+        },
+        "reconsolidation_wired_in_consolidation_phase": {
+            "statement": "R3（C1 接线，语义决策 D-2026-08-18-01 运行时落地）："
+                         "loop 巩固期（doubt_check 后、state_update 前——9 "
+                         "步固化不加步）调用 reconsolidation_queue.maybe_rewrite"
+                         "（三闸门机器防线 G1 候选在队/G2 巩固期时相/G3 写侧"
+                         "委托 state_machine 巩固时相入口）；入队只允许写侧"
+                         "时相（注入 suspect 标记后 / 去稳定化 labile 登记，"
+                         "写侧入队即落盘）；检索路径零改写保持（只读四不变"
+                         "不破坏——/recall 与 /react 只读口不经过巩固期）",
+            "verified_by": "tests/test_loop_reconsolidation_labile.py",
         },
     },
 }
@@ -317,6 +330,24 @@ class LivingMemoryLoop:
         # 体验层 D：信息缺口登记（怀疑灯数据源，A/B 类进灯、C 类仅诊断）
         from core.doubt.gap_registry import GapRegistry
         self.gap_registry = GapRegistry()
+
+        # R3（C1 接线，语义决策 D-2026-08-18-01 运行时落地）：再巩固候选队列
+        # （跨重启持久化）+ 巩固期受控改写（三闸门：候选在队/巩固期触发/
+        # 改写受控——机器防线）。loop 在 turn 生命周期巩固期（doubt_check
+        # 后、state_update 前）调用 maybe_rewrite；检索路径零改写保持
+        # （队列只读接口绝不 setattr 条目——只读四不变不破坏）。
+        # 测试可注入 reconsolidation_queue 实例或 reconsolidation_queue_path
+        # （隔离路径）；缺省 → env LMS_DOUBT_RECONSOLIDATION_QUEUE_PATH >
+        # 数据目录。开关 LMS_DOUBT_RECONSOLIDATION_ENABLED（默认 1）关 →
+        # 队列全部路径零参与（行为与开关引入前完全一致）。
+        from core.doubt.reconsolidation_queue import ReconsolidationQueue
+        self.reconsolidation_queue = (
+            config.get('reconsolidation_queue')
+            or ReconsolidationQueue(path=config.get('reconsolidation_queue_path')))
+        # 上一轮巩固期再巩固是否真实发生（目的时相 reconsolidated 信号——
+        # 目的检查在 doubt_check 步、再巩固在其后，用上一轮结果保持诚实；
+        # 纯进程内存态，重启即失，同 gap_registry 先例）。
+        self._last_turn_reconsolidated: bool = False
 
         # 阶段 3（precision 三层动态化，质疑自动校准）：全局怀疑强度状态机。
         # 治理开关 LMS_PRECISION_ADAPT（默认 1=开；0=关 → None，全部路径
@@ -774,7 +805,10 @@ class LivingMemoryLoop:
                     # fail-open：怀疑逻辑异常绝不阻断主循环（G 模式以日志
                     # 可见，不以静默吞掉）。
                     entry = list(self.memory.iter_episodic())[-1]
-                    from core.doubt.state_machine import compute_rebuttal_hit
+                    from core.doubt.state_machine import (
+                        DoubtPhase,
+                        compute_rebuttal_hit,
+                    )
                     rebuttal_hit = compute_rebuttal_hit(
                         entry, self.memory.iter_episodic())
                     self.doubt_state.injection_check(
@@ -785,6 +819,20 @@ class LivingMemoryLoop:
                         rebuttal_hit=rebuttal_hit,
                         verification_chain=self.verification_chain,
                     )
+                    # R3（C1 接线）：注入 suspect 标记后登记再巩固候选
+                    # （reconsolidation_queue 契约："入队只允许写侧时相——
+                    # 注入 suspect 标记后登记"；写侧入队即落盘，跨重启不失）。
+                    # fail-open：入队异常绝不阻断写侧提交（G 模式以日志可见）。
+                    if (self.doubt_state.injection_suspect_marked
+                            > _suspect_marked_before):
+                        try:
+                            self.reconsolidation_queue.enqueue(
+                                entry, reason="injection_suspect",
+                                score=float(activation.surprise),
+                                phase=DoubtPhase.INJECTION.value)
+                        except Exception as e:  # pylint: disable=broad-except
+                            logger.warning(
+                                "再巩固候选入队失败（fail-open）: %s", e)
                 except Exception as e:  # pylint: disable=broad-except
                     logger.warning(
                         "M3-1 注入时怀疑检查失败（fail-open）: %s", e)
@@ -861,6 +909,20 @@ class LivingMemoryLoop:
                 pass
         self._pending_negative_evidence = False
 
+        # R3（C1 接线）：巩固期受控改写——turn 生命周期巩固期（doubt_check
+        # 后、state_update 前）调用 reconsolidation_queue.maybe_rewrite
+        # （三闸门机器防线：G1 候选在队 / G2 巩固期时相 / G3 写侧委托——
+        # 经 state_machine 巩固时相写侧入口 consolidation_resolve 受控
+        # 改写；写侧默认保守）。检索路径零改写保持（只读四不变不破坏：
+        # 本段只走写侧时相，/recall 与 /react 只读口不经过 process_turn）。
+        # 结果进 state_update 观测 + 下一轮目的时相 reconsolidated 信号。
+        try:
+            _reconsolidated_count = self._reconsolidation_consolidate()
+        except Exception as e:  # pylint: disable=broad-except
+            logger.warning("巩固期再巩固失败（fail-open）: %s", e)
+            _reconsolidated_count = 0
+        self._last_turn_reconsolidated = bool(_reconsolidated_count > 0)
+
         # M5 step 8/9 state_update 观测（状态更新：allostatic J 滑动设定点
         # + J/σ 更新（learn）+ π 更新（purpose.adjust）+ 记忆更新/巩固——
         # 锚点分散在 FEP 管线，观测在此聚合；增量 = 本轮期望增量，供
@@ -900,6 +962,7 @@ class LivingMemoryLoop:
                 self.turn_count > 0
                 and self.turn_count % self.consolidation_interval == 0),
             allostatic_events=_allostatic_events,
+            reconsolidated=int(_reconsolidated_count),
         )
 
         # 更新状态
@@ -1028,6 +1091,14 @@ class LivingMemoryLoop:
             chain_active = bool(
                 chain is not None and chain.enabled
                 and (suspect_marked or doubt_events > 0))
+            # P2-B 目的检查口径修正（C3）：本轮是否只读轮（无任何写侧活动
+            # ——如 /recall 查询）→ Q1 豁免（产出未流入活结构是只读语义，
+            # 不是偏离，不判 drifted）。写侧活动口径与 Q1 同源：episodic
+            # 写入 / suspect 标记 / 再巩固（上一轮巩固期结果——目的检查在
+            # doubt_check 步、本轮再巩固在其后，用上一轮保持诚实）。
+            _recon_last = bool(getattr(self, "_last_turn_reconsolidated", False))
+            _write_activity = bool(episodic_added) or bool(suspect_marked) \
+                or _recon_last
             round_signals = {
                 "episodic_added": bool(episodic_added),
                 "doubt_events": int(doubt_events),
@@ -1040,8 +1111,10 @@ class LivingMemoryLoop:
                 # 不是只作展示（诚实信号，非凑分）。
                 "surprise_in_decisions": True,
                 "lifecycle_trace": bool(self.lifecycle_trace is not None),
-                "reconsolidated": False,
+                "reconsolidated": _recon_last,
                 "dream_consolidated": False,
+                # P2-B（C3）：只读轮豁免 Q1（不判"产出未流入活结构"）
+                "readonly_round": not _write_activity,
                 "conclusion_only": False,
                 "memory_idle": False,
                 "surprise_display_only": False,
@@ -1067,6 +1140,62 @@ class LivingMemoryLoop:
         except Exception as e:  # pylint: disable=broad-except
             logger.warning("目的时相判定失败（fail-open）: %s", e)
             return None
+
+    def _reconsolidation_consolidate(self) -> int:
+        """R3（C1 接线）：巩固期受控改写（三闸门 maybe_rewrite）。
+
+        turn 生命周期巩固期（doubt_check 后、state_update 前——9 步固化
+        不加步，再巩固观测并入 state_update 步）调用：遍历 episodic 缓冲，
+        对在再巩固候选队列中的条目执行 ``maybe_rewrite``：
+
+          - G1 候选在队（candidate_in_queue）：条目键在持久化队列中；
+          - G2 巩固期触发（consolidation_triggered）：本段以巩固期写侧
+            时相（DoubtPhase.CONSOLIDATION）调用——改写只由巩固调度方
+            触发；
+          - G3 改写受控（rewrite_controlled）：改写动作经 ``rewrite_fn``
+            委托 state_machine 巩固时相写侧入口（consolidation_resolve
+            ——证据裁决：conflict → superseded / confirm → kept / 超时 →
+            downgraded；写侧默认保守）。任一不过 → 不改写（机器防线）。
+
+        **检索路径零改写保持**：本段只走写侧时相（process_turn 内）；
+        /recall、/react 只读口不经过本方法（只读四不变不破坏）。
+
+        返回本轮实际改写（三闸门全过）的条目数；任何异常 fail-open
+        （G 模式以日志可见，绝不阻断主循环）。
+        """
+        q = getattr(self, "reconsolidation_queue", None)
+        if q is None or not q.enabled:
+            return 0
+        from core.doubt.state_machine import DoubtPhase
+        rewritten = 0
+        try:
+            for entry in self.memory.iter_episodic():
+                if not q.contains(entry):
+                    continue
+                res = q.maybe_rewrite(
+                    entry,
+                    phase=DoubtPhase.CONSOLIDATION.value,
+                    rewrite_fn=self._reconsolidation_write_side,
+                    detail="巩固期受控改写（loop 接线）",
+                )
+                if res.get("passed"):
+                    rewritten += 1
+        except Exception as e:  # pylint: disable=broad-except
+            logger.warning("再巩固候选处理失败（fail-open）: %s", e)
+        return rewritten
+
+    def _reconsolidation_write_side(self, entry) -> None:
+        """R3（C1 接线）：G3 写侧委托——state_machine 巩固时相写侧入口。
+
+        由 ``reconsolidation_queue.maybe_rewrite`` 在**三闸门全过**后调用
+        （队列本体只做裁决与登记，不直接改条目）——本方法经
+        ``doubt_state.consolidation_resolve``（写侧唯一转移入口之一）执行
+        真正的状态转移：证伪证据（violated_by）→ superseded；窗口内无
+        证据 → kept（stable，confidence 重巩固）；窗口超时 → downgraded。
+        与 M6 梦期巩固时相同语义（写侧默认保守）。任何异常 fail-open
+        （maybe_rewrite 已接住，队列不动）。
+        """
+        self.doubt_state.consolidation_resolve(entry)
 
     # ================================================================== #
     #  私有辅助方法（由 process_turn / query_llm 拆分而来，保持行为不变）
@@ -1425,6 +1554,18 @@ class LivingMemoryLoop:
                         f"体验层D: 高惊讶 z={z:.2f} → 去稳定化旧记忆 "
                         f"(turn={getattr(entry, 'turn', '?')}, "
                         f"rebuttal={getattr(entry, 'rebuttal_count', 0)})")
+                    # R3（C1 接线）：去稳定化（labile 标记）条目登记再巩固
+                    # 候选（写侧时相——mark_labile 是写侧动作；队列契约
+                    # "入队只允许写侧时相"；巩固期 maybe_rewrite 消化）。
+                    # fail-open：入队异常绝不影响去稳定化结果。
+                    try:
+                        from core.doubt.state_machine import DoubtPhase
+                        self.reconsolidation_queue.enqueue(
+                            entry, reason="destabilized_labile",
+                            score=float(activation.surprise),
+                            phase=DoubtPhase.INJECTION.value)
+                    except Exception:  # pylint: disable=broad-except
+                        pass
                     # 阶段 3：证伪 → conformal 校准集 + 负性证据标记
                     # （对称性约束：坏消息 PE 不被系统性低估）
                     if self.precision_adapt is not None:

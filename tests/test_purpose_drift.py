@@ -16,6 +16,8 @@
   7. DoubtStateMachine 集成：purpose_drift_check 返回闸门信号、snapshot()
      含 purpose_drift 块、原快照键全部保留（回归断言）→ TestStateMachineIntegration
   8. fail-open：异常输入不抛 → TestFailOpen
+  9. P2-B 口径修正：只读轮（无写侧活动）Q1 豁免不判 drifted →
+     TestReadonlyRoundExemption
 
 运行方式：pytest rewrite-ws/tests/test_purpose_drift.py -v。
 """
@@ -250,6 +252,101 @@ class TestVerdictRules:
             ["Q1", "Q2", "Q3", "Q4", "Q5"]
         assert len(out["reasons"]) == 5
         assert out["purpose"] == _DEFAULT_PURPOSE_TEXT
+
+
+# ===========================================================================
+# 2.5 P2-B 口径修正：只读轮 Q1 豁免（无写侧活动 = 只读语义，不是偏离）
+# ===========================================================================
+
+class TestReadonlyRoundExemption:
+    """只读轮（无写侧活动的轮——如 /recall 查询）不该被 Q1 判 drifted。
+
+    Q1 对只读轮豁免：state="exempt"（不适用），不计入 verdict——
+    写轮（缺省）无写侧活动仍判"否"（旧行为保持，判定口径不放松）。
+    """
+
+    def test_readonly_round_q1_exempt(self):
+        """readonly_round=True → Q1 exempt（ok=None，不判是/否）。"""
+        out = PurposeDriftPhase().judge({"readonly_round": True})
+        assert out["answers"]["Q1"]["state"] == "exempt"
+        assert out["answers"]["Q1"]["ok"] is None
+        assert "只读轮" in out["answers"]["Q1"]["reason"]
+
+    def test_readonly_round_not_drifted_by_q1(self):
+        """只读轮 + Q2-Q5 全「是」→ aligned（exempt 不计入 verdict）。"""
+        out = PurposeDriftPhase().judge({
+            "readonly_round": True,
+            "doubt_events": 1,              # Q2/Q3 是
+            "lifecycle_trace": True,        # Q5 是
+            "surprise_in_decisions": True,  # Q4 是
+            # 无写侧活动 → 旧行为 Q1 否 → drifted；豁免后 Q1 不计 → aligned
+        })
+        assert out["answers"]["Q1"]["state"] == "exempt"
+        assert out["verdict"] == "aligned"
+        assert out["purpose_drift"] is False
+
+    def test_readonly_round_alone_uncertain_not_drifted(self):
+        """纯只读轮（无其他信号）→ uncertain（未判），**不是 drifted**。"""
+        out = PurposeDriftPhase().judge({"readonly_round": True})
+        assert out["answers"]["Q1"]["state"] == "exempt"
+        assert out["verdict"] == "uncertain"   # 不因 Q1 判 drifted
+        assert out["purpose_drift"] is True    # 不确定=未判，闸门仍亮（补判语义）
+
+    def test_round_type_string_readonly(self):
+        """round_type='readonly' → Q1 豁免（显式轮类型判定）。"""
+        out = PurposeDriftPhase().judge({"round_type": "readonly"})
+        assert out["answers"]["Q1"]["state"] == "exempt"
+
+    def test_round_type_string_write_keeps_q1_no(self):
+        """round_type='write' → 无写侧活动 Q1 仍判「否」（口径不放松）。"""
+        out = PurposeDriftPhase().judge({"round_type": "write"})
+        assert out["answers"]["Q1"]["state"] == "no"
+
+    def test_write_round_no_write_activity_still_drifted(self):
+        """写轮（缺省）无写侧活动 → Q1 否 → drifted（旧行为保持）。"""
+        out = PurposeDriftPhase().judge({})
+        assert out["answers"]["Q1"]["state"] == "no"
+        assert out["verdict"] == "drifted"
+
+    def test_readonly_does_not_mask_other_questions_no(self):
+        """豁免只作用于 Q1：其他问判「否」仍 → drifted（Q3 memory_idle）。"""
+        out = PurposeDriftPhase().judge({
+            "readonly_round": True,
+            "memory_idle": True,            # Q3 否
+        })
+        assert out["answers"]["Q1"]["state"] == "exempt"
+        assert out["answers"]["Q3"]["state"] == "no"
+        assert out["verdict"] == "drifted"  # 经 Q3 偏离，不是经 Q1
+
+    def test_readonly_round_not_counted_as_drift(self):
+        """只读轮 Q1 豁免 → 不产生 drifted 记录（drift_count 不增）。"""
+        ph = PurposeDriftPhase()
+        ph.judge({"readonly_round": True})   # uncertain（未判），不计 drift
+        ph.judge({"readonly_round": True})
+        assert ph.drift_count == 0
+        assert ph.snapshot()["last_verdict"] == "uncertain"
+
+    def test_reasons_include_exempt_marker(self):
+        """reasons 可回放：Q1 豁免理由含「只读轮/豁免」标记（可审计）。"""
+        out = PurposeDriftPhase().judge({"readonly_round": True})
+        joined = " | ".join(out["reasons"])
+        assert "exempt" in joined
+        assert "只读轮" in joined
+
+    def test_state_machine_delegates_readonly_exemption(self):
+        """DoubtStateMachine 委托路径同样豁免只读轮 Q1。"""
+        sm = DoubtStateMachine()
+        gate = sm.purpose_drift_check({"readonly_round": True,
+                                       "doubt_events": 1,
+                                       "lifecycle_trace": True,
+                                       "surprise_in_decisions": True})
+        assert gate["answers"]["Q1"]["state"] == "exempt"
+        assert gate["verdict"] == "aligned"
+
+    def test_no_score_fields_with_exempt(self):
+        """豁免输出仍满足无分数保证（递归无符合度分数键）。"""
+        _assert_no_score_fields(PurposeDriftPhase().judge(
+            {"readonly_round": True}))
 
 
 # ===========================================================================
