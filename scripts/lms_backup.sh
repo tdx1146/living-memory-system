@@ -161,6 +161,7 @@ run_hourly() {
     # 先写临时文件再原子 mv：中途失败不会留下半个归档冒充本轮备份。
     if ! ( cd "$LMS_HOME" && tar --zstd -cf "$tmp_archive" \
             --exclude='*.lock' --exclude='*.tmp' --exclude='*.swp' \
+            --warning=no-file-changed --warning=no-file-ignored \
             snapshots ); then
         rm -f "$tmp_archive" 2>/dev/null || true
         fail "每小时归档 tar.zst 打包失败"
