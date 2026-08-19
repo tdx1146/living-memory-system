@@ -1073,6 +1073,12 @@ class AttractorNetwork:
             "sigma": self.sigma.clone(),
             "num_nodes": self.num_nodes,
             "input_dim": self.input_dim,
+            # B 级（2026-08-19 四妹审核）：allostatic j_target 持久化
+            # （只加不改字段；旧快照缺省回退 init_target）。
+            # 用 snapshot(turn_count=None) 避免 side-effect（ts_turn 写入）。
+            "allostatic": (
+                self.allostatic.snapshot()
+                if self.allostatic is not None else None),
         }
 
     def set_landscape(self, landscape: dict) -> None:
@@ -1089,6 +1095,15 @@ class AttractorNetwork:
         self.sigma = landscape["sigma"].clone().to(self.device)
         self.num_nodes = landscape["num_nodes"]
         self.input_dim = landscape["input_dim"]
+        # B 级（2026-08-19）：恢复 allostatic j_target（只加不改；
+        # 缺省/非法值回退 init_target——重启后继续下探而非回 40）。
+        if self.allostatic is not None:
+            _as = landscape.get("allostatic") or {}
+            _jt = _as.get("j_target")
+            if isinstance(_jt, (int, float)) and _jt > 0:
+                self.allostatic.j_target = max(
+                    self.allostatic.j_min,
+                    min(self.allostatic.j_max, float(_jt)))
 
     def reset_state(self) -> None:
         """重置内部状态 sigma 为零（不影响已学习的 J 矩阵）。
