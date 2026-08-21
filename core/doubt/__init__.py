@@ -32,6 +32,12 @@ labile 平衡（R3 核心——语义决策 D-2026-08-18-01 代码化）：
                     改写（三闸门：候选在队/巩固期触发/改写受控）——
                     检索不塑形 + 巩固期再巩固
 
+E3（自我怀疑驱动的主动调节，dandan 拍板 2026-08-20 22:14）：
+  - epistemic_selector: 悬案选择器纯函数（信息增益×学习进度×可达性排序，
+                    无 LLM、纯 stdlib、可单测）
+  - satiety:          消解判定（judge_resolved）+ SatietyGate（冷却/计数/
+                    武装-待机——终止信号防 OCD 化；冷却 12h 按拍板放宽）
+
 模块（既有）：
   - confidence_field: 置信度场纯函数（更新/重算/强制降权/来源信任）
   - reconsolidation:  惊讶度双角色-角色2（去稳定化，labile 标记）
@@ -250,6 +256,14 @@ from core.doubt.precision_adapt import (  # noqa: E402
     PrecisionLearnState,
     precision_learn_enabled,
 )
+from core.doubt.epistemic_selector import (  # noqa: E402
+    default_weights,
+    select_cases,
+)
+from core.doubt.satiety import (  # noqa: E402
+    SatietyGate,
+    judge_resolved,
+)
 
 __all__ = [
     "MODULE_CLAIMS",
@@ -317,4 +331,9 @@ __all__ = [
     # precision_learn（ABC §S3：π = 1/Var 估计 + lr_multiplier 跟随 π）
     "PrecisionLearnState",
     "precision_learn_enabled",
+    # E3（方案-E3自我怀疑驱动调节-20260820.md §3.3：纯函数选料器 + satiety）
+    "default_weights",
+    "select_cases",
+    "SatietyGate",
+    "judge_resolved",
 ]

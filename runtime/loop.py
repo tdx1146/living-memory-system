@@ -122,8 +122,65 @@ MODULE_CLAIMS: dict = {
                          "不破坏——/recall 与 /react 只读口不经过巩固期）",
             "verified_by": "tests/test_loop_reconsolidation_labile.py",
         },
+        "e3_switch_off_bitwise_equivalent": {
+            "statement": "E3（自我怀疑驱动的主动调节，dandan 拍板 2026-08-20）："
+                         "总开关 LMS_E3_ENABLED 默认 0=关——关时选择器/重激活/"
+                         "satiety/min-age 全部新路径零参与，行为与开关引入前"
+                         "逐位一致（e3_reactivate 返回 enabled:false，min-age "
+                         "闸门不生效）；开时受 LMS_E3_MIN_AGE_TURNS（默认 1）/ "
+                         "LMS_E3_SATIETY_COOLDOWN_H（默认 12）/ "
+                         "LMS_E3_REACTIVATE_MAX（默认 2）治理",
+            "verified_by": "tests/test_e3_reactivation.py",
+        },
     },
 }
+
+
+# ---------------------------------------------------------------------- #
+#  E3 env 开关（自我怀疑驱动的主动调节，dandan 拍板 2026-08-20 22:14）。
+#  总开关默认 0=关 → 全部新路径零参与（行为与开关引入前逐位一致）。
+#  子开关在总开关开时才生效（§5.3 写侧默认保守先例）。
+# ---------------------------------------------------------------------- #
+
+_ENV_E3_ENABLED = "LMS_E3_ENABLED"
+_ENV_E3_MIN_AGE_TURNS = "LMS_E3_MIN_AGE_TURNS"
+_ENV_E3_REACTIVATE_MAX = "LMS_E3_REACTIVATE_MAX"
+_ENV_E3_TOPIC_LEN = "LMS_E3_REACTIVATE_TOPIC_LEN"
+
+
+def _e3_enabled() -> bool:
+    """E3 总开关（LMS_E3_ENABLED，默认 0=关）。关 → 全部新路径零参与。"""
+    raw = os.environ.get(_ENV_E3_ENABLED, "0")
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+def _e3_min_age_turns() -> int:
+    """min-age 闸门轮数（LMS_E3_MIN_AGE_TURNS，默认 1）。
+
+    E3 总开关关 → 0（不闸——行为与 E3 引入前逐位一致：同轮即消保持）。
+    """
+    if not _e3_enabled():
+        return 0
+    try:
+        return max(0, int(os.environ.get(_ENV_E3_MIN_AGE_TURNS, "1") or 1))
+    except (TypeError, ValueError):
+        return 1
+
+
+def _e3_reactivate_max() -> int:
+    """单次闭环最多重激活条数（LMS_E3_REACTIVATE_MAX，dandan 拍板放宽=2）。"""
+    try:
+        return max(1, int(os.environ.get(_ENV_E3_REACTIVATE_MAX, "2") or 2))
+    except (TypeError, ValueError):
+        return 2
+
+
+def _e3_topic_len() -> int:
+    """线索/证据摘要长度上限（LMS_E3_REACTIVATE_TOPIC_LEN，默认 120）。"""
+    try:
+        return max(40, int(os.environ.get(_ENV_E3_TOPIC_LEN, "120") or 120))
+    except (TypeError, ValueError):
+        return 120
 
 
 # ---------------------------------------------------------------------- #
@@ -344,6 +401,18 @@ class LivingMemoryLoop:
         self.reconsolidation_queue = (
             config.get('reconsolidation_queue')
             or ReconsolidationQueue(path=config.get('reconsolidation_queue_path')))
+        # E3（自我怀疑驱动的主动调节，dandan 拍板 2026-08-20 22:14）：
+        #   - satiety 状态机（冷却/计数/武装-待机——终止信号防 OCD 化，
+        #     设计 §3.2 ⑤）；纯进程内存态（同 gap_registry 先例）。
+        #   - min-age 闸门滚动快照（候选至少活过当轮，根因 4 修复）。
+        #   - 闭环观测（最近一次重激活 / 闭环计数）。
+        # 总开关 LMS_E3_ENABLED 默认 0=关 → 全部新路径零参与（逐位等价）。
+        from core.doubt.satiety import SatietyGate
+        self.satiety_gate = SatietyGate()
+        self._e3_turn_start_keys = None          # 懒创建 deque（min-age 数据源）
+        self._e3_pending_targets: list = []      # 上轮重激活目标（satiety 消解扫）
+        self._e3_last_reactivation = None        # 观测：最近一次闭环结果
+        self._e3_closed_loops: int = 0           # 观测：闭环计数
         # 上一轮巩固期再巩固是否真实发生（目的时相 reconsolidated 信号——
         # 目的检查在 doubt_check 步、再巩固在其后，用上一轮结果保持诚实；
         # 纯进程内存态，重启即失，同 gap_registry 先例）。
@@ -543,6 +612,12 @@ class LivingMemoryLoop:
         # ────────────────────────────────────────────────────────── #
         # 1. 编码输入
         text = f"用户: {user_input}\n助手: {llm_output}" if llm_output else user_input
+        # E3（min-age 闸门数据源，根因 4 修复）：记录本 turn 起始的再巩固
+        # 候选键快照——候选入队后至少隔 LMS_E3_MIN_AGE_TURNS（默认 1）轮才
+        # 允许巩固期消费（根治"同轮即消"：候选至少活过当轮，做梦 M6 能扫到
+        # labile/suspect）。总开关关 → 零参与（_e3_record_turn_start_keys
+        # 内部判定，行为与 E3 引入前逐位一致）。
+        self._e3_record_turn_start_keys()
         # 提取层 v1.4（S1-7/P3）：每轮开始重置降级标记（观测粒度=单轮）
         self.last_turn_degraded = False
         sensory_input = self.encoder.encode(text, self.tokenizer, self.embedder)
@@ -563,6 +638,15 @@ class LivingMemoryLoop:
             ev = doubt_ingest(self, text)
             if ev:
                 _doubt_action = ev.get('action')
+                # E3（satiety 恢复路径，设计 §3.2 ⑤）：新 [doubt] 事件 →
+                # 重新武装（清待机 + 重置闭环计数——系统重新开始怀疑）。
+                # fail-open：重激活异常绝不影响怀疑摄入结果。
+                _gate = getattr(self, 'satiety_gate', None)
+                if _gate is not None:
+                    try:
+                        _gate.rearm()
+                    except Exception:  # pylint: disable=broad-except
+                        pass
             if (self.precision_adapt is not None and ev
                     and ev.get('action') == 'rebutted'):
                 self._pending_negative_evidence = True
@@ -1167,11 +1251,23 @@ class LivingMemoryLoop:
         if q is None or not q.enabled:
             return 0
         from core.doubt.state_machine import DoubtPhase
+        # E3（根因 4 修复）：min-age 闸门——只消费入队 ≥N 轮的候选
+        # （N = LMS_E3_MIN_AGE_TURNS，默认 1）。E3 总开关关 → 返回 None
+        # （不闸，行为与 E3 引入前逐位一致：同轮即消保持）。
+        eligible = self._e3_eligible_keys()
         rewritten = 0
         try:
             for entry in self.memory.iter_episodic():
                 if not q.contains(entry):
                     continue
+                if eligible is not None:
+                    # 候选键不在可消费集（入队不足 N 轮）→ 本轮跳过，
+                    # 至少活过当轮留给做梦 M6 扫 labile/suspect。
+                    from core.doubt.reconsolidation_queue import (
+                        entry_key as _queue_entry_key)
+                    k = _queue_entry_key(entry)
+                    if not k or k not in eligible:
+                        continue
                 res = q.maybe_rewrite(
                     entry,
                     phase=DoubtPhase.CONSOLIDATION.value,
@@ -1196,6 +1292,371 @@ class LivingMemoryLoop:
         （maybe_rewrite 已接住，队列不动）。
         """
         self.doubt_state.consolidation_resolve(entry)
+
+    # ================================================================== #
+    #  E3（自我怀疑驱动的主动调节，dandan 拍板 2026-08-20 22:14）：
+    #  选择 → 重激活 → satiety 消解；min-age 闸门数据源；/status e3 观测。
+    #  总开关 LMS_E3_ENABLED 默认 0=关 → 全部新路径零参与（逐位等价）。
+    #  全部走既有刹车（sleep_check 由触发侧 self_pulse 把关；本方法只做
+    #  记忆内容调节，不调任何阈值参数——不动 B 级修复成果）。
+    # ================================================================== #
+
+    def _e3_record_turn_start_keys(self) -> None:
+        """E3：记录本 turn 起始的再巩固候选键快照（min-age 闸门数据源）。
+
+        滚动保留最近 N 份（N = LMS_E3_MIN_AGE_TURNS）turn 起始快照；
+        入队于第 T' 轮的候选自第 T'+1 轮起始出现在快照。总开关关 →
+        零参与。fail-open：任何异常以日志可见，绝不阻断主循环。
+        """
+        n = _e3_min_age_turns()
+        if n <= 0:
+            return
+        q = getattr(self, "reconsolidation_queue", None)
+        if q is None or not q.enabled:
+            return
+        try:
+            keys = frozenset(
+                r.get("entry_key") for r in q.peek(max_items=4096)
+                if r.get("entry_key"))
+            snaps = self._e3_turn_start_keys
+            if snaps is None or snaps.maxlen != max(1, n):
+                snaps = deque(maxlen=max(1, n))
+                self._e3_turn_start_keys = snaps
+            snaps.append(keys)
+        except Exception as e:  # pylint: disable=broad-except
+            logger.warning("E3 turn 起始键快照记录失败（fail-open）: %s", e)
+
+    def _e3_eligible_keys(self):
+        """E3 min-age 闸门的可消费键集（None = 开关关，不闸）。
+
+        取滚动快照中**最旧**一份 s_{T-N+1}（第 T 轮消费时年龄 ≥N 轮 ⟺
+        键 ∈ s_{T-N+1}）；运行不足 N 轮 → 空集（无候选年龄达标，保守）；
+        无快照（防御）→ None（fail-open 不拦，回到无闸门行为）。
+        """
+        n = _e3_min_age_turns()
+        if n <= 0:
+            return None
+        snaps = getattr(self, "_e3_turn_start_keys", None)
+        if not snaps:
+            return None
+        if len(snaps) < n:
+            return frozenset()
+        return snaps[0]
+
+    def _e3_build_clue(self, cand: dict) -> str:
+        """生成重激活线索（无 LLM——dandan 拍板 3：免费版自动生成）。
+
+        复用 dream_engine._build_incomplete_clue 思路（前缀截断 + 省略号 +
+        质疑问句——B3 绝不复述全文，完全重复反而稳定旧记忆），叠加新上下文/
+        新证据（gap 登记的 detail/证据摘要承载——预测误差源，不是温和"重新
+        审视"）。长度上限 LMS_E3_REACTIVATE_TOPIC_LEN（默认 120）。
+        纯函数，fail-open（异常回退通用疑问句）。
+        """
+        try:
+            target = (cand.get("target_text") or cand.get("topic") or "").strip()
+            if not target:
+                return "这条记忆还成立吗？"
+            cut = max(8, min(int(len(target) * 0.6), 40))
+            fragment = target[:cut].strip()
+            if len(fragment) < len(target):
+                fragment += "……"
+            clue = f"{fragment}？这条还成立吗？"
+            detail = (cand.get("detail") or "").strip()
+            if detail:
+                clue += f" 新证据/疑点：{detail[:60]}"
+            return clue[:max(40, _e3_topic_len())]
+        except Exception:  # pylint: disable=broad-except
+            return "这条记忆还成立吗？"
+
+    def _e3_find_target_by_key(self, entry_key: str):
+        """按稳定键找回目标条目（选择器只回键/文本，不回条目对象）。"""
+        if not entry_key:
+            return None
+        from core.doubt.reconsolidation_queue import entry_key as _queue_entry_key
+        for entry in self.memory.iter_episodic():
+            try:
+                if _queue_entry_key(entry) == entry_key:
+                    return entry
+            except Exception:  # pylint: disable=broad-except
+                continue
+        return None
+
+    def _e3_reactivate_path_b(self, clue: str) -> bool:
+        """路径 B 兜底：线索文本走普通 store → FEP surprise → 既有去稳定化。
+
+        走 ``process_turn``（与 /store 同路径）：新条目写入 → FEP 预测误差
+        → ``_destabilize_if_high_surprise``（既有 L1514 起，z>2 → mark_labile
+        + enqueue）。成功后候选队列尺寸增大（含注入 suspect 入队）→ True。
+        fail-open：任何异常返回 False（兜底失败不阻断主流程）。
+        """
+        try:
+            q = getattr(self, "reconsolidation_queue", None)
+            size_before = q.size() if q is not None else 0
+            self.process_turn(clue)
+            size_after = q.size() if q is not None else 0
+            return bool(size_after > size_before)
+        except Exception as e:  # pylint: disable=broad-except
+            logger.warning("E3 路径 B 重激活失败（fail-open）: %s", e)
+            return False
+
+    def e3_reactivate(self, *, dry_run: bool = False,
+                      limit: Optional[int] = None) -> dict:
+        """E3 重激活动作（选择 → 重激活 → satiety 记账 → 返回结果 dict）。
+
+        总开关 LMS_E3_ENABLED=0 → {"enabled": False} 零参与（A6 逐位等价）。
+
+        流程（设计 §3.2 ②，dandan 拍板 3：无 LLM）：
+          0. satiety 消解扫（上轮重激活目标：superseded/kept≥N → 判 resolved
+             → gap_registry.mark_resolved + satiety 记账——A5 落点）；
+          1. satiety 武装检查（待机中 → 直接返回待机态）；
+          2. 选择器选悬案（fok_unresolved ∪ low_confidence ∪ suspect 未决；
+             score = α·epistemic + β·progress + γ·reachable，纯函数无 LLM）；
+          3. 对 top-N（N = limit 或 LMS_E3_REACTIVATE_MAX，默认 2）重激活：
+             路径 A（主）：feed "[doubt] conflict: <线索+新证据摘要>" →
+               doubt_ingest（target_entry 显式传入——选择器已定位目标）→
+               mark_labile(violated_by=线索) → 补 enqueue（doubt_ingest 已接）
+               → 候选带证据进队列；
+             路径 B（兜底）：线索走普通 store → FEP surprise → 既有去稳定化；
+          4. satiety 记账：record_reactivation(topic)（冷却内不重选同一悬案）
+             + close_cycle（累计 3 次闭环 → 待机 24h）；
+          5. 观测：surprise_before（A2 观测字段，不设阈值判定——dandan 拍板
+             4：到验收时由 dandan 判断）。
+
+        任何异常 fail-open（G 模式以日志可见，绝不抛给调用方）。
+        """
+        if not _e3_enabled():
+            return {"enabled": False,
+                    "note": "LMS_E3_ENABLED=0（总开关关，零参与）"}
+        from core.doubt.doubt_ingest import ingest as doubt_ingest
+        from core.doubt.epistemic_selector import select_cases
+        from core.doubt.satiety import judge_resolved
+        gate = getattr(self, "satiety_gate", None)
+        result = {
+            "enabled": True,
+            "armed": False,
+            "session_id": self.session_id,
+            "surprise_before": self._e3_last_surprise(),
+            "selected": 0, "activated": 0, "rejected": 0,
+            "candidates": [], "activated_items": [], "rejected_items": [],
+            "satiety": gate.snapshot() if gate is not None else None,
+            "note": "",
+        }
+        try:
+            # 0. satiety 消解扫（上轮重激活目标的闭环收口）
+            if gate is not None:
+                self._e3_satiety_sweep(judge_resolved=judge_resolved)
+            # 1. 武装检查
+            if gate is None or not gate.is_armed():
+                result.update({
+                    "armed": False,
+                    "note": "satiety 待机中（累计闭环达上限；新 [doubt] 事件或"
+                            "新 plateau 触发后 rearm 恢复）",
+                    "satiety": gate.snapshot() if gate is not None else None,
+                })
+                return result
+            result["armed"] = True
+            # 2. 选料（纯函数）
+            snap = {}
+            try:
+                snap = self.gap_registry.snapshot()
+            except Exception:  # pylint: disable=broad-except
+                pass
+            fok_list = list(snap.get("fok_unresolved", []) or [])
+            lowconf_list = list(
+                snap.get("low_confidence_unreviewed", []) or [])
+            episodic = list(self.memory.iter_episodic())
+            # 补充候选源：suspect 未决条目（fok 形态混入，选择器只消费列表）
+            try:
+                for e in episodic:
+                    if str(getattr(e, "doubt_state", "stable") or "stable") \
+                            == "suspect":
+                        fok_list.append({
+                            "topic": (getattr(e, "text", "") or "")[:120],
+                            "detail": "suspect 未决条目（doubt_state=suspect）",
+                        })
+            except Exception:  # pylint: disable=broad-except
+                pass
+            excluded = set()
+            try:
+                excluded.update(
+                    r.get("topic") for r in self.gap_registry.resolved_list())
+            except Exception:  # pylint: disable=broad-except
+                pass
+            if gate is not None:
+                try:
+                    excluded.update(gate.cooldown_topics())
+                except Exception:  # pylint: disable=broad-except
+                    pass
+            max_items = max(1, min(
+                int(limit if limit is not None else _e3_reactivate_max()), 8))
+            candidates = select_cases(
+                fok_list, lowconf_list, episodic=episodic,
+                surprise_window=list(
+                    getattr(self, "react_surprise_history", None) or []),
+                excluded_topics=excluded, max_candidates=max_items * 2)
+            selected = candidates[:max_items]
+            result["selected"] = len(selected)
+            result["candidates"] = [
+                {k: c.get(k) for k in
+                 ("kind", "topic", "score", "epistemic", "progress",
+                  "reachable", "target_found", "entry_key")
+                 if k in c}
+                for c in selected]
+            if dry_run:
+                result["dry_run"] = True
+                result["note"] = "dry_run：只选择不激活（A1 观测）"
+                return result
+            # 3. 重激活（路径 A 主 / 路径 B 兜底）
+            pending = []
+            for cand in selected:
+                clue = self._e3_build_clue(cand)
+                brief = {
+                    "kind": cand.get("kind"),
+                    "topic": cand.get("topic"),
+                    "clue": clue,
+                }
+                # 路径 A：显式目标条目 → doubt_ingest conflict → labile+入队
+                target = None
+                if cand.get("entry_key"):
+                    target = self._e3_find_target_by_key(cand.get("entry_key"))
+                ev = None
+                try:
+                    ev = doubt_ingest(
+                        self, f"[doubt] conflict: {clue}",
+                        target_entry=target)
+                except Exception:  # pylint: disable=broad-except
+                    ev = None
+                if ev is not None and ev.get("action") == "rebutted":
+                    result["activated_items"].append({**brief, "path": "A"})
+                    result["activated"] += 1
+                    pending.append(cand)
+                    if gate is not None:
+                        gate.record_reactivation(cand.get("topic"))
+                    continue
+                # 路径 B（兜底）：普通 store → FEP surprise → 去稳定化
+                if self._e3_reactivate_path_b(clue):
+                    result["activated_items"].append({**brief, "path": "B"})
+                    result["activated"] += 1
+                    pending.append(cand)
+                    if gate is not None:
+                        gate.record_reactivation(cand.get("topic"))
+                    continue
+                result["rejected_items"].append({
+                    **brief, "reason": "路径 A 未命中 + 路径 B 无去稳定化"})
+                result["rejected"] += 1
+            # 4. satiety 闭环记账（下次触发做消解扫；累计 3 次 → 待机）
+            if result["activated"] > 0:
+                self._e3_pending_targets = [
+                    {"topic": c.get("topic"), "entry_key": c.get("entry_key")}
+                    for c in pending]
+                self._e3_closed_loops += 1
+                self._e3_last_reactivation = {
+                    "ts": time.time(),
+                    "closed_loop": self._e3_closed_loops,
+                    "activated": result["activated"],
+                    "topics": [c.get("topic") for c in pending],
+                }
+                if gate is not None:
+                    try:
+                        gate.close_cycle(
+                            outcome="activated",
+                            detail=", ".join(
+                                str(c.get("topic")) for c in pending)[:300])
+                    except Exception:  # pylint: disable=broad-except
+                        pass
+            result["satiety"] = gate.snapshot() if gate is not None else None
+            return result
+        except Exception as e:  # pylint: disable=broad-except
+            logger.warning("E3 重激活失败（fail-open）: %s", e)
+            result["note"] = f"e3_reactivate fail-open: {e}"
+            return result
+
+    def _e3_satiety_sweep(self, *, judge_resolved) -> None:
+        """satiety 消解扫：上轮重激活目标的闭环收口（A5 落点）。
+
+        对 ``_e3_pending_targets`` 逐条：目标条目 superseded（重巩固改写
+        落库）或复核报告 kept ≥ kept_threshold（N 轮无新证据）→ 判
+        resolved → ``gap_registry.mark_resolved`` + satiety 记账（冷却）。
+        尽力而为不无限怀疑（Szechtman & Woody 2004 终止信号）。fail-open。
+        """
+        pending = list(getattr(self, "_e3_pending_targets", []) or [])
+        if not pending:
+            return
+        try:
+            stats = self.gap_registry.review_stats()
+        except Exception:  # pylint: disable=broad-except
+            stats = {}
+        still_pending = []
+        for item in pending:
+            topic = item.get("topic")
+            verdict = "pending"
+            try:
+                entry = self._e3_find_target_by_key(item.get("entry_key"))
+                verdict = judge_resolved(entry, outcomes=stats)
+                if verdict == "resolved":
+                    try:
+                        self.gap_registry.mark_resolved(
+                            topic, detail="E3 satiety 消解判定")
+                    except Exception:  # pylint: disable=broad-except
+                        pass
+                    gate = getattr(self, "satiety_gate", None)
+                    if gate is not None:
+                        try:
+                            gate.record_resolved(topic)
+                            gate.close_cycle(outcome="resolved", detail=str(topic))
+                        except Exception:  # pylint: disable=broad-except
+                            pass
+                    continue
+            except Exception as e:  # pylint: disable=broad-except
+                logger.warning("E3 satiety 消解扫条目失败（fail-open）: %s", e)
+            if verdict != "resolved":
+                still_pending.append(item)
+        self._e3_pending_targets = still_pending
+
+    def _e3_last_surprise(self) -> Optional[float]:
+        """最近一次激活惊讶度（A2 观测字段——不设阈值判定，dandan 拍板 4）。"""
+        try:
+            if self.last_activation is not None:
+                return round(float(self.last_activation.surprise), 4)
+        except Exception:  # pylint: disable=broad-except
+            pass
+        return None
+
+    def e3_observation(self) -> dict:
+        """E3 观测块（/status 数据源：闭环计数/待机态/最近悬案/冷却倒计时）。
+
+        总开关关 → {"enabled": False}（A6 回归可观测）；fail-open：任何
+        异常只缺省该字段（纯增量字段，旧客户端忽略）。
+        """
+        if not _e3_enabled():
+            return {"enabled": False}
+        obs: dict = {
+            "enabled": True,
+            "satiety": None,
+            "closed_loops": int(getattr(self, "_e3_closed_loops", 0) or 0),
+            "last_reactivation": getattr(self, "_e3_last_reactivation", None),
+            "pending_targets": len(
+                getattr(self, "_e3_pending_targets", []) or []),
+            "last_surprise": self._e3_last_surprise(),
+            "fok_resolved_count": 0,
+            "queue_size": 0,
+        }
+        try:
+            gate = getattr(self, "satiety_gate", None)
+            if gate is not None:
+                obs["satiety"] = gate.snapshot()
+        except Exception:  # pylint: disable=broad-except
+            pass
+        try:
+            obs["fok_resolved_count"] = self.gap_registry.resolved_count()
+        except Exception:  # pylint: disable=broad-except
+            pass
+        try:
+            q = getattr(self, "reconsolidation_queue", None)
+            obs["queue_size"] = q.size() if q is not None else 0
+        except Exception:  # pylint: disable=broad-except
+            pass
+        return obs
 
     # ================================================================== #
     #  私有辅助方法（由 process_turn / query_llm 拆分而来，保持行为不变）
@@ -2364,6 +2825,15 @@ class LivingMemoryLoop:
         except Exception as e:  # pylint: disable=broad-except
             logger.debug(
                 "get_status doubt_native 字段组装失败（fail-open）: %s", e)
+
+        # E3（自我怀疑驱动的主动调节，dandan 拍板 2026-08-20）：观测块
+        # （闭环计数/待机态/最近悬案/冷却倒计时——A5/A6 数据源；纯增量
+        # 字段；总开关关 → {'enabled': False}，旧客户端忽略）。
+        try:
+            status['e3'] = self.e3_observation()
+        except Exception as e:  # pylint: disable=broad-except
+            logger.debug(
+                "get_status e3 字段组装失败（fail-open）: %s", e)
 
         # 论文机制 A：allostatic J 滑动设定点观测（纯增量字段；开关关 →
         # {'enabled': False}——§4.2 独立追加语义，旧客户端忽略）。

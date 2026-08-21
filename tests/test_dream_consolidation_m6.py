@@ -534,8 +534,11 @@ class TestDreamEventStreamPublishing:
                  if ev["event_type"] == "lms.verification"][-1]
             assert v["payload"]["snapshot"]["conflicts_pending"] == 0
             assert v["payload"]["events"], "应含 verify 事件明细"
-            # 写侧应用成功：目标 labile（[doubt] conflict 同路径）
-            assert entry.labile is True
+            # 写侧应用成功：目标 [doubt] conflict → labile → 补入队 → 巩固
+            # 期受控改写（E3 根因 3 修复，2026-08-20）→ 终态 superseded
+            assert getattr(entry, "doubt_state", "stable") == "superseded"
+            assert entry.rebuttal_count == 1
+            assert entry.labile is False  # labile 时相已复位（改写已落库）
         finally:
             bus_events.reset_publisher_for_test()
 

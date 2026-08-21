@@ -9,6 +9,8 @@
     POST   /chat/simple       简化对话（自动处理记忆+LLM查询）
     POST   /react             实时反应只读（体验层 A：infer-only 零持久化）
     POST   /recall            只读情景检索（T1.3/P0-9：不 process_turn、不调 LLM）
+    POST   /e3/review         E3 触发端（self_pulse plateau → 选悬案+重激活；
+                              LMS_E3_ENABLED=0 → {"enabled": false} 零参与）
     GET    /status/{sid}      查询会话记忆状态
     GET    /landscape/{sid}   只读景观端点（阶段 2 思考链：盆地结构/激活/能量，raw=1 附完整张量）
     POST   /snapshot/{sid}    保存快照
@@ -304,6 +306,41 @@ class StoreResponse(BaseModel):
         None, description="派生视图：从过程核心重建的当前结论快照（≤300 字）")
     evolution: Optional[dict] = Field(
         None, description="演化史（append-only 状态转移，created 开端）")
+
+
+# ---------------------------------------------------------------------------
+# E3（自我怀疑驱动的主动调节，dandan 拍板 2026-08-20 22:14）：/e3/review
+# 触发端入口（self_pulse plateau → POST /e3/review）
+# ---------------------------------------------------------------------------
+class E3ReviewRequest(BaseModel):
+    """E3 触发端请求（body 全可选；开关关 → 零参与）。
+
+    语义（方案 §3.3 ⑥）：``dry_run`` 只选择不激活（A1 观测）；``limit``
+    覆盖单次最多重激活条数（缺省读 LMS_E3_REACTIVATE_MAX，dandan 拍板
+    放宽=2）；``LMS_E3_ENABLED=0`` 时直接返回 {"enabled": false} 零参与
+    （A6 开关回归——连会话都不建）。
+    """
+    session_id: str = Field("main", description="会话标识")
+    dry_run: bool = Field(False, description="只选择不激活（观测用）")
+    limit: Optional[int] = Field(
+        None, description="单次最多重激活条数（缺省读 LMS_E3_REACTIVATE_MAX）")
+    # 兼容旧客户端 sid 字段（与 ChatRequest 同策略，防静默丢弃）
+    sid: Optional[str] = Field(None, description="session_id 兼容别名（旧客户端）")
+
+    @model_validator(mode="after")
+    def _apply_sid_alias(self) -> "E3ReviewRequest":
+        """旧客户端 sid → session_id 映射（与 StoreRequest 的 P0-3 兼容同款）。"""
+        if self.sid is not None:
+            if self.session_id == "main":
+                self.session_id = self.sid
+                logger.warning(
+                    f"[E3ReviewRequest] 兼容字段 sid='{self.sid}' 已映射为"
+                    " session_id（P0-3 兼容）")
+            elif self.session_id != self.sid:
+                logger.warning(
+                    f"[E3ReviewRequest] 同时收到 session_id='{self.session_id}'"
+                    f" 与 sid='{self.sid}'，以 session_id 为准")
+        return self
 
 
 # ---------------------------------------------------------------------------
@@ -1091,6 +1128,50 @@ async def recall(req: RecallRequest):
         # 不改动既有字段语义；labile 内存态投影，不落库）。
         "suspicion": _last_suspicion(loop),
     }
+
+
+def _e3_enabled_server() -> bool:
+    """E3 总开关（LMS_E3_ENABLED，默认 0=关）——/e3/review 零参与闸门。
+
+    关时返回 {"enabled": false}，连会话都不建（A6 开关回归：全部新路径
+    零参与，行为与开关引入前逐位一致）。
+    """
+    raw = os.environ.get("LMS_E3_ENABLED", "0")
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+@app.post("/e3/review")
+async def e3_review(req: E3ReviewRequest):
+    """E3 触发端入口（self_pulse plateau 触发 → POST /e3/review）。
+
+    - ``LMS_E3_ENABLED=0`` → ``{"enabled": false}`` 零参与（A6 开关回归，
+      连会话都不建——不产生任何副作用）；
+    - ``dry_run=true`` → 只选择不激活（A1 观测）；
+    - ``limit`` 缺省读 ``LMS_E3_REACTIVATE_MAX``（dandan 拍板放宽=2）；
+    - 与 /store 同等做梦协调（acquire_conversation 防并发写记忆状态）；
+      做梦冲突返回软 busy 体（fail-open——self_pulse 触发失败不影响主流程，
+      E-1 先例：非 2xx 即视为降级）。
+    """
+    if not _e3_enabled_server():
+        return {"enabled": False, "session_id": req.session_id,
+                "note": "LMS_E3_ENABLED=0（总开关关，零参与）"}
+    sm = get_session_manager()
+    scheduler = get_dream_scheduler()
+    loop = sm.get_or_create(req.session_id)
+    scheduler.register_session(req.session_id)
+    acquired = scheduler.acquire_conversation(req.session_id)
+    scheduler.touch(req.session_id)
+    if not acquired:
+        return {"enabled": True, "busy": True, "session_id": req.session_id,
+                "note": "系统正在做梦（记忆巩固中），请稍后重试。"}
+    try:
+        result = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: loop.e3_reactivate(
+                dry_run=req.dry_run, limit=req.limit))
+    finally:
+        scheduler.release_conversation(req.session_id)
+    result["session_id"] = req.session_id
+    return result
 
 
 @app.get("/status/{session_id}")

@@ -5,9 +5,15 @@
 
 前缀协议（纯工程接口，溯源 §4.2）：
     [doubt] conflict: <被反驳的旧记忆文本摘要>     → 证伪（rebuttal +1，labile）
+    [doubt] 证伪: <同 conflict>                    → 别名（E3 拍板 2：证伪收编）
+    [doubt] reactivate: <同 conflict>              → 别名（E3 拍板 2：重激活收编）
     [doubt] fok: <未决问题>                        → A 类缺口登记
     [doubt] lowconf: <低置信条目文本摘要>           → B 类缺口登记
     [doubt] event: <事件描述>                      → 仅登记（诊断）
+
+E3（2026-08-20，dandan 拍板 2）：'证伪'/'reactivate' 别名在解析时归一为
+'conflict' 语义（证伪收编进 conflict）；conflict 证伪命中补入队（根因 3
+修复：labile 带证据进再巩固候选队列，独立受队列开关治理）。
 
 fail-open：无前缀/解析失败 = 普通塑形，逐字节不变（红线）。
 """
@@ -24,6 +30,9 @@ from core.doubt.reconsolidation import mark_labile
 _DOUBT_PREFIX_RE = re.compile(
     r"^\s*\[doubt\]\s*(\w+)\s*:\s*(.+)$", re.I | re.S)
 _KNOWN_KINDS = {'conflict', 'fok', 'lowconf', 'event'}
+# E3（dandan 拍板 2，2026-08-20：证伪收编）：'证伪'/'reactivate' 别名 →
+# conflict 语义（解析时归一为 canonical kind，下游分支零改动）。
+_KIND_ALIASES = {'证伪': 'conflict', 'reactivate': 'conflict'}
 # 结构化摄入不再作为普通对话入库（系统事件不是对话，同 8/10 垃圾过滤哲学）
 _DOUBT_EVENT_RE = re.compile(r"^\s*\[doubt\]", re.I)
 
@@ -36,13 +45,18 @@ def is_doubt_event(text: str) -> bool:
 
 
 def parse_doubt_event(text: str) -> Optional[dict]:
-    """解析 [doubt] 前缀协议 → {kind, content}；解析失败返回 None（fail-open）。"""
+    """解析 [doubt] 前缀协议 → {kind, content}；解析失败返回 None（fail-open）。
+
+    E3（拍板 2）：'证伪'/'reactivate' 别名在解析时归一为 'conflict'——
+    下游按 conflict 分支处理（证伪收编进 conflict 语义）。
+    """
     if not text:
         return None
     m = _DOUBT_PREFIX_RE.match(text.strip())
     if not m:
         return None
     kind = m.group(1).strip().lower()
+    kind = _KIND_ALIASES.get(kind, kind)
     if kind not in _KNOWN_KINDS:
         return None
     content = m.group(2).strip()[:300]
@@ -51,12 +65,15 @@ def parse_doubt_event(text: str) -> Optional[dict]:
     return {'kind': kind, 'content': content}
 
 
-def ingest(loop, text: str) -> Optional[dict]:
+def ingest(loop, text: str, target_entry=None) -> Optional[dict]:
     """结构化摄入（process_turn /feed 路径调用，fail-open）。
 
     参数:
         loop: LivingMemoryLoop（提供 gap_registry / memory）。
         text: 当前轮文本。
+        target_entry: E3 重激活专用（可选）——conflict 事件的目标条目已由
+            选择器定位时显式传入，跳过文本重叠匹配（旧调用方不传 → 行为
+            逐位不变）。纯增量参数，fail-open（异常回退重叠匹配）。
 
     返回:
         摄入事件 dict（含 kind/content/action），非怀疑事件返回 None。
@@ -71,12 +88,21 @@ def ingest(loop, text: str) -> Optional[dict]:
         registry = getattr(loop, 'gap_registry', None)
         if kind == 'conflict':
             # 证伪：在 episodic 中找内容重叠的旧记忆 → rebuttal +1 + labile
-            hit = _find_overlapping_entry(loop, content)
+            try:
+                hit = target_entry if target_entry is not None \
+                    else _find_overlapping_entry(loop, content)
+            except Exception:  # pylint: disable=broad-except
+                hit = _find_overlapping_entry(loop, content)
             if hit is not None:
                 mark_labile(hit, violated_by=content)
                 action = 'rebutted'
                 hit_entry = hit
                 detail = 'conflict 事件（已标记证伪条目）'
+                # E3（根因 3 修复）：conflict 证伪命中 → 补入队（写侧时相
+                # INJECTION——队列契约"入队只允许写侧时相"）。labile 条目
+                # 带证据进再巩固候选队列，梦期/巩固期消化。独立受队列自身
+                # 开关（LMS_DOUBT_RECONSOLIDATION_ENABLED）治理；fail-open。
+                _enqueue_conflict_hit(loop, hit, content)
             else:
                 detail = 'conflict 事件（未找到重叠条目）'
             if registry is not None:
@@ -102,6 +128,26 @@ def ingest(loop, text: str) -> Optional[dict]:
     # 收集 conformal 校准集 + 标记负性证据（对称性约束）。纯增量字段，
     # 旧调用方无感。
     return {**ev, 'action': action, 'entry': hit_entry}
+
+
+def _enqueue_conflict_hit(loop, hit, content: str) -> bool:
+    """E3（根因 3 修复）：conflict 证伪命中 → 补入队（写侧时相 INJECTION）。
+
+    labile 标记后把候选带证据登记进再巩固候选队列（R3 C1 接线缺口修复：
+    labile 不进队列 → 队列恒空 → rewritten 恒 0）。fail-open：任何异常
+    返回 False，绝不阻断证伪标记与主循环。独立受队列自身开关治理
+    （LMS_DOUBT_RECONSOLIDATION_ENABLED，默认 1=开——队列是 R3 机制本体）。
+    """
+    try:
+        q = getattr(loop, 'reconsolidation_queue', None)
+        if q is None or not q.enabled:
+            return False
+        from core.doubt.state_machine import DoubtPhase
+        return bool(q.enqueue(
+            hit, reason="doubt_conflict_labile", score=None,
+            detail=str(content)[:300], phase=DoubtPhase.INJECTION.value))
+    except Exception:  # pylint: disable=broad-except
+        return False
 
 
 def _find_overlapping_entry(loop, content: str):

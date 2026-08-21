@@ -30,6 +30,10 @@
     "reconsolidation_wired_in_consolidation_phase": {
       "statement": "R3（C1 接线，语义决策 D-2026-08-18-01 运行时落地）：loop 巩固期（doubt_check 后、state_update 前——9 步固化不加步）调用 reconsolidation_queue.maybe_rewrite（三闸门机器防线 G1 候选在队/G2 巩固期时相/G3 写侧委托 state_machine 巩固时相入口）；入队只允许写侧时相（注入 suspect 标记后 / 去稳定化 labile 登记，写侧入队即落盘）；检索路径零改写保持（只读四不变不破坏——/recall 与 /react 只读口不经过巩固期）",
       "verified_by": "tests/test_loop_reconsolidation_labile.py"
+    },
+    "e3_switch_off_bitwise_equivalent": {
+      "statement": "E3（自我怀疑驱动的主动调节，dandan 拍板 2026-08-20）：总开关 LMS_E3_ENABLED 默认 0=关——关时选择器/重激活/satiety/min-age 全部新路径零参与，行为与开关引入前逐位一致（e3_reactivate 返回 enabled:false，min-age 闸门不生效）；开时受 LMS_E3_MIN_AGE_TURNS（默认 1）/ LMS_E3_SATIETY_COOLDOWN_H（默认 12）/ LMS_E3_REACTIVATE_MAX（默认 2）治理",
+      "verified_by": "tests/test_e3_reactivation.py"
     }
   }
 }
