@@ -635,7 +635,11 @@ class LivingMemoryLoop:
         _doubt_action = None
         try:
             from core.doubt.doubt_ingest import ingest as doubt_ingest
-            ev = doubt_ingest(self, text)
+            # E3 生产适配（2026-08-21 部署验证发现）：ingest 用原始 user_input
+            # 而非拼接 text（"用户: [doubt]..." 带前缀导致 parse_doubt_event
+            # 的 ^ 锚定 match 失败→摄入空转）。[doubt] 协议定义=输入以 [doubt]
+            # 开头；llm_output 侧带 [doubt] 由注入检查（injection_check）处理。
+            ev = doubt_ingest(self, user_input)
             if ev:
                 _doubt_action = ev.get('action')
                 # E3（satiety 恢复路径，设计 §3.2 ⑤）：新 [doubt] 事件 →
