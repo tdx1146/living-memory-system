@@ -15,14 +15,26 @@ gap_registry（登记）→ /status doubt.gaps + 回魂怀疑灯。
 
 from __future__ import annotations
 
+import json
+import os
 import time
 from typing import Dict, List, Optional
 
 
 class GapRegistry:
-    """信息缺口登记（进程内内存状态）。"""
+    """信息缺口登记（进程内内存状态 + 持久化镜像）。
 
-    def __init__(self) -> None:
+    E3 持久化（2026-08-21 部署验证发现：重启后 fok_unresolved 清零 → E3
+    候选源丢失）：A/B/C + resolved 列表经 _PERSIST_PATH jsonl 落盘，
+    启动时 load 恢复；写侧 fail-open（落盘失败不影响登记）。
+    """
+
+    _PERSIST_PATH = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__)))),
+        'data', 'gap_registry.json')
+
+    def __init__(self, persist_path: Optional[str] = None) -> None:
         # A/B/C 三类缺口（C 类仅诊断）
         self._fok_unresolved: List[Dict] = []          # A 类
         self._low_confidence_unreviewed: List[Dict] = []  # B 类
@@ -34,6 +46,51 @@ class GapRegistry:
             'reviewed': 0, 'downgraded': 0, 'rewritten': 0,
             'kept': 0, 'flagged': 0,
         }
+        if persist_path:
+            self._PERSIST_PATH = persist_path
+        self._load()
+
+    # ------------------------------------------------------------------ #
+    #  持久化（E3 2026-08-21：重启不丢候选源）
+    # ------------------------------------------------------------------ #
+
+    def _load(self) -> None:
+        """启动恢复：读 jsonl 镜像（缺省/损坏 → 空，fail-open）。"""
+        try:
+            if not os.path.exists(self._PERSIST_PATH):
+                return
+            with open(self._PERSIST_PATH, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            self._fok_unresolved = list(
+                data.get('fok_unresolved', []) or [])[-50:]
+            self._low_confidence_unreviewed = list(
+                data.get('low_confidence_unreviewed', []) or [])[-50:]
+            self._explore_dims = list(
+                data.get('explore_dims', []) or [])
+            self._fok_resolved = list(
+                data.get('fok_resolved', []) or [])[-100:]
+            self._last_review = data.get('last_review')
+        except Exception:  # pylint: disable=broad-except
+            pass
+
+    def _persist(self) -> None:
+        """落盘镜像（fail-open：写失败不影响登记主流程）。"""
+        try:
+            data = {
+                'fok_unresolved': self._fok_unresolved,
+                'low_confidence_unreviewed':
+                    self._low_confidence_unreviewed,
+                'explore_dims': self._explore_dims,
+                'fok_resolved': self._fok_resolved,
+                'last_review': self._last_review,
+                'ts': time.time(),
+            }
+            tmp = self._PERSIST_PATH + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False)
+            os.replace(tmp, self._PERSIST_PATH)
+        except Exception:  # pylint: disable=broad-except
+            pass
 
     # ------------------------------------------------------------------ #
     #  登记
@@ -48,6 +105,7 @@ class GapRegistry:
             'ts': ts if ts is not None else time.time(),
         })
         self._fok_unresolved = self._fok_unresolved[-50:]
+        self._persist()
 
     def register_low_confidence(self, entry, ts: Optional[float] = None) -> None:
         """B 类：低置信未复核条目登记（按 entry 文本去重，上限 50 条）。"""
@@ -70,6 +128,7 @@ class GapRegistry:
         ]
         self._low_confidence_unreviewed.append(record)
         self._low_confidence_unreviewed = self._low_confidence_unreviewed[-50:]
+        self._persist()
 
     def register_explore_dims(self, dims: List[int],
                               ts: Optional[float] = None) -> None:
@@ -108,6 +167,7 @@ class GapRegistry:
             r for r in self._fok_resolved if r.get('topic') != normalized]
         self._fok_resolved.append(record)
         self._fok_resolved = self._fok_resolved[-100:]
+        self._persist()
         # 同步移除未决（A 类）与低置信待复核（B 类）中的同 topic 记录
         self._fok_unresolved = [
             r for r in self._fok_unresolved
