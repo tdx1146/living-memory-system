@@ -1347,6 +1347,26 @@ class LivingMemoryLoop:
             return frozenset()
         return snaps[0]
 
+    def _e3_obs_infer(self, clue: str) -> float:
+        """档 2 观测性 infer（四妹审视 2026-08-21，LMS_E3_OBS_INFER=1 启用）：
+        对重激活线索跑一次零副作用 infer——编码线索 → attractor.infer(
+        update_internal_state=False) → 返回 surprise。不写 σ、不 learn、
+        不入 episodic、不污染 last_activation（观测专用）。fail-open None。
+        """
+        try:
+            vec = self.encoder.encode(
+                clue, self.tokenizer, self.embedder)
+            if vec is None:
+                return None
+            precision = self.purpose.get_precision()
+            act = self.attractor.infer(
+                vec.vector, precision,
+                num_steps=self.config.get('num_infer_steps', 10),
+                update_internal_state=False)
+            return round(float(act.surprise), 4)
+        except Exception:  # pylint: disable=broad-except
+            return None
+
     def _e3_build_clue(self, cand: dict) -> str:
         """生成重激活线索（无 LLM——dandan 拍板 3：免费版自动生成）。
 
@@ -1536,6 +1556,17 @@ class LivingMemoryLoop:
                     pending.append(cand)
                     if gate is not None:
                         gate.record_reactivation(cand.get("topic"))
+                    # 档 2（四妹审视 2026-08-21，env 默认关）：重激活线索跑
+                    # 一次观测性 infer（零副作用：不写 σ、不 learn、不入
+                    # episodic）——让"重激活→预测误差→惊讶"真实产生一个
+                    # 可判读数（A2 的观测修复，非机制强改）。
+                    if os.environ.get("LMS_E3_OBS_INFER", "0") == "1":
+                        try:
+                            _obs = self._e3_obs_infer(clue)
+                            if _obs is not None:
+                                result["obs_surprise"] = _obs
+                        except Exception:  # pylint: disable=broad-except
+                            pass
                     continue
                 # 路径 B（兜底）：普通 store → FEP surprise → 去稳定化
                 if self._e3_reactivate_path_b(clue):
