@@ -863,7 +863,12 @@ class TestVerificationWriteSide:
         assert getattr(entry, "doubt_state", "stable") == "stable"
 
     def test_loop_process_turn_applies_conflicts(self, tmp_path, monkeypatch):
-        """process_turn 自动应用：CONFLICT 结果 → [doubt] conflict → labile。"""
+        """process_turn 自动应用：CONFLICT 结果 → [doubt] conflict → 再巩固改写。
+
+        E3（根因 3 修复，2026-08-20）：conflict 证伪命中补入队 → 巩固期
+        受控改写消化 → 条目终态 superseded（原断言 labile 停留在中间态，
+        现断言证伪→再巩固全链收口的终态——候选不再被丢在半路）。
+        """
         monkeypatch.setenv("LMS_VERIFICATION_CHAIN_ENABLED", "1")
         loop = self._make_loop(tmp_path)
         loop.process_turn("用户: 蓝色小橘猫很可爱")
@@ -874,7 +879,8 @@ class TestVerificationWriteSide:
             req.idempotency_key, reference_claims=["蓝色小橘猫很可爱"])
         assert loop.verification_chain.pending_conflicts(), "待应用"
         loop.process_turn("用户: 无关内容")
-        assert entry.labile is True
+        assert getattr(entry, "doubt_state", "stable") == "superseded"
+        assert entry.rebuttal_count == 1
         assert loop.verification_chain.pending_conflicts() == []
 
     def test_loop_write_side_default_off(self, tmp_path):
@@ -987,19 +993,28 @@ class TestLoopIntegrationM3:
             assert getattr(e, "doubt_state", "stable") == "stable"
 
     def test_loop_conflict_syncs_native_field(self, tmp_path):
-        """[doubt] conflict 证伪经 loop：平坦字段 + 原生字段同步（写侧）。"""
+        """[doubt] conflict 证伪经 loop：平坦字段 + 原生字段同步（写侧）。
+
+        E3（根因 3 修复，2026-08-20）：conflict 证伪命中补入队 → 本回合
+        巩固期再巩固消化（E3 关无 min-age 闸门）→ 条目终态 superseded、
+        labile 时相复位、原生字段最后一次写者为 consolidation（巩固时相
+        合法写者）——证伪→再巩固全链收口（原断言 labile 停留在中间态）。
+        """
         loop = self._make_loop(tmp_path)
         loop.process_turn("用户: 我喜欢蓝色小橘猫")
         loop.process_turn("[doubt] conflict: 我喜欢蓝色小橘猫")
         e = list(loop.memory.iter_episodic())[-1]
         assert e.rebuttal_count == 1
-        assert e.labile is True
+        assert getattr(e, "doubt_state", "stable") == "superseded"
+        assert e.labile is False  # labile 时相已复位（改写已落库）
         rc = get_rebuttal_consistency(e)
-        assert rc["updated_by"] == "ingest"
-        # consistency = 证伪时点快照（mark_rebutted 后置信度=0.0；随后
-        # _retrieve_episodic 的正向佐证把平坦 confidence 抬到 0.5——结构化
-        # 字段保存的是写侧时相写入值，不被后续只读路径改写）
-        assert rc["consistency"] == 0.0
+        # 证伪写侧（ingest）与巩固写侧（consolidation）均为合法写者；
+        # 终态写者 = 最后一次状态转移（consolidation_resolve 写侧入口）
+        assert rc["updated_by"] == "consolidation"
+        assert isinstance(rc["consistency"], float)
+        # consistency = 巩固写侧时点快照（consolidation_resolve rewritten
+        # 分支写入；随后只读路径不改写结构化字段——写者守卫铁律）
+        assert rc["consistency"] == pytest.approx(e.confidence, abs=1e-3)
         assert e.confidence == pytest.approx(0.5, abs=1e-3)
 
     def test_recall_readonly_four_invariants_hold_with_native(self, tmp_path):

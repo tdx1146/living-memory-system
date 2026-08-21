@@ -27,6 +27,8 @@ class GapRegistry:
         self._fok_unresolved: List[Dict] = []          # A 类
         self._low_confidence_unreviewed: List[Dict] = []  # B 类
         self._explore_dims: List[Dict] = []            # C 类（仅诊断）
+        # E3 satiety：已消解悬案（fok_resolved——消解历史，不随复核轮清空）
+        self._fok_resolved: List[Dict] = []
         self._last_review: Optional[float] = None      # 最近一次做梦复核时间
         self._review_stats: Dict = {                   # 最近复核报告
             'reviewed': 0, 'downgraded': 0, 'rewritten': 0,
@@ -81,16 +83,78 @@ class GapRegistry:
         }]
 
     # ------------------------------------------------------------------ #
+    #  E3 satiety：消解登记（fok_resolved）
+    # ------------------------------------------------------------------ #
+
+    def mark_resolved(self, topic: str, detail: str = "",
+                      ts: Optional[float] = None) -> bool:
+        """E3 satiety：悬案消解登记（尽力而为不无限怀疑的落点）。
+
+        追加消解记录到 ``_fok_resolved``（上限 100 条，防膨胀），并同步
+        从 A/B 类缺口移除同 topic 记录（消解后不再出现在怀疑灯）。幂等：
+        同 topic 重复登记只留最新。返回是否新增登记。
+        """
+        normalized = str(topic)[:120]
+        if not normalized:
+            return False
+        record = {
+            'topic': normalized,
+            'detail': str(detail)[:300],
+            'ts': ts if ts is not None else time.time(),
+        }
+        existed = any(
+            r.get('topic') == normalized for r in self._fok_resolved)
+        self._fok_resolved = [
+            r for r in self._fok_resolved if r.get('topic') != normalized]
+        self._fok_resolved.append(record)
+        self._fok_resolved = self._fok_resolved[-100:]
+        # 同步移除未决（A 类）与低置信待复核（B 类）中的同 topic 记录
+        self._fok_unresolved = [
+            r for r in self._fok_unresolved
+            if r.get('topic') != normalized]
+        self._low_confidence_unreviewed = [
+            r for r in self._low_confidence_unreviewed
+            if (r.get('text') or '')[:120] != normalized]
+        return not existed
+
+    def is_resolved(self, topic: str) -> bool:
+        """该悬案是否已消解（选择器排除集数据源，只读）。"""
+        normalized = str(topic)[:120]
+        return any(
+            r.get('topic') == normalized for r in self._fok_resolved)
+
+    def resolved_list(self) -> List[Dict]:
+        """已消解悬案记录（只读拷贝）。"""
+        return list(self._fok_resolved)
+
+    def resolved_count(self) -> int:
+        """已消解悬案计数（A5 观测数据源）。"""
+        return len(self._fok_resolved)
+
+    # ------------------------------------------------------------------ #
     #  复核联动
     # ------------------------------------------------------------------ #
 
-    def mark_review(self, stats: Optional[Dict] = None) -> None:
-        """做梦 doubt_review 完成后调用：记录时间 + 复核报告。"""
+    def mark_review(self, stats: Optional[Dict] = None,
+                    resolved_topics: Optional[List[str]] = None) -> None:
+        """做梦 doubt_review 完成后调用：记录时间 + 复核报告。
+
+        E3 联动（2026-08-20）：
+          - ``resolved_topics``（可选）：本次复核判定已消解的悬案列表，
+            一并 ``mark_resolved``（satiety 落点；调用方也可逐条调用）。
+          - ``_fok_resolved`` 是消解历史，**不**随复核轮清空（与 B 类
+            不同——B 类清空是"已复核一轮"，消解史是"已闭环"）。
+        """
         self._last_review = time.time()
         if stats:
             for k in ('reviewed', 'downgraded', 'rewritten', 'kept', 'flagged'):
                 if k in stats:
                     self._review_stats[k] = int(stats.get(k, 0) or 0)
+        for topic in (resolved_topics or []):
+            try:
+                self.mark_resolved(topic, detail='做梦复核判定消解')
+            except Exception:  # pylint: disable=broad-except
+                pass
         # B 类清空（已复核一轮）；A 类保留（fok 未决不随单轮复核消失）
         self._low_confidence_unreviewed = []
 
@@ -99,11 +163,12 @@ class GapRegistry:
     # ------------------------------------------------------------------ #
 
     def snapshot(self) -> Dict:
-        """/status doubt.gaps 数据源（A/B 类 + C 类诊断）。"""
+        """/status doubt.gaps 数据源（A/B 类 + C 类诊断 + E3 消解史）。"""
         return {
             'fok_unresolved': list(self._fok_unresolved),
             'low_confidence_unreviewed': list(self._low_confidence_unreviewed),
             'explore_dims': list(self._explore_dims),  # C 类：仅诊断
+            'fok_resolved': list(self._fok_resolved),  # E3 satiety 消解史
         }
 
     def doubt_lamp(self) -> Dict:

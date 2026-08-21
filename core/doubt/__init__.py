@@ -27,6 +27,17 @@ M3-2（同一规格 §2.2 判定细节）：
                     信号，不输出可被优化的分数（Pan 警示）；经
                     DoubtStateMachine.purpose_drift_check 委托接入
 
+labile 平衡（R3 核心——语义决策 D-2026-08-18-01 代码化）：
+  - reconsolidation_queue: 再巩固候选队列（跨重启持久化）+ 巩固期受控
+                    改写（三闸门：候选在队/巩固期触发/改写受控）——
+                    检索不塑形 + 巩固期再巩固
+
+E3（自我怀疑驱动的主动调节，dandan 拍板 2026-08-20 22:14）：
+  - epistemic_selector: 悬案选择器纯函数（信息增益×学习进度×可达性排序，
+                    无 LLM、纯 stdlib、可单测）
+  - satiety:          消解判定（judge_resolved）+ SatietyGate（冷却/计数/
+                    武装-待机——终止信号防 OCD 化；冷却 12h 按拍板放宽）
+
 模块（既有）：
   - confidence_field: 置信度场纯函数（更新/重算/强制降权/来源信任）
   - reconsolidation:  惊讶度双角色-角色2（去稳定化，labile 标记）
@@ -143,6 +154,33 @@ MODULE_CLAIMS: dict = {
                            "TestVerificationChainFullChain::"
                            "test_verify_provenance_full_trail",
         },
+        "reconsolidation_retrieval_no_reshape": {
+            "statement": "检索不塑形（语义决策 D-2026-08-18-01）：检索时相"
+                         "入队被拒（零副作用）；队列只读接口绝不 setattr "
+                         "条目——检索路径零改写保持",
+            "verified_by": "tests/test_reconsolidation_queue.py::"
+                           "TestThreeGates::"
+                           "test_retrieval_phase_enqueue_rejected",
+        },
+        "reconsolidation_three_gates": {
+            "statement": "巩固期受控改写三闸门机器防线：候选在队/"
+                         "巩固期触发/改写受控——任一不过 → 不改写",
+            "verified_by": "tests/test_reconsolidation_queue.py::"
+                           "TestThreeGates::test_gate1_candidate_in_queue",
+        },
+        "reconsolidation_persistent": {
+            "statement": "候选队列跨重启持久化：写侧入队即落盘（原子写），"
+                         "重启加载后候选仍在——再巩固不因进程重启丢失",
+            "verified_by": "tests/test_reconsolidation_queue.py::"
+                           "TestPersistence::test_survives_restart",
+        },
+        "reconsolidation_controlled_append": {
+            "statement": "改写受控：巩固完成只留 append-only 演化史登记"
+                         "（process_core.append_transition，写者 "
+                         "consolidation）——绝不覆盖历史",
+            "verified_by": "tests/test_reconsolidation_queue.py::"
+                           "TestThreeGates::test_controlled_append_only",
+        },
     },
 }
 
@@ -205,6 +243,11 @@ from core.doubt.state_machine import (  # noqa: E402
     doubt_injection_enabled,
     is_high_surprise,
 )
+from core.doubt.reconsolidation_queue import (  # noqa: E402
+    ReconsolidationQueue,
+    entry_key,
+    reconsolidation_enabled,
+)
 from core.doubt.purpose_drift import (  # noqa: E402
     PurposeDriftPhase,
     purpose_drift_enabled,
@@ -212,6 +255,14 @@ from core.doubt.purpose_drift import (  # noqa: E402
 from core.doubt.precision_adapt import (  # noqa: E402
     PrecisionLearnState,
     precision_learn_enabled,
+)
+from core.doubt.epistemic_selector import (  # noqa: E402
+    default_weights,
+    select_cases,
+)
+from core.doubt.satiety import (  # noqa: E402
+    SatietyGate,
+    judge_resolved,
 )
 
 __all__ = [
@@ -270,10 +321,19 @@ __all__ = [
     "compute_rebuttal_hit",
     "doubt_injection_enabled",
     "is_high_surprise",
+    # reconsolidation_queue（R3 labile 平衡——D-2026-08-18-01）
+    "ReconsolidationQueue",
+    "entry_key",
+    "reconsolidation_enabled",
     # purpose_drift（总任务书 §二.5：目的检查时相）
     "PurposeDriftPhase",
     "purpose_drift_enabled",
     # precision_learn（ABC §S3：π = 1/Var 估计 + lr_multiplier 跟随 π）
     "PrecisionLearnState",
     "precision_learn_enabled",
+    # E3（方案-E3自我怀疑驱动调节-20260820.md §3.3：纯函数选料器 + satiety）
+    "default_weights",
+    "select_cases",
+    "SatietyGate",
+    "judge_resolved",
 ]
