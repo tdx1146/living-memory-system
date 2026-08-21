@@ -28,7 +28,7 @@ from core.doubt.reconsolidation import mark_labile
 
 # [doubt] 前缀协议（大小写不敏感；内容支持跨行，取前 300 字）
 _DOUBT_PREFIX_RE = re.compile(
-    r"^\s*\[doubt\]\s*(\w+)\s*:\s*(.+)$", re.I | re.S)
+    r"^\s*\[doubt\]\s*(\w+)\s*[:：]\s*(.+)$", re.I | re.S)
 _KNOWN_KINDS = {'conflict', 'fok', 'lowconf', 'event'}
 # E3（dandan 拍板 2，2026-08-20：证伪收编）：'证伪'/'reactivate' 别名 →
 # conflict 语义（解析时归一为 canonical kind，下游分支零改动）。
