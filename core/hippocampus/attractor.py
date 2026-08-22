@@ -371,6 +371,182 @@ class AllostaticJController:
             return {'enabled': True}
 
 
+class HomeostaticBias:
+    """HomeostaticBias 滑动设定点控制器（方案 B，2026-08-22，dandan 拍板）。
+
+    依据：Turrigiano 稳态可塑性"滑动阈值/设定点"（PubMed 10322495）——bias
+    （工作点/静息电位）缓慢滑向目标平均活跃度；FEP 语义下 bias=先验均值×精度。
+    结构照抄亲哥哥 AllostaticJController（attractor.py:130-371）——纯进程内存、
+    开关关=零参与逐字节不变、冷启动攒基线、persist 防抖、step 重锚、钳制区间。
+
+    与 allostatic J 的分工（不打架）：
+      - J（哥哥）：管预测结构强度（surprise 创新带，Mehra 1970）。
+      - bias（弟弟）：管工作点/静息活跃度（mean|σ| 目标带，Turrigiano）。
+      饱和/崩塌信号两者都会看到：方向一致无害；若反向，以 J（结构信号）优先。
+
+    参数（全 env 化，开关 LMS_BIAS_ADAPT 默认 0=关）：
+        LMS_BIAS_INIT                   初始 bias（默认 1.5 = 手调现状）
+        LMS_BIAS_ADAPT_TARGET_LO/HI     mean|σ| 目标带（默认 0.30/0.60，文献带）
+        LMS_BIAS_ADAPT_STEP             重锚步长（默认 0.05，比 J 的 0.5 慢一个量级）
+        LMS_BIAS_ADAPT_PERSIST          越带持续轮数（默认 5，防单轮抖动）
+        LMS_BIAS_ADAPT_MIN/MAX          设定点钳制（默认 0.5/2.5，文献非线性带）
+        LMS_BIAS_ADAPT_MIN_SAMPLES      冷启动窗口样本数（默认 30，与 allostatic 同步热身）
+        LMS_BIAS_ADAPT_SAT_FRAC / COL_ACT  σ 饱和/崩塌判定（复用 allostatic 口径）
+    """
+
+    def __init__(self, init_bias: float = 1.5, input_dim: int = 0,
+                 target_lo: float = 0.30, target_hi: float = 0.60,
+                 step: float = 0.05, persist: int = 5,
+                 bias_min: float = 0.5, bias_max: float = 2.5,
+                 min_samples: int = 30, sat_frac: float = 0.9,
+                 col_act: int = 5) -> None:
+        self.enabled = True  # 由 AttractorNetwork 构造时按 env 决定是否实例化
+        self.input_dim = int(input_dim)
+        self.init_bias = float(init_bias)
+        self.target_lo = float(target_lo)
+        self.target_hi = float(target_hi)
+        self.step = float(step)
+        self.persist = int(persist)
+        self.bias_min = float(bias_min)
+        self.bias_max = float(bias_max)
+        self.min_samples = int(min_samples)
+        self.sat_frac = float(sat_frac)
+        self.col_act = int(col_act)
+
+        # 设定点（初始 = env 现值，不另设固定值）
+        self.bias: float = max(self.bias_min, min(self.bias_max, self.init_bias))
+
+        # 活跃度窗口（mean|σ| 序列，Turrigiano 目标跟踪）
+        self.activity_window: Deque[float] = deque(maxlen=200)
+        # 越带连续计数（persist 确认用）
+        self._below_streak: int = 0
+        self._above_streak: int = 0
+        # 最近观测（供日志/快照）
+        self.last_mean_abs: float = 0.0
+        self.last_frac_gt0_9: float = 0.0
+        self.last_act05: int = 0
+        # 可观测：重锚事件 + bias 历史
+        self.events: Deque[dict] = deque(maxlen=20)
+        self.bias_history: Deque[float] = deque(maxlen=200)
+
+    def update(self, sigma_state) -> float:
+        """每轮观测（σ 激活态）→ 更新 bias 滑动设定点。
+
+        返回新的 bias。冷启动（窗口 < min_samples）保持初始值不动（"渐渐"）。
+        重锚决策（优先级：σ 硬信号 > 活跃度带）:
+            饱和（frac_gt0.9 ≥ sat_frac）          → bias −step（场太闹，冷静）
+            崩塌（act05 ≤ col_act）                → bias +step（场死了，叫醒）
+            活跃度持续低于 target_lo（达 persist）  → bias +step（场睡回去，唤醒）
+            活跃度持续高于 target_hi（达 persist）  → bias −step（场过激，降温）
+            否则                                    → 不变（动态稳）
+        """
+        # 观测登记（冷启动也登记，只是不动作）
+        try:
+            stats = compute_sigma_stats(sigma_state)
+        except Exception as e:  # pylint: disable=broad-except
+            logger.warning("HomeostaticBias: σ 统计失败（fail-open 中性）: %s", e)
+            return self.bias
+        if not stats.valid:
+            return self.bias
+
+        # 活跃度 = 非感官（潜变量）节点的 mean|σ|（感官节点被输入钳制驱动，
+        # 反映的是输入不是工作点；input_dim=0 时退化观测全部节点）
+        try:
+            s = sigma_state.detach().cpu().abs()
+            if self.input_dim and s.numel() > self.input_dim:
+                mean_abs = float(s[self.input_dim:].mean())
+            else:
+                mean_abs = float(s.mean())
+        except Exception as e:  # pylint: disable=broad-except
+            logger.warning("HomeostaticBias: 活跃度计算失败（fail-open）: %s", e)
+            return self.bias
+        if not math.isfinite(mean_abs):
+            return self.bias
+
+        self.activity_window.append(mean_abs)
+        self.last_mean_abs = mean_abs
+        self.last_frac_gt0_9 = float(stats.frac_gt0_9)
+        self.last_act05 = int(stats.act05)
+
+        if len(self.activity_window) < self.min_samples:
+            return self.bias  # 冷启动：保持初始设定点（渐渐）
+
+        sat = stats.frac_gt0_9 >= self.sat_frac
+        col = stats.act05 <= self.col_act
+
+        # 活跃度带越界计数（persist 防抖）
+        if mean_abs < self.target_lo:
+            self._below_streak += 1
+            self._above_streak = 0
+        elif mean_abs > self.target_hi:
+            self._above_streak += 1
+            self._below_streak = 0
+        else:
+            self._below_streak = 0
+            self._above_streak = 0
+        persist_below = self._below_streak >= self.persist
+        persist_above = self._above_streak >= self.persist
+
+        # 重锚决策（σ 硬信号优先）
+        if sat:
+            new_bias, reason = self.bias - self.step, 'saturation'
+        elif col:
+            new_bias, reason = self.bias + self.step, 'collapse'
+        elif persist_below:
+            new_bias, reason = self.bias + self.step, 'activity-below-band'
+        elif persist_above:
+            new_bias, reason = self.bias - self.step, 'activity-above-band'
+        else:
+            new_bias, reason = self.bias, 'stable'
+
+        new_bias = max(self.bias_min, min(self.bias_max, new_bias))
+        if abs(new_bias - self.bias) > 1e-9:
+            logger.info(
+                "HomeostaticBias 重锚: %.4f → %.4f (%s, mean|σ|=%.3f, "
+                "frac_gt0.9=%.3f, act05=%d)",
+                self.bias, new_bias, reason, mean_abs,
+                self.last_frac_gt0_9, self.last_act05)
+            self.events.append({
+                'reason': reason,
+                'bias_before': round(self.bias, 4),
+                'bias_after': round(new_bias, 4),
+                'mean_abs': round(mean_abs, 4),
+            })
+            self.bias = new_bias
+        self.bias_history.append(self.bias)
+        return self.bias
+
+    def snapshot(self, turn_count: Optional[int] = None) -> dict:
+        """观测块（/status homeostatic_bias）。"""
+        try:
+            win = list(self.activity_window)
+            mean_a = (sum(win) / len(win)) if win else None
+            events = list(self.events)
+            return {
+                'enabled': True,
+                'bias': round(self.bias, 4),
+                'bias_initial': round(self.init_bias, 4),
+                'bias_min': self.bias_min,
+                'bias_max': self.bias_max,
+                'target_lo': self.target_lo,
+                'target_hi': self.target_hi,
+                'cold': len(win) < self.min_samples,
+                'window_n': len(win),
+                'min_samples': self.min_samples,
+                'mean_abs': round(mean_a, 4) if mean_a is not None else None,
+                'last_mean_abs': round(self.last_mean_abs, 4),
+                'last_frac_gt0_9': round(self.last_frac_gt0_9, 4),
+                'last_act05': self.last_act05,
+                'step': self.step,
+                'persist': self.persist,
+                'bias_history': [round(float(x), 4) for x in self.bias_history],
+                'events': events,
+            }
+        except Exception as e:  # pylint: disable=broad-except
+            logger.debug("HomeostaticBias snapshot 失败（fail-open）: %s", e)
+            return {'enabled': True}
+
+
 class AttractorNetwork:
     """FEP 吸引子网络：核心记忆引擎。
 
@@ -443,13 +619,51 @@ class AttractorNetwork:
             _bias_scale = float(os.environ.get("LMS_BIAS_SCALE", "0") or 0)
         except Exception:
             _bias_scale = 0.0
-        if _bias_scale > 0:
-            self.bias: torch.Tensor = torch.full(
-                (num_nodes,), _bias_scale, device=self.device)
-            logger.warning(
-                "LMS_BIAS_SCALE=%.3f 启用：bias 非零（场唤醒实验）", _bias_scale)
+        # 方案 B（2026-08-22 dandan 拍板）：LMS_BIAS_ADAPT=1 → HomeostaticBias
+        # 滑动设定点（Turrigiano 稳态可塑性）；=0/缺省 → 静态 bias（现状逐字节不变）。
+        _bias_adapt = os.environ.get("LMS_BIAS_ADAPT", "0").strip().lower() \
+            in ('1', 'true', 'yes', 'on')
+        if _bias_adapt:
+            _init_bias = _bias_scale if _bias_scale > 0 else 1.5
+            try:
+                self.homeostatic_bias = HomeostaticBias(
+                    init_bias=_init_bias,
+                    input_dim=input_dim,
+                    target_lo=float(os.environ.get(
+                        "LMS_BIAS_ADAPT_TARGET_LO", "0.30")),
+                    target_hi=float(os.environ.get(
+                        "LMS_BIAS_ADAPT_TARGET_HI", "0.60")),
+                    step=float(os.environ.get("LMS_BIAS_ADAPT_STEP", "0.05")),
+                    persist=int(os.environ.get("LMS_BIAS_ADAPT_PERSIST", "5")),
+                    bias_min=float(os.environ.get("LMS_BIAS_ADAPT_MIN", "0.5")),
+                    bias_max=float(os.environ.get("LMS_BIAS_ADAPT_MAX", "2.5")),
+                    min_samples=int(os.environ.get(
+                        "LMS_BIAS_ADAPT_MIN_SAMPLES", "30")),
+                )
+                self.bias: torch.Tensor = torch.full(
+                    (num_nodes,), self.homeostatic_bias.bias,
+                    device=self.device)
+                logger.warning(
+                    "LMS_BIAS_ADAPT=1 启用：bias 自适应滑动（HomeostaticBias，"
+                    "init=%.3f, 带[%.2f,%.2f], step=%.2f）",
+                    _init_bias, self.homeostatic_bias.target_lo,
+                    self.homeostatic_bias.target_hi, self.homeostatic_bias.step)
+            except Exception as e:  # pylint: disable=broad-except
+                # 自适应构造失败 → 回退静态（fail-open，绝不阻断构造）
+                logger.warning("HomeostaticBias 构造失败，回退静态 bias: %s", e)
+                self.homeostatic_bias = None
+                self.bias: torch.Tensor = torch.full(
+                    (num_nodes,), _init_bias, device=self.device)
         else:
-            self.bias: torch.Tensor = torch.zeros(num_nodes, device=self.device)
+            self.homeostatic_bias = None
+            if _bias_scale > 0:
+                self.bias: torch.Tensor = torch.full(
+                    (num_nodes,), _bias_scale, device=self.device)
+                logger.warning(
+                    "LMS_BIAS_SCALE=%.3f 启用：bias 非零（场唤醒实验）", _bias_scale)
+            else:
+                self.bias: torch.Tensor = torch.zeros(
+                    num_nodes, device=self.device)
 
         # 当前状态 sigma：初始为 0（中性状态）
         self.sigma: torch.Tensor = torch.zeros(num_nodes, device=self.device)
@@ -1149,15 +1363,22 @@ class AttractorNetwork:
         返回:
             更新后的 j_target_norm（设定点）。
         """
-        if self.allostatic is None:
+        if self.allostatic is None and self.homeostatic_bias is None:
             return self.j_target_norm
         try:
             if sigma_state is None:
                 sigma_state = self.sigma
             stats = compute_sigma_stats(sigma_state)
-            self.j_target_norm = self.allostatic.update(surprise, stats)
+            if self.allostatic is not None:
+                self.j_target_norm = self.allostatic.update(surprise, stats)
+            # 方案 B：HomeostaticBias 滑动设定点（每轮观测 σ 活跃度 → 重锚 bias）
+            if self.homeostatic_bias is not None:
+                new_bias = self.homeostatic_bias.update(sigma_state)
+                if abs(new_bias - float(self.bias.mean())) > 1e-9:
+                    self.bias = torch.full(
+                        (self.num_nodes,), new_bias, device=self.device)
         except Exception as e:  # pylint: disable=broad-except
-            logger.warning("allostatic J 更新失败（fail-open）: %s", e)
+            logger.warning("allostatic/bias 更新失败（fail-open）: %s", e)
         return self.j_target_norm
 
     def allostatic_snapshot(self, turn_count: Optional[int] = None) -> dict:
@@ -1168,6 +1389,15 @@ class AttractorNetwork:
         if self.allostatic is None:
             return {'enabled': False}
         return self.allostatic.snapshot(turn_count=turn_count)
+
+    def homeostatic_bias_snapshot(self) -> dict:
+        """观测块（/status homeostatic_bias；方案 B bias 滑动曲线）。
+
+        开关关（LMS_BIAS_ADAPT=0）→ {'enabled': False}（零参与）。
+        """
+        if getattr(self, 'homeostatic_bias', None) is None:
+            return {'enabled': False}
+        return self.homeostatic_bias.snapshot()
 
     def to(self, device: Union[str, torch.device]) -> 'AttractorNetwork':
         """将网络所有张量迁移到指定设备（E-P2-1）。

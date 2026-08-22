@@ -2891,6 +2891,15 @@ class LivingMemoryLoop:
             logger.debug(
                 "get_status allostatic_j 字段组装失败（fail-open）: %s", e)
 
+        # 方案 B（2026-08-22）：homeostatic_bias 观测块（bias 滑动曲线 +
+        # 重锚事件；开关关 → {'enabled': False}，零参与）。
+        try:
+            status['homeostatic_bias'] = \
+                self.attractor.homeostatic_bias_snapshot()
+        except Exception as e:  # pylint: disable=broad-except
+            logger.debug(
+                "get_status homeostatic_bias 字段组装失败（fail-open）: %s", e)
+
         # M5（§7.1）：turn 生命周期状态汇总观测（纯增量字段；未跑过
         # process_turn 时 last_turn_lifecycle 为 None → 提供空汇总提示——
         # §4.2 独立追加语义，旧客户端忽略）。
