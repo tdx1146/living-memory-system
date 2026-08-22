@@ -44,6 +44,11 @@ _GARBAGE_TEXT_RE = [
     re.compile(r"\[Subagent Task\]", re.I),                        # 子代理任务样板（无前缀变体实证）
     re.compile(r"\[Inter-session message\]", re.I),                # 跨会话转发样板（v1.4 S1-8）
     re.compile(r"\[梦醒\]", re.I),                                 # 梦醒回路注入样板（v1.4 S1-8）
+    # 2026-08-22 灰池修复：中文子代理样板（灰池 985 条实证，现有英文
+    # 模板 0 命中）。只滤明确样板串，不滤真实对话（同 8/10 哲学）。
+    re.compile(r"后台思考者", re.I),                               # "你是思考链的【后台思考者】"思考链注入样板
+    re.compile(r"隔离子代理", re.I),                               # 子代理隔离声明样板
+    re.compile(r"不唤醒不发言", re.I),                             # 后台代理行为约束样板
 ]
 _GARBAGE_FILTERED = 0  # 计数器（进程内，可被 status 读取）
 
