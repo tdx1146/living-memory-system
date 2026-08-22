@@ -248,34 +248,36 @@ class AllostaticJController:
             # 仅 surprise 带漂移逻辑生效；last_* 保留最近有效观测供日志/快照。
             sat = False
             col = False
-        if len(self.surprise_window) < self.min_samples:
-            return self.j_target  # 冷启动：保持初始设定点
-
-        # --- surprise 统计带（Mehra 1970 innovation）---
-        z = self._surprise_z(surprise)
-        if z > self.k:
-            self._above_streak += 1
-            self._below_streak = 0
-        elif z < -self.k:
-            self._below_streak += 1
-            self._above_streak = 0
-        else:
-            self._above_streak = 0
-            self._below_streak = 0
-        persist_above = self._above_streak >= self.persist
-        persist_below = self._below_streak >= self.persist
-
-        # --- 重锚决策 ---
+        # 2026-08-22 冷启动门修正（dandan 拍板：测试期绕过）：饱和/崩塌是结构
+        # 性硬信号（一帧即判，对应论文"越界触发重锚"本意），**绕过冷启动**；
+        # 只有 surprise 统计带漂移（需分布）才等 min_samples 窗口。
         if sat:
             new_target, reason = self.j_target - self.step, 'saturation'
         elif col:
             new_target, reason = self.j_target + self.step, 'collapse'
-        elif persist_above:
-            new_target, reason = self.j_target - self.step, 'surprise-above-band'
-        elif persist_below:
-            new_target, reason = self.j_target + self.step, 'surprise-below-band'
+        elif len(self.surprise_window) < self.min_samples:
+            return self.j_target  # 冷启动只挡统计带，不挡硬信号
         else:
-            new_target, reason = self.j_target, 'stable'
+            # --- surprise 统计带（Mehra 1970 innovation）---
+            z = self._surprise_z(surprise)
+            if z > self.k:
+                self._above_streak += 1
+                self._below_streak = 0
+            elif z < -self.k:
+                self._below_streak += 1
+                self._above_streak = 0
+            else:
+                self._above_streak = 0
+                self._below_streak = 0
+            persist_above = self._above_streak >= self.persist
+            persist_below = self._below_streak >= self.persist
+
+            if persist_above:
+                new_target, reason = self.j_target - self.step, 'surprise-above-band'
+            elif persist_below:
+                new_target, reason = self.j_target + self.step, 'surprise-below-band'
+            else:
+                new_target, reason = self.j_target, 'stable'
 
         new_target = max(self.j_min, min(self.j_max, new_target))
         if abs(new_target - self.j_target) > 1e-9:
@@ -468,11 +470,15 @@ class HomeostaticBias:
         self.last_frac_gt0_9 = float(stats.frac_gt0_9)
         self.last_act05 = int(stats.act05)
 
-        if len(self.activity_window) < self.min_samples:
-            return self.bias  # 冷启动：保持初始设定点（渐渐）
-
         sat = stats.frac_gt0_9 >= self.sat_frac
         col = stats.act05 <= self.col_act
+
+        # 2026-08-22 冷启动门修正（dandan 拍板：测试期绕过）：饱和/崩塌硬信号
+        # 一帧即判，绕过冷启动；只有活跃度带（需趋势）才等 min_samples 窗口。
+        if sat or col or len(self.activity_window) >= self.min_samples:
+            pass  # 走下方重锚逻辑
+        else:
+            return self.bias  # 冷启动只挡活跃度带，不挡硬信号
 
         # 活跃度带越界计数（persist 防抖）
         if mean_abs < self.target_lo:
