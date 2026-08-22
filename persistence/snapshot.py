@@ -326,7 +326,8 @@ class Snapshot:
              self_ref_state: Optional[dict] = None,
              session_id: Optional[str] = None,
              turn_count: Optional[int] = None,
-             last_entropy_ratio: Optional[float] = None) -> bool:
+             last_entropy_ratio: Optional[float] = None,
+             last_activation: Optional[dict] = None) -> bool:
         """保存吸引子景观和目的层状态到文件。
 
         0.5.0 新增：
@@ -360,6 +361,9 @@ class Snapshot:
             session_id: 会话标识（可选，0.5.0 顶层元数据）。
             turn_count: 当前轮次（可选，0.5.0 顶层元数据，供重启后连续）。
             last_entropy_ratio: 最近一轮熵比（可选，0.5.0 顶层元数据）。
+            last_activation: 最近一轮激活态序列化 dict（可选，[A10]——内部
+                参数，非端点签名）。为 None 时不保存该字段（旧快照无此键 →
+                load 侧优雅跳过，向后兼容）。
 
         返回:
             True 表示已保存；False 表示因写锁超时被跳过（fail-open）。
@@ -394,6 +398,10 @@ class Snapshot:
             data['turn_count'] = int(turn_count)
         if last_entropy_ratio is not None:
             data['last_entropy_ratio'] = float(last_entropy_ratio)
+        # [A10] 可选保存 last_activation（重启后 query_llm 首轮不再
+        # "[无记忆]"；None 不写键 → 旧快照无该键，load 侧优雅跳过）。
+        if last_activation is not None:
+            data['last_activation'] = last_activation
 
         # 确保目录存在
         dir_path = os.path.dirname(path)

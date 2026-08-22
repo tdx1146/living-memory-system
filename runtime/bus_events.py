@@ -212,7 +212,11 @@ class CircuitBreaker:
                 "max_failures": self.max_failures,
                 "cooldown_seconds": self.cooldown_seconds,
                 "consecutive_failures": self._failures,
-                "open": self.is_open(),
+                # [A2] 内联 open 判定，不再调 is_open()：status() 已持非重入
+                # threading.Lock，is_open() 二次 acquire 同一把锁 → 自死锁
+                # （任何状态观测接线 / quick_test 即挂线程）。is_open() 对外
+                # 契约不变。
+                "open": self._open_until > 0.0 and time.time() < self._open_until,
                 "tripped_count": self._tripped_count,
                 "total_failures": self._total_failures,
                 "total_successes": self._total_successes,

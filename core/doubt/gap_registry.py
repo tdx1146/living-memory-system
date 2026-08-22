@@ -133,6 +133,18 @@ class GapRegistry:
         union = len(ga | gb)
         return union > 0 and inter / union >= 0.4
 
+    def _same_case(self, a_topic: str, b_topic: str) -> bool:
+        """[A4][B7] 消解/判重与登记侧同构的归一化判定（_fok_core + _fok_similar）。
+
+        登记侧（register_fok_unresolved）用归一化核心 + 前缀/Jaccard 模糊去重；
+        旧消解/判重侧（mark_resolved/is_resolved）用原始 topic 精确相等 →
+        同一悬案换包装登记后永远无法被消解移除，E3 反复选中已闭环主题。
+        统一后三处共用同构判定；_fok_core 剥"用户:/助手:"与 [doubt] 前缀，
+        _fok_similar 已含精确相等短路，不会误并独立悬案（实测共享 ≤7 字不误并）。
+        """
+        ca, cb = self._fok_core(a_topic), self._fok_core(b_topic)
+        return bool(ca) and bool(cb) and self._fok_similar(ca, cb)
+
     def register_fok_unresolved(self, topic: str, detail: str = "",
                                 ts: Optional[float] = None) -> None:
         """A 类：fok 未决登记（上限 50 条，防膨胀）。
@@ -146,8 +158,9 @@ class GapRegistry:
         core = self._fok_core(topic)
         now = ts if ts is not None else time.time()
         for existing in self._fok_unresolved:
-            ex_core = self._fok_core(existing['topic'])
-            if core and self._fok_similar(core, ex_core):
+            # [A4] 统一走 _same_case（原内联 _fok_similar 判定，语义等价；
+            # 消解侧 mark_resolved/is_resolved 现用同一判定助手，避免漂移）。
+            if core and self._same_case(core, existing['topic']):
                 existing['ts'] = now
                 if detail:
                     existing['detail'] = str(detail)[:300]
@@ -215,17 +228,24 @@ class GapRegistry:
             'detail': str(detail)[:300],
             'ts': ts if ts is not None else time.time(),
         }
+        # [A4][B7] 幂等去重改用 _same_case（与登记侧同构）：登记侧模糊去重、
+        # 消解侧精确匹配 → 同悬案换包装登记后永远无法被消解移除。统一判定后
+        # 消解移除/判重与登记去重行为一致（B7 同根，一并覆盖）。
         existed = any(
-            r.get('topic') == normalized for r in self._fok_resolved)
+            self._same_case(r.get('topic', ''), normalized)
+            for r in self._fok_resolved)
         self._fok_resolved = [
-            r for r in self._fok_resolved if r.get('topic') != normalized]
+            r for r in self._fok_resolved
+            if not self._same_case(r.get('topic', ''), normalized)]
         self._fok_resolved.append(record)
         self._fok_resolved = self._fok_resolved[-100:]
         self._persist()
         # 同步移除未决（A 类）与低置信待复核（B 类）中的同 topic 记录
+        # [A4] A 类移除同样用 _same_case（旧精确匹配无法移除换包装悬案）；
+        # B 类按 text 去重（register_low_confidence 语义），保持原样。
         self._fok_unresolved = [
             r for r in self._fok_unresolved
-            if r.get('topic') != normalized]
+            if not self._same_case(r.get('topic', ''), normalized)]
         self._low_confidence_unreviewed = [
             r for r in self._low_confidence_unreviewed
             if (r.get('text') or '')[:120] != normalized]
@@ -234,8 +254,11 @@ class GapRegistry:
     def is_resolved(self, topic: str) -> bool:
         """该悬案是否已消解（选择器排除集数据源，只读）。"""
         normalized = str(topic)[:120]
+        # [A4][B7] 与登记侧同构的归一化判定：精确匹配无法识别换包装的已消解
+        # 悬案 → 已闭环主题被 E3 反复选中。
         return any(
-            r.get('topic') == normalized for r in self._fok_resolved)
+            self._same_case(normalized, r.get('topic', ''))
+            for r in self._fok_resolved)
 
     def resolved_list(self) -> List[Dict]:
         """已消解悬案记录（只读拷贝）。"""

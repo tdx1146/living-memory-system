@@ -159,14 +159,26 @@ run_hourly() {
 
     # 仅打包 snapshots/（轻量高频层）；data/ 与 logs/ 由每日全量覆盖。
     # 先写临时文件再原子 mv：中途失败不会留下半个归档冒充本轮备份。
-    if ! ( cd "$LMS_HOME" && tar --zstd -cf "$tmp_archive" \
+    # [C1] live 每 ~34s 写快照 → tar 报 "file changed as we read it" 退出码 1 属常态
+    # （--warning=no-file-changed 只抑制显示、不改变退出码，故不再使用，需保留 stderr 判别）；
+    # 归档内容仍完整，不能当失败丢弃归档（此前 hourly 连续多日失败，灾备只剩 15min 镜像一层）。
+    local err_file
+    err_file="$HOURLY_DIR/.lms-hourly-$stamp.err.$$"
+    ( cd "$LMS_HOME" && tar --zstd -cf "$tmp_archive" \
             --exclude='*.lock' --exclude='*.tmp' --exclude='*.swp' \
-            --warning=no-file-changed --warning=no-file-ignored \
-            snapshots ); then
-        rm -f "$tmp_archive" 2>/dev/null || true
-        fail "每小时归档 tar.zst 打包失败"
-        return 1
+            snapshots ) 2>"$err_file"
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        if [ "$rc" -eq 1 ] && grep -q 'file changed as we read it' "$err_file" 2>/dev/null; then
+            log "tar 因快照持续写入返回 1（file changed），归档内容仍完整，按成功处理"
+        else
+            rm -f "$tmp_archive" 2>/dev/null || true
+            rm -f "$err_file" 2>/dev/null || true
+            fail "每小时归档 tar.zst 打包失败（rc=$rc）"
+            return 1
+        fi
     fi
+    rm -f "$err_file" 2>/dev/null || true
     mv -f "$tmp_archive" "$archive"
 
     # 完整性冒烟：zstd 帧校验 + tar 列表可读
@@ -214,14 +226,26 @@ run_daily() {
     # 全量打包：snapshots/ + data/ + logs/，排除临时/锁/缓存文件。
     # 相对路径（在 LMS_HOME 内执行 tar）→ 归档内路径干净，恢复直接解包。
     # 先写临时文件再原子 mv：中途失败不会留下半个归档冒充当日备份。
-    if ! ( cd "$LMS_HOME" && tar --zstd -cf "$tmp_archive" \
+    # [C1] 与 run_hourly 同款：live 每 ~34s 写快照 → tar "file changed" 退出码 1 按成功处理，
+    # 否则 daily 归档连续失败（灾备只剩 15min 镜像一层）。
+    local err_file
+    err_file="$DAILY_DIR/.lms-$stamp.err.$$"
+    ( cd "$LMS_HOME" && tar --zstd -cf "$tmp_archive" \
             --exclude='*.lock' --exclude='*.tmp' --exclude='*.swp' \
             --exclude='__pycache__' --exclude='*.pyc' \
-            snapshots data logs .env .env.bak-* ); then
-        rm -f "$tmp_archive" 2>/dev/null || true
-        fail "tar.zst 打包失败"
-        return 1
+            snapshots data logs .env .env.bak-* ) 2>"$err_file"
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        if [ "$rc" -eq 1 ] && grep -q 'file changed as we read it' "$err_file" 2>/dev/null; then
+            log "tar 因快照持续写入返回 1（file changed），归档内容仍完整，按成功处理"
+        else
+            rm -f "$tmp_archive" 2>/dev/null || true
+            rm -f "$err_file" 2>/dev/null || true
+            fail "tar.zst 打包失败（rc=$rc）"
+            return 1
+        fi
     fi
+    rm -f "$err_file" 2>/dev/null || true
     mv -f "$tmp_archive" "$archive"
 
     # 完整性冒烟：zstd 帧校验 + tar 列表可读

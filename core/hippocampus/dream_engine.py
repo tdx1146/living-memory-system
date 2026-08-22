@@ -41,6 +41,7 @@ import re
 import time
 import random
 import logging
+import hashlib
 import tempfile
 from typing import Optional, Tuple, List
 
@@ -523,6 +524,15 @@ class DreamEngine:
         # 体验层 D 工程决策；fail-open）
         self._doubt_review()
 
+        # [A8] full_cycle 补齐短时→长时迁移：dream_mvp 调 self.memory.
+        # consolidate() 而 dream_cycle 不调 → 七阶段 full_cycle 模式缺失
+        # 阶段1"NREM巩固"的短时→长时迁移（与 docstring 不符）。
+        # consolidate() 幂等且无参（memory.py）；fail-open 不阻断做梦。
+        try:
+            self.memory.consolidate()
+        except Exception as e:
+            logger.warning("dream_cycle 记忆巩固失败（fail-open）: %s", e)
+
         # 周期结束保存快照
         snapshot_path = self._save_snapshot()
 
@@ -917,10 +927,20 @@ class DreamEngine:
 
     @staticmethod
     def _entry_id(entry):
-        """条目标识（id 优先，无 id 时用 turn 兜底；观测用）。"""
+        """[A14] 条目标识：id 优先；无 id 用文本 sha1 前 12 位（同 turn
+        多条目不撞键）；text 空才回退 turn。旧实现无 id 直接回退 turn →
+        supersedes 记录复用原条目 turn 时多条目共享同键 → score_map /
+        replay_set_ids 分数错配/ID 歧义（episodic 条目当前无 id 属性 →
+        全部回退 turn 撞键）。输出字符串键，进 dream_state.json 观测
+        无类型破坏。"""
         eid = getattr(entry, 'id', None)
         if eid is None:
-            eid = getattr(entry, 'turn', None)
+            text = getattr(entry, 'text', '') or ''
+            if text:
+                eid = 't:' + hashlib.sha1(
+                    text.encode('utf-8')).hexdigest()[:12]
+            else:
+                eid = getattr(entry, 'turn', None)
         return eid
 
     def _reinforce_entry(self, entry, current_turn: int) -> None:

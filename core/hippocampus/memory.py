@@ -471,6 +471,11 @@ class MemoryManager:
         # 命中即丢弃（不写入记忆），fail-open：过滤逻辑异常照常存储。
         try:
             if _is_garbage_text(text):
+                # [A9] 计数器声明"可被 status 读取"但从不自增 → 补计数
+                # （垃圾过滤次数不可观测；进程内计数器，重启清零，符合
+                # 原注释语义；不改变过滤行为，fail-open 保持）。
+                global _GARBAGE_FILTERED
+                _GARBAGE_FILTERED += 1
                 return
         except Exception:
             pass
@@ -680,18 +685,24 @@ class MemoryManager:
         # reinforce_turn 时，同步刷新 last_reinforced_turn（wear 重新计时）。
         # 命中条目的 reference_count 已由 count_reference 覆盖（P2-A：复用
         # 现有字段为加固计数唯一权威，不新增 link_count）。
+
+        # 按相似度降序取 top_k
+        k = min(top_k, len(scored))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        # [A3] 只对真正进入 top_k 的条目加固：先截取后加固——旧实现在排序
+        # 截取之前对全部相似命中（含从未进 LLM context 的）执行
+        # record_reference + 刷新 last_reinforced_turn，每轮给整批条目虚增
+        # 引用/置信度/磨损计时 → 置信度趋近 1.0、E3/labile 指标失真。
+        # record_reference 的 fail-open 包裹保留；顺序变化不影响相似度排序
+        # 结果，只影响加固范围。
         if count_reference:
-            for _score, entry in scored:
+            for _score, entry in scored[:k]:
                 record_reference(entry)
                 if reinforce_turn is not None:
                     try:
                         entry.last_reinforced_turn = reinforce_turn
                     except Exception:
                         pass
-
-        # 按相似度降序取 top_k
-        k = min(top_k, len(scored))
-        scored.sort(key=lambda x: x[0], reverse=True)
         return scored[:k]
 
     def recall_episodic(self, query_vector: torch.Tensor,
@@ -830,6 +841,9 @@ class MemoryManager:
             "num_nodes": self.num_nodes,
             "buffer": list(self._buffer),
             "episodic_buffer": list(self._episodic_buffer),
+            # [A9] 追加键（向后兼容）：垃圾过滤计数可观测——get_state 是
+            # 快照/观测路径的统一出口，set_state 忽略未知键，恢复不受影响。
+            "garbage_filtered": _GARBAGE_FILTERED,
         }
 
     def set_state(self, state: dict) -> None:

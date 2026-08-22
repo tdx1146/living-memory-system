@@ -555,7 +555,8 @@ class LivingMemoryLoop:
                 "M5 生命周期步骤 %r 记录失败（fail-open，汇总将 broken=True）:"
                 " %s", step, e)
 
-    def process_turn(self, user_input: str, llm_output: str = "") -> str:
+    def process_turn(self, user_input: str, llm_output: str = "",
+                     source: str = 'external') -> str:
         """处理一轮对话，执行完整的记忆循环。
 
         流程（M5 loop 重组——turn 生命周期**固定 9 步，禁止旁路**；规格
@@ -585,6 +586,12 @@ class LivingMemoryLoop:
         参数:
             user_input: 用户输入文本
             llm_output: LLM输出文本（上一轮的，首轮可为空）
+            source: [A12] 条目来源标记（内部参数，非端点签名）。默认
+                'external'（现有调用点 /chat /feed /store /dream 不变）；
+                E3 路径 B 重激活线索传 'doubt'——[doubt] 前缀解析
+                （doubt_ingest）只针对 user_input，与 source 正交；source
+                仅改变落库来源标记，L1 检索 source_filter='external' 排除，
+                探针文本不污染记忆/不自喂（FEP surprise 仍照常计算）。
 
         返回:
             记忆context文本（供LLM查询使用）
@@ -613,7 +620,13 @@ class LivingMemoryLoop:
         # M5 step 1/9 ingest —— 写侧入口（输入进入 + 注入时怀疑前置）
         # ────────────────────────────────────────────────────────── #
         # 1. 编码输入
-        text = f"用户: {user_input}\n助手: {llm_output}" if llm_output else user_input
+        # [A16] 统一存储文本前缀：无论 llm_output 是否为空都带"用户:"前缀
+        # （旧实现 `f"用户: {u}\n助手: {o}" if o else u` 只在非空时加前缀，
+        # 空 llm_output 轮次的条目以裸用户文本开头 → 格式漂移、检索/归档
+        # 解析不一致）。
+        text = f"用户: {user_input}"
+        if llm_output:
+            text += f"\n助手: {llm_output}"
         # E3（min-age 闸门数据源，根因 4 修复）：记录本 turn 起始的再巩固
         # 候选键快照——候选入队后至少隔 LMS_E3_MIN_AGE_TURNS（默认 1）轮才
         # 允许巩固期消费（根治"同轮即消"：候选至少活过当轮，做梦 M6 能扫到
@@ -887,7 +900,10 @@ class LivingMemoryLoop:
             self.memory.store_episodic(
                 text, semantic_vector, activation.surprise, self.turn_count,
                 raw_semantic_vector=raw_semantic_vector,
-                source='external')  # Phase 2: 显式来源标记
+                # [A12] 来源参数化：E3 路径 B 传 source='doubt'（线索文本不
+                # 以 external 入库 → 不污染/不自喂；L1 检索 source_filter=
+                # 'external' 排除）。默认 'external' 行为不变。
+                source=source)  # Phase 2: 显式来源标记
             if self.memory.episodic_size() > _epi_before:
                 try:
                     # 注入时怀疑判定：高 surprise（>factor×J_target）或
@@ -1418,7 +1434,13 @@ class LivingMemoryLoop:
         try:
             q = getattr(self, "reconsolidation_queue", None)
             size_before = q.size() if q is not None else 0
-            self.process_turn(clue)
+            # [A12] E3 路径 B 线索以 doubt 来源入库：旧实现走 process_turn(clue)
+            # 默认 source='external' 把重激活线索当普通 external 条目写入 →
+            # 探针文本污染记忆、可被后续检索注入、自喂风险。source='doubt'
+            # 不触发 is_doubt_event 分支（仍走普通塑形），仅改变落库来源标记；
+            # L1 检索 source_filter='external' 排除；FEP surprise 仍照常计算
+            # （去稳定化不依赖落库来源）。
+            self.process_turn(clue, source='doubt')
             size_after = q.size() if q is not None else 0
             return bool(size_after > size_before)
         except Exception as e:  # pylint: disable=broad-except
@@ -1815,17 +1837,24 @@ class LivingMemoryLoop:
         if entropy_ratio > entropy_high_threshold:
             # 熵过高：系统混沌，增强正交化压力驱散相似表示
             # E-P2-5: 通过 orth_weight_override 传递临时权重，不修改实例属性
+            # [A7] entropy_correction=True：熵管理只做正交化增量校正，不做
+            # 完整 learn——主 learn（state_update 步）已在本轮执行一次，同
+            # activation 二次完整 learn 会让 J/Hebbian 双重强化（M5"每轮
+            # learn 一次"契约）。
             self.attractor.learn(
                 activation, sensory_input.vector, effective_lr * 0.3,
                 orth_weight_override=self.attractor.orth_weight * 1.5,
+                entropy_correction=True,
             )
             logger.info(f"在线熵管理: 熵={entropy:.3f}(ratio={entropy_ratio:.2f}) 过高，增强正交化")
         elif entropy_ratio < entropy_low_threshold:
             # 熵过低：系统僵化，降低正交化压力允许更多激活
             # E-P2-5: 通过 orth_weight_override 传递临时权重，不修改实例属性
+            # [A7] 同上：熵校正模式，避免同轮第二次完整 learn。
             self.attractor.learn(
                 activation, sensory_input.vector, effective_lr * 0.2,
                 orth_weight_override=self.attractor.orth_weight * 0.7,
+                entropy_correction=True,
             )
             logger.info(f"在线熵管理: 熵={entropy:.3f}(ratio={entropy_ratio:.2f}) 过低，放松正交化")
 
@@ -2551,7 +2580,10 @@ class LivingMemoryLoop:
             interval = self.config.get('auto_snapshot_interval', 50)
             if self.turn_count > 0 and self.turn_count % interval == 0:
                 try:
-                    path = self.save_session_state()
+                    # [A16] 自动快照用增量前 turn 命名：_auto_snapshot 在
+                    # _increment_turn() 之后运行（emit 步），此时 turn_count
+                    # 已 +1，而本轮条目内容用的是增量前 turn → 快照名不应 +1。
+                    path = self.save_session_state(turn=self.turn_count - 1)
                     if path:
                         logger.info(f"自动快照已保存: {path}")
                 except Exception as e:
@@ -2640,6 +2672,23 @@ class LivingMemoryLoop:
         if self.self_ref is not None:
             self_ref_state = self.self_ref.get_state()
 
+        # [A10] 序列化 last_activation：load_state 恢复后 query_llm 不再
+        # 首轮 "[无记忆]"（LLM context 丢失最近激活态）。纯张量/标量字段，
+        # 先 detach 再 tolist 防计算图残留。
+        last_act_state = None
+        if self.last_activation is not None:
+            la = self.last_activation
+            last_act_state = {
+                'state': la.state.detach().cpu().tolist(),
+                'entropy': float(la.entropy),
+                'surprise': float(la.surprise),
+                'free_energy': float(la.free_energy),
+                'mse': la.mse,
+                'per_dim_surprise': (
+                    la.per_dim_surprise.detach().cpu().tolist()
+                    if la.per_dim_surprise is not None else None),
+            }
+
         saved = self.snapshot.save(path, landscape, purpose_dict,
                            memory_state=memory_state,
                            tokenizer_state=tokenizer_state,
@@ -2647,7 +2696,8 @@ class LivingMemoryLoop:
                            self_ref_state=self_ref_state,
                            session_id=self.session_id,
                            turn_count=self.turn_count,
-                           last_entropy_ratio=self.last_entropy_ratio)
+                           last_entropy_ratio=self.last_entropy_ratio,
+                           last_activation=last_act_state)  # [A10] 双侧补 last_activation 状态
         if not saved:
             # P1-1 修复：传播写锁超时的真实结果，禁止"声称已保存、实际未落盘"。
             # （调用方依赖该返回值触发 503/跳过提示/优雅停机重试。）
@@ -2656,7 +2706,7 @@ class LivingMemoryLoop:
         logger.info(f"状态已保存到 {path}")
         return True
 
-    def save_session_state(self) -> Optional[str]:
+    def save_session_state(self, turn: Optional[int] = None) -> Optional[str]:
         """按新命名规范保存会话快照，并同步更新 latest_{session}.pt（T1.1/P0-5）。
 
         - 轮次快照：snapshots/{session}/snapshot_{session}_{turn}_{ts}.pt
@@ -2664,13 +2714,23 @@ class LivingMemoryLoop:
         - 最新指针：snapshots/{session}/latest_{session}.pt（写最新时同步更新，
           供加载方快速定位该会话最新状态）。
 
+        参数:
+            turn: [A16] 快照命名轮次覆盖（内部参数，非端点签名）。默认
+                None → self.turn_count（/snapshot、做梦快照、watchdog
+                dispose 等现有调用点不变）。_auto_snapshot 传增量前 turn
+                （见调用点注释）。
+
         返回:
             轮次快照路径；保存被写锁超时跳过时返回 None（fail-open）。
         """
         snap_dir = self._snapshot_dir_path()
         snap_dir.mkdir(parents=True, exist_ok=True)
+        # [A16] 快照命名 turn 对齐内容：_auto_snapshot 在 _increment_turn()
+        # 之后（emit 步）运行，此时 turn_count 已 +1，而本轮条目内容用的是
+        # 增量前 turn → 快照名不应比内容 +1。默认 None 保持现有调用点不变。
+        snap_turn = self.turn_count if turn is None else turn
         turn_path = snapshot_path_for(
-            str(snap_dir), self.session_id, self.turn_count)
+            str(snap_dir), self.session_id, snap_turn)
         saved = self.save_state(turn_path)
         if not saved:
             return None
@@ -2767,6 +2827,34 @@ class LivingMemoryLoop:
             logger.warning(
                 f"快照 session_id={snap_session} 与当前会话 "
                 f"{self.session_id} 不一致（以当前会话为准）")
+
+        # [A10] 恢复 last_activation：重启/恢复后 query_llm 首轮不再返回
+        # "[无记忆]"（LLM context 丢失最近激活态）。旧快照无该键 → 优雅
+        # 跳过（向后兼容）。
+        la_state = raw_data.get('last_activation')
+        if isinstance(la_state, dict) and la_state.get('state'):
+            try:
+                self.last_activation = Activation(
+                    state=torch.tensor(
+                        la_state['state'], device=self.attractor.device),
+                    entropy=float(la_state.get('entropy', 0.0)),
+                    surprise=float(la_state.get('surprise', 0.0)),
+                    free_energy=float(la_state.get('free_energy', 0.0)),
+                    mse=la_state.get('mse'),
+                    per_dim_surprise=(
+                        torch.tensor(la_state['per_dim_surprise'])
+                        if la_state.get('per_dim_surprise') is not None
+                        else None))
+                logger.info(
+                    "last_activation 已恢复（重启后 query_llm 不再首轮"
+                    " [无记忆]）")
+            except Exception as e:  # pylint: disable=broad-except
+                # fail-open：恢复失败不影响主恢复流程（降级为无最近激活态）
+                logger.warning(
+                    "last_activation 恢复失败（fail-open）: %s", e)
+                self.last_activation = None
+        else:
+            logger.info("快照不含 last_activation 字段，跳过（向后兼容）")
 
         logger.info(f"已从 {path} 恢复状态")
 
