@@ -36,12 +36,25 @@ _KIND_ALIASES = {'证伪': 'conflict', 'reactivate': 'conflict'}
 # 结构化摄入不再作为普通对话入库（系统事件不是对话，同 8/10 垃圾过滤哲学）
 _DOUBT_EVENT_RE = re.compile(r"^\s*\[doubt\]", re.I)
 
+# 2026-08-22 自喂断环（E3 路径B 产物污染修复）：路径B 重激活线索是
+# episodic 条目文本（带"用户: "包装前缀），process_turn 摄入时前缀导致
+# ^[doubt] 锚定失败 → 被当普通对话入库 → 又被选择器选中重激活 → 反馈环。
+# 剥离包装前缀后 [doubt] 事件被正确识别为系统事件（不入库、正常登记）。
+_ARTIFACT_PREFIX_RE = re.compile(r"^(?:用户|助手)\s*[:：]\s*", re.I)
+
+
+def _strip_artifact_prefix(text: str) -> str:
+    """剥离 E3 路径B 产物自带的"用户: /助手: "包装前缀（自喂断环）。"""
+    if not text:
+        return text
+    return _ARTIFACT_PREFIX_RE.sub("", text, count=1)
+
 
 def is_doubt_event(text: str) -> bool:
     """判断文本是否为结构化怀疑事件（带 [doubt] 前缀）。"""
     if not text:
         return False
-    return bool(_DOUBT_EVENT_RE.search(text))
+    return bool(_DOUBT_EVENT_RE.search(_strip_artifact_prefix(text)))
 
 
 def parse_doubt_event(text: str) -> Optional[dict]:
@@ -52,7 +65,7 @@ def parse_doubt_event(text: str) -> Optional[dict]:
     """
     if not text:
         return None
-    m = _DOUBT_PREFIX_RE.match(text.strip())
+    m = _DOUBT_PREFIX_RE.match(_strip_artifact_prefix(text).strip())
     if not m:
         return None
     kind = m.group(1).strip().lower()
