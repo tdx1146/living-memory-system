@@ -57,7 +57,31 @@ def lms_recall(user_input: str, sid: str = DEFAULT_SESSION) -> dict:
             for i, item in enumerate(results, 1):
                 text = (item or {}).get("text", "")
                 score = (item or {}).get("score", 0.0)
-                lines.append(f"--- 记忆 {i}（相关度 {score:.3f}）---\n{text}")
+                # 2026-08-22 怀疑有牙齿：暴露每条记忆的怀疑/置信元数据，
+                # 让 agent 能对低置信/存疑/被反驳的记忆改变行为（而非盲引）。
+                meta_bits = []
+                conf = (item or {}).get("adaptive_confidence")
+                if conf is not None:
+                    meta_bits.append(f"置信 {conf:.3f}")
+                cons = (item or {}).get("consistency")
+                if cons is not None:
+                    meta_bits.append(f"一致性 {cons:.3f}")
+                dv = (item or {}).get("doubt_verdict")
+                if dv is not None:
+                    meta_bits.append(f"存疑 {dv}")
+                rb = (item or {}).get("rebuttal_count")
+                if rb:
+                    meta_bits.append(f"反驳 {rb}")
+                if (item or {}).get("labile"):
+                    meta_bits.append("labile")
+                st = (item or {}).get("source_trust")
+                if st is not None:
+                    meta_bits.append(f"来源可信 {st:.2f}")
+                meta = " / ".join(meta_bits)
+                block = f"--- 记忆 {i}（相关度 {score:.3f}）---\n{text}"
+                if meta:
+                    block += f"\n[元数据] {meta}"
+                lines.append(block)
             memory_context = "\n\n".join(lines)
         else:
             memory_context = ""
