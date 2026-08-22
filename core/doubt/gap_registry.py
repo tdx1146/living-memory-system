@@ -15,9 +15,11 @@ gap_registry（登记）→ /status doubt.gaps + 回魂怀疑灯。
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import re
+import threading
 import time
 from typing import Dict, List, Optional
 
@@ -28,6 +30,13 @@ class GapRegistry:
     E3 持久化（2026-08-21 部署验证发现：重启后 fok_unresolved 清零 → E3
     候选源丢失）：A/B/C + resolved 列表经 _PERSIST_PATH jsonl 落盘，
     启动时 load 恢复；写侧 fail-open（落盘失败不影响登记）。
+
+    线程安全（[B17][F1] 收尾修复，2026-08-23）：模块此前全程无锁——做梦
+    线程（mark_review/mark_resolved 写侧）与 API 线程（/status snapshot
+    读侧、/feed register 写侧）跨线程并发读写 → json.dump 可能抛
+    RuntimeError 被 fail-open 吞掉、列表推导/拷贝期间增删丢更新。现统一
+    持 ``threading.RLock``（可重入：mark_review → mark_resolved 嵌套持锁
+    安全）；``_persist`` 在锁内对全部列表深拷贝后再序列化（快照一致性）。
     """
 
     _PERSIST_PATH = os.path.join(
@@ -36,6 +45,8 @@ class GapRegistry:
         'data', 'gap_registry.json')
 
     def __init__(self, persist_path: Optional[str] = None) -> None:
+        # [B17][F1] 线程锁必须先于任何读写创建（_load 在 __init__ 末尾调用）
+        self._lock = threading.RLock()
         # A/B/C 三类缺口（C 类仅诊断）
         self._fok_unresolved: List[Dict] = []          # A 类
         self._low_confidence_unreviewed: List[Dict] = []  # B 类
@@ -57,41 +68,48 @@ class GapRegistry:
 
     def _load(self) -> None:
         """启动恢复：读 jsonl 镜像（缺省/损坏 → 空，fail-open）。"""
-        try:
-            if not os.path.exists(self._PERSIST_PATH):
-                return
-            with open(self._PERSIST_PATH, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            self._fok_unresolved = list(
-                data.get('fok_unresolved', []) or [])[-50:]
-            self._low_confidence_unreviewed = list(
-                data.get('low_confidence_unreviewed', []) or [])[-50:]
-            self._explore_dims = list(
-                data.get('explore_dims', []) or [])
-            self._fok_resolved = list(
-                data.get('fok_resolved', []) or [])[-100:]
-            self._last_review = data.get('last_review')
-        except Exception:  # pylint: disable=broad-except
-            pass
+        with self._lock:
+            try:
+                if not os.path.exists(self._PERSIST_PATH):
+                    return
+                with open(self._PERSIST_PATH, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                self._fok_unresolved = list(
+                    data.get('fok_unresolved', []) or [])[-50:]
+                self._low_confidence_unreviewed = list(
+                    data.get('low_confidence_unreviewed', []) or [])[-50:]
+                self._explore_dims = list(
+                    data.get('explore_dims', []) or [])
+                self._fok_resolved = list(
+                    data.get('fok_resolved', []) or [])[-100:]
+                self._last_review = data.get('last_review')
+            except Exception:  # pylint: disable=broad-except
+                pass
 
     def _persist(self) -> None:
-        """落盘镜像（fail-open：写失败不影响登记主流程）。"""
-        try:
-            data = {
-                'fok_unresolved': self._fok_unresolved,
-                'low_confidence_unreviewed':
-                    self._low_confidence_unreviewed,
-                'explore_dims': self._explore_dims,
-                'fok_resolved': self._fok_resolved,
-                'last_review': self._last_review,
-                'ts': time.time(),
-            }
-            tmp = self._PERSIST_PATH + '.tmp'
-            with open(tmp, 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False)
-            os.replace(tmp, self._PERSIST_PATH)
-        except Exception:  # pylint: disable=broad-except
-            pass
+        """落盘镜像（fail-open：写失败不影响登记主流程）。
+
+        [B17][F1] 锁内深拷贝快照：先对全部列表 deepcopy 再 json.dump——
+        即使未来在锁外读（防御性），序列化期间也不会因并发增删抛
+        RuntimeError；同时保证落盘内容是一次一致快照而非撕裂视图。
+        """
+        with self._lock:
+            try:
+                data = {
+                    'fok_unresolved': copy.deepcopy(self._fok_unresolved),
+                    'low_confidence_unreviewed':
+                        copy.deepcopy(self._low_confidence_unreviewed),
+                    'explore_dims': copy.deepcopy(self._explore_dims),
+                    'fok_resolved': copy.deepcopy(self._fok_resolved),
+                    'last_review': self._last_review,
+                    'ts': time.time(),
+                }
+                tmp = self._PERSIST_PATH + '.tmp'
+                with open(tmp, 'w', encoding='utf-8') as f:
+                    json.dump(data, f, ensure_ascii=False)
+                os.replace(tmp, self._PERSIST_PATH)
+            except Exception:  # pylint: disable=broad-except
+                pass
 
     # ------------------------------------------------------------------ #
     #  登记
@@ -154,48 +172,51 @@ class GapRegistry:
         归一化去重键（剥前缀取核心前 20 字）命中已有条目 → 更新 ts/detail
         （"重新面对"语义），不新增。
         """
-        topic = str(topic)[:120]
-        core = self._fok_core(topic)
-        now = ts if ts is not None else time.time()
-        for existing in self._fok_unresolved:
-            # [A4] 统一走 _same_case（原内联 _fok_similar 判定，语义等价；
-            # 消解侧 mark_resolved/is_resolved 现用同一判定助手，避免漂移）。
-            if core and self._same_case(core, existing['topic']):
-                existing['ts'] = now
-                if detail:
-                    existing['detail'] = str(detail)[:300]
-                self._persist()
-                return  # 去重：更新已有，不新增
-        self._fok_unresolved.append({
-            'topic': topic,
-            'detail': str(detail)[:300],
-            'ts': now,
-        })
-        self._fok_unresolved = self._fok_unresolved[-50:]
-        self._persist()
+        with self._lock:
+            topic = str(topic)[:120]
+            core = self._fok_core(topic)
+            now = ts if ts is not None else time.time()
+            for existing in self._fok_unresolved:
+                # [A4] 统一走 _same_case（原内联 _fok_similar 判定，语义等价；
+                # 消解侧 mark_resolved/is_resolved 现用同一判定助手，避免漂移）。
+                if core and self._same_case(core, existing['topic']):
+                    existing['ts'] = now
+                    if detail:
+                        existing['detail'] = str(detail)[:300]
+                    self._persist()
+                    return  # 去重：更新已有，不新增
+            self._fok_unresolved.append({
+                'topic': topic,
+                'detail': str(detail)[:300],
+                'ts': now,
+            })
+            self._fok_unresolved = self._fok_unresolved[-50:]
+            self._persist()
 
     def register_low_confidence(self, entry, ts: Optional[float] = None) -> None:
         """B 类：低置信未复核条目登记（按 entry 文本去重，上限 50 条）。"""
-        try:
-            text = getattr(entry, 'text', '') or ''
-            conf = float(getattr(entry, 'confidence', 1.0) or 1.0)
-            rebuttal = int(getattr(entry, 'rebuttal_count', 0) or 0)
-        except (TypeError, ValueError):
-            return
-        record = {
-            'text': str(text)[:120],
-            'confidence': round(conf, 3),
-            'rebuttal_count': rebuttal,
-            'ts': ts if ts is not None else time.time(),
-        }
-        # 去重（同文本只留最新）
-        self._low_confidence_unreviewed = [
-            r for r in self._low_confidence_unreviewed
-            if r.get('text') != record['text']
-        ]
-        self._low_confidence_unreviewed.append(record)
-        self._low_confidence_unreviewed = self._low_confidence_unreviewed[-50:]
-        self._persist()
+        with self._lock:
+            try:
+                text = getattr(entry, 'text', '') or ''
+                conf = float(getattr(entry, 'confidence', 1.0) or 1.0)
+                rebuttal = int(getattr(entry, 'rebuttal_count', 0) or 0)
+            except (TypeError, ValueError):
+                return
+            record = {
+                'text': str(text)[:120],
+                'confidence': round(conf, 3),
+                'rebuttal_count': rebuttal,
+                'ts': ts if ts is not None else time.time(),
+            }
+            # 去重（同文本只留最新）
+            self._low_confidence_unreviewed = [
+                r for r in self._low_confidence_unreviewed
+                if r.get('text') != record['text']
+            ]
+            self._low_confidence_unreviewed.append(record)
+            self._low_confidence_unreviewed = \
+                self._low_confidence_unreviewed[-50:]
+            self._persist()
 
     def register_explore_dims(self, dims: List[int],
                               ts: Optional[float] = None) -> None:
@@ -203,10 +224,11 @@ class GapRegistry:
 
         不进怀疑灯、不进注入（专注化修订，设计 v1.1 §6.6）。
         """
-        self._explore_dims = [{
-            'dims': [int(d) for d in dims][:10],
-            'ts': ts if ts is not None else time.time(),
-        }]
+        with self._lock:
+            self._explore_dims = [{
+                'dims': [int(d) for d in dims][:10],
+                'ts': ts if ts is not None else time.time(),
+            }]
 
     # ------------------------------------------------------------------ #
     #  E3 satiety：消解登记（fok_resolved）
@@ -220,53 +242,57 @@ class GapRegistry:
         从 A/B 类缺口移除同 topic 记录（消解后不再出现在怀疑灯）。幂等：
         同 topic 重复登记只留最新。返回是否新增登记。
         """
-        normalized = str(topic)[:120]
-        if not normalized:
-            return False
-        record = {
-            'topic': normalized,
-            'detail': str(detail)[:300],
-            'ts': ts if ts is not None else time.time(),
-        }
-        # [A4][B7] 幂等去重改用 _same_case（与登记侧同构）：登记侧模糊去重、
-        # 消解侧精确匹配 → 同悬案换包装登记后永远无法被消解移除。统一判定后
-        # 消解移除/判重与登记去重行为一致（B7 同根，一并覆盖）。
-        existed = any(
-            self._same_case(r.get('topic', ''), normalized)
-            for r in self._fok_resolved)
-        self._fok_resolved = [
-            r for r in self._fok_resolved
-            if not self._same_case(r.get('topic', ''), normalized)]
-        self._fok_resolved.append(record)
-        self._fok_resolved = self._fok_resolved[-100:]
-        self._persist()
-        # 同步移除未决（A 类）与低置信待复核（B 类）中的同 topic 记录
-        # [A4] A 类移除同样用 _same_case（旧精确匹配无法移除换包装悬案）；
-        # B 类按 text 去重（register_low_confidence 语义），保持原样。
-        self._fok_unresolved = [
-            r for r in self._fok_unresolved
-            if not self._same_case(r.get('topic', ''), normalized)]
-        self._low_confidence_unreviewed = [
-            r for r in self._low_confidence_unreviewed
-            if (r.get('text') or '')[:120] != normalized]
-        return not existed
+        with self._lock:
+            normalized = str(topic)[:120]
+            if not normalized:
+                return False
+            record = {
+                'topic': normalized,
+                'detail': str(detail)[:300],
+                'ts': ts if ts is not None else time.time(),
+            }
+            # [A4][B7] 幂等去重改用 _same_case（与登记侧同构）：登记侧模糊去重、
+            # 消解侧精确匹配 → 同悬案换包装登记后永远无法被消解移除。统一判定后
+            # 消解移除/判重与登记去重行为一致（B7 同根，一并覆盖）。
+            existed = any(
+                self._same_case(r.get('topic', ''), normalized)
+                for r in self._fok_resolved)
+            self._fok_resolved = [
+                r for r in self._fok_resolved
+                if not self._same_case(r.get('topic', ''), normalized)]
+            self._fok_resolved.append(record)
+            self._fok_resolved = self._fok_resolved[-100:]
+            self._persist()
+            # 同步移除未决（A 类）与低置信待复核（B 类）中的同 topic 记录
+            # [A4] A 类移除同样用 _same_case（旧精确匹配无法移除换包装悬案）；
+            # B 类按 text 去重（register_low_confidence 语义），保持原样。
+            self._fok_unresolved = [
+                r for r in self._fok_unresolved
+                if not self._same_case(r.get('topic', ''), normalized)]
+            self._low_confidence_unreviewed = [
+                r for r in self._low_confidence_unreviewed
+                if (r.get('text') or '')[:120] != normalized]
+            return not existed
 
     def is_resolved(self, topic: str) -> bool:
         """该悬案是否已消解（选择器排除集数据源，只读）。"""
-        normalized = str(topic)[:120]
-        # [A4][B7] 与登记侧同构的归一化判定：精确匹配无法识别换包装的已消解
-        # 悬案 → 已闭环主题被 E3 反复选中。
-        return any(
-            self._same_case(normalized, r.get('topic', ''))
-            for r in self._fok_resolved)
+        with self._lock:
+            normalized = str(topic)[:120]
+            # [A4][B7] 与登记侧同构的归一化判定：精确匹配无法识别换包装的已消解
+            # 悬案 → 已闭环主题被 E3 反复选中。
+            return any(
+                self._same_case(normalized, r.get('topic', ''))
+                for r in self._fok_resolved)
 
     def resolved_list(self) -> List[Dict]:
         """已消解悬案记录（只读拷贝）。"""
-        return list(self._fok_resolved)
+        with self._lock:
+            return list(self._fok_resolved)
 
     def resolved_count(self) -> int:
         """已消解悬案计数（A5 观测数据源）。"""
-        return len(self._fok_resolved)
+        with self._lock:
+            return len(self._fok_resolved)
 
     # ------------------------------------------------------------------ #
     #  复核联动
@@ -282,43 +308,52 @@ class GapRegistry:
           - ``_fok_resolved`` 是消解历史，**不**随复核轮清空（与 B 类
             不同——B 类清空是"已复核一轮"，消解史是"已闭环"）。
         """
-        self._last_review = time.time()
-        if stats:
-            for k in ('reviewed', 'downgraded', 'rewritten', 'kept', 'flagged'):
-                if k in stats:
-                    self._review_stats[k] = int(stats.get(k, 0) or 0)
-        for topic in (resolved_topics or []):
-            try:
-                self.mark_resolved(topic, detail='做梦复核判定消解')
-            except Exception:  # pylint: disable=broad-except
-                pass
-        # B 类清空（已复核一轮）；A 类保留（fok 未决不随单轮复核消失）
-        self._low_confidence_unreviewed = []
+        with self._lock:
+            self._last_review = time.time()
+            if stats:
+                for k in ('reviewed', 'downgraded', 'rewritten', 'kept', 'flagged'):
+                    if k in stats:
+                        self._review_stats[k] = int(stats.get(k, 0) or 0)
+            for topic in (resolved_topics or []):
+                try:
+                    self.mark_resolved(topic, detail='做梦复核判定消解')
+                except Exception:  # pylint: disable=broad-except
+                    pass
+            # B 类清空（已复核一轮）；A 类保留（fok 未决不随单轮复核消失）
+            self._low_confidence_unreviewed = []
 
     # ------------------------------------------------------------------ #
     #  读出
     # ------------------------------------------------------------------ #
 
     def snapshot(self) -> Dict:
-        """/status doubt.gaps 数据源（A/B 类 + C 类诊断 + E3 消解史）。"""
-        return {
-            'fok_unresolved': list(self._fok_unresolved),
-            'low_confidence_unreviewed': list(self._low_confidence_unreviewed),
-            'explore_dims': list(self._explore_dims),  # C 类：仅诊断
-            'fok_resolved': list(self._fok_resolved),  # E3 satiety 消解史
-        }
+        """/status doubt.gaps 数据源（A/B 类 + C 类诊断 + E3 消解史）。
+
+        [B17][F1] 持锁取一致快照（列表浅拷贝在锁内完成，条目 dict 只读）。
+        """
+        with self._lock:
+            return {
+                'fok_unresolved': list(self._fok_unresolved),
+                'low_confidence_unreviewed': list(
+                    self._low_confidence_unreviewed),
+                'explore_dims': list(self._explore_dims),  # C 类：仅诊断
+                'fok_resolved': list(self._fok_resolved),  # E3 satiety 消解史
+            }
 
     def doubt_lamp(self) -> Dict:
         """回魂怀疑灯数据（**仅 A/B 类**，C 类不进——专注化修订）。"""
-        return {
-            'fok_unresolved_count': len(self._fok_unresolved),
-            'low_confidence_unreviewed_count': len(
-                self._low_confidence_unreviewed),
-            'last_review': self._last_review,
-        }
+        with self._lock:
+            return {
+                'fok_unresolved_count': len(self._fok_unresolved),
+                'low_confidence_unreviewed_count': len(
+                    self._low_confidence_unreviewed),
+                'last_review': self._last_review,
+            }
 
     def review_stats(self) -> Dict:
-        return dict(self._review_stats)
+        with self._lock:
+            return dict(self._review_stats)
 
     def last_review(self) -> Optional[float]:
-        return self._last_review
+        with self._lock:
+            return self._last_review

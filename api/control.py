@@ -803,7 +803,21 @@ async def control_diagnose(request: Request):
         "api": {
             "reachable": api_status == 200,
             "health": api_body.get("status") if isinstance(api_body, dict) else None,
-            # [B23] landscape 探针替代 recall 探针（纯只读，不创建会话）
+            # [B23] recall 探针 → landscape 探针：原 POST /recall 探针会
+            # get_or_create("main") 制造幻影会话（只读诊断不应有建会话副作用），
+            # 改打 /landscape/main（sm.get 而非 get_or_create，纯只读）。
+            # [F2] 收尾修复（审计发现 B23 计划偏差：响应字段被"替换"而非"追加"）：
+            # 仓库内无 recall_probe 消费方（grep 证实），但外部控制面 :8191
+            # 消费方若解析旧字段会断——保留同名字段作向后兼容占位并标注废弃，
+            # 同时**追加** landscape_probe（原实现语义不变）。若外部消费方
+            # 确需真值，恢复 POST /recall 探针前须先解决 get_or_create 副作用。
+            "recall_probe": {
+                "status": 410,
+                "ok": False,
+                "deprecated": True,
+                "note": "已废弃（B23）：原 /recall 探针有建幻影会话副作用，"
+                        "改用 landscape_probe（纯只读）",
+            },
             "landscape_probe": {
                 "status": ls_status,
                 "duration_ms": ls_ms,

@@ -53,10 +53,27 @@ def _strip_artifact_prefix(text: str) -> str:
 
 
 def is_doubt_event(text: str) -> bool:
-    """判断文本是否为结构化怀疑事件（带 [doubt] 前缀）。"""
+    """判断文本是否为结构化怀疑事件（带 [doubt] 前缀）。
+
+    [收尾/存量失败] 修复 is_doubt_event 误判（审计 F3 存量项，286085b 起失败）：
+    2026-08-22 自喂断环修复引入 ``_strip_artifact_prefix`` 后，任何带
+    "用户:/助手:" 包装且以 [doubt] 开头的文本都被判为怀疑事件——真实用户
+    提问 "用户: [doubt] 是什么意思？" 被当系统事件丢弃（不入库，文本丢失）。
+    修复：包装前缀剥离后**必须是合法协议事件**（parse_doubt_event 非空，
+    即带 kind+冒号）才判为怀疑事件；裸 [doubt] 前缀（锚定行首）判定不变，
+    正文提及不误伤。E3 路径 B 产物（"用户: [doubt] conflict: …" 合法协议）
+    仍被正确识别，08-22 断环语义保持。
+    """
     if not text:
         return False
-    return bool(_DOUBT_EVENT_RE.search(_strip_artifact_prefix(text)))
+    # 锚定行首：裸 [doubt] 前缀（含未知 kind 的协议行）→ 系统事件（同旧语义）
+    if _DOUBT_EVENT_RE.search(text):
+        return True
+    # E3 路径 B 产物：剥离 "用户:/助手:" 包装后须是**合法协议事件**
+    # （kind+冒号），"用户: [doubt] 是什么意思？" 这类真实提问不满足
+    # _DOUBT_PREFIX_RE（无 kind+冒号）→ 判为普通对话（正确入库）。
+    stripped = _strip_artifact_prefix(text)
+    return stripped != text and parse_doubt_event(stripped) is not None
 
 
 def parse_doubt_event(text: str) -> Optional[dict]:

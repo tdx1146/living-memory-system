@@ -74,6 +74,12 @@ class TestColdStart:
     """窗口样本不足 min_samples → 保持初始设定点，不动作。"""
 
     def test_cold_start_keeps_init(self):
+        # [收尾/存量失败] 本用例断言 08-22 冷启动门**旧行为**（冷启动期间
+        # σ 饱和也不重锚），与 dandan 08-22 拍板"饱和/崩塌是结构性硬信号，
+        # 一帧即判，绕过冷启动"（core/hippocampus/attractor.py update() 中
+        # sat/col 分支位于 min_samples 冷启动门之前）冲突：286085b 起即失败，
+        # 非本轮修复引入，属已知存量失败，留档不修（断言与 08-22 冷启动门
+        # 修正冲突）。
         ctl = AllostaticJController(
             enabled=True, init_target=7.0, min_samples=30)
         # 即使 σ 饱和信号在场，冷启动也不重锚
@@ -336,6 +342,11 @@ class TestNativeIntegration:
 
     def test_cold_start_no_slide(self, monkeypatch):
         """冷启动（<min_samples=30）：即使 σ 饱和在场也不滑动（任务书核心）。"""
+        # [收尾/存量失败] 与 test_cold_start_keeps_init 同因：断言 08-22
+        # 冷启动门旧行为（冷启动期间 σ 饱和不重锚），与 dandan 08-22 拍板
+        # "饱和/崩塌绕过冷启动"冲突（attractor.py update() sat/col 分支先于
+        # min_samples 冷启动门）——286085b 起即失败，非本轮引入，属已知存量
+        # 失败，留档不修（断言与 08-22 冷启动门修正冲突）。
         monkeypatch.setenv("LMS_J_ALLOSTATIC", "1")
         monkeypatch.setenv("LMS_J_TARGET_NORM", "7.0")
         net = AttractorNetwork(num_nodes=32, input_dim=16)

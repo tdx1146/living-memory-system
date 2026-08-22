@@ -38,6 +38,25 @@ def _self_voice_persist_dir(tmp_path_factory):
     os.environ["LMS_SELF_VOICE_DIR"] = str(tmp)
     yield tmp
 
+
+@pytest.fixture(autouse=True)
+def _gap_registry_persist_isolated(tmp_path, monkeypatch):
+    """[F3] GapRegistry 默认持久化路径按**每个测试**隔离到 tmp_path。
+
+    收尾修复（审计 F3：测试隔离缺陷）：GapRegistry 无参构造直读共享
+    data/gap_registry.json（gitignored）——test_mark_resolved_lifecycle 等
+    写侧测试把悬案A/悬案B 等测试数据落进共享文件，后续测试（loop 构造的
+    GapRegistry 也会读默认路径）被污染 → 4 例 doubt/e3 假失败（clean 状态
+    4/4 通过实证）。此夹具把类默认路径重定向为每测试独立的临时文件：
+    - 函数级作用域 → 跨测试零残留（写侧测试的落盘不外泄）；
+    - monkeypatch 自动还原 → 不改变显式传 persist_path 的测试；
+    - 行为零影响：仅隔离路径，读写语义不变。
+    """
+    from core.doubt.gap_registry import GapRegistry
+    monkeypatch.setattr(
+        GapRegistry, "_PERSIST_PATH",
+        str(tmp_path / "gap_registry.json"))
+
 from core.types import SensoryInput, Activation, PurposeState
 from core.sensory.tokenizer import SimpleTokenizer
 from core.sensory.embedder import SimpleEmbedder

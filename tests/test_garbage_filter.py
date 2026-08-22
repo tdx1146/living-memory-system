@@ -108,8 +108,13 @@ class TestLegacyGarbageUnchanged:
 
     def test_garbage_re_count(self):
         """正则条数 = 4 旧 + 6 新 + 2（v1.4 S1-8: [Inter-session message]/[梦醒]）
-        = 12（纯增量，无删改）。"""
-        assert len(_GARBAGE_TEXT_RE) == 12
+        + 3（2026-08-22 灰池修复：后台思考者/隔离子代理/不唤醒不发言）
+        = 15（纯增量，无删改）。"""
+        # [收尾/存量失败] 断言曾为 12：2026-08-22 灰池修复（core/hippocampus/
+        # memory.py _GARBAGE_TEXT_RE 追加 3 条中文子代理样板，灰池 985 条实证
+        # 英文模板 0 命中）后未同步断言 → 286085b 起即失败（测试滞后，非代码
+        # bug：15 条均为带注释的设计内增量）。同步断言为 15。
+        assert len(_GARBAGE_TEXT_RE) == 15
 
     def test_garbage_filtered_counter(self):
         """_GARBAGE_FILTERED 计数可用（进程内，可被 status 读取）。"""
