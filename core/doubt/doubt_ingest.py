@@ -31,7 +31,12 @@ from core.doubt.reconsolidation import mark_labile
 # [doubt] 前缀协议（大小写不敏感；内容支持跨行，取前 300 字）
 _DOUBT_PREFIX_RE = re.compile(
     r"^\s*\[doubt\]\s*(\w+)\s*[:：]\s*(.+)$", re.I | re.S)
-_KNOWN_KINDS = {'conflict', 'fok', 'lowconf', 'event'}
+_KNOWN_KINDS = {'conflict', 'fok', 'lowconf', 'event', 'gap'}
+# gap：怀疑缺口登记格式（gap_registry 历史事件，如 "[doubt] gap: 旧结论…
+# 需重新审视"）。纳入合法 kind 后，裸 [doubt] gap: 行被 parse_doubt_event
+# 识别为协议事件 → is_doubt_event 统一走协议判定，无需"裸锚定"分支，
+# 彻底消除"真实提问 [doubt] 误伤"与"gap 系统事件漏判"的歧义（F3 回归
+# 修复 2026-08-23：先剥前缀再判，顺序与 08-22 断环修复一致）。
 # E3（dandan 拍板 2，2026-08-20：证伪收编）：'证伪'/'reactivate' 别名 →
 # conflict 语义（解析时归一为 canonical kind，下游分支零改动）。
 _KIND_ALIASES = {'证伪': 'conflict', 'reactivate': 'conflict'}
