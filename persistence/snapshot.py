@@ -548,6 +548,9 @@ class Snapshot:
         return {
             'version': data.get('version', 'unknown'),
             'timestamp': data.get('timestamp', 0),
+            # [B3] 追加顶层 session_id：/restore 归属校验需要（轻量读顶层键，
+            # 避免整包 load；旧快照无该键 → None，调用方放行向后兼容）
+            'session_id': data.get('session_id'),
         }
 
 

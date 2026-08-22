@@ -152,6 +152,24 @@ class ChatResponse(BaseModel):
 class SimpleChatRequest(BaseModel):
     user_input: str = Field(..., description="用户输入文本")
     session_id: str = Field("default", description="会话标识")
+    # [B15] 补 sid 兼容别名：旧客户端 sid 被静默丢弃 → 与其余请求模型一致
+    # （SimpleChatRequest 之前缺该别名，旧客户端 sid 全部静默落进 default 脑）
+    sid: Optional[str] = Field(None, description="session_id 兼容别名（旧客户端）")
+
+    @model_validator(mode="after")
+    def _apply_sid_alias(self) -> "SimpleChatRequest":
+        """[B15] 旧客户端 sid → session_id 映射（与 ChatRequest 的 P0-3 兼容同款）。"""
+        if self.sid is not None:
+            if self.session_id == "default":
+                self.session_id = self.sid
+                logger.warning(
+                    f"[SimpleChatRequest] 兼容字段 sid='{self.sid}' 已映射为"
+                    " session_id（P0-3 兼容；新客户端请直接使用 session_id）")
+            elif self.session_id != self.sid:
+                logger.warning(
+                    f"[SimpleChatRequest] 同时收到 session_id='{self.session_id}'"
+                    f" 与 sid='{self.sid}'，以 session_id 为准（P0-3 兼容告警）")
+        return self
 
 
 class SimpleChatResponse(BaseModel):
@@ -236,6 +254,24 @@ class FeedRequest(BaseModel):
     # 与 sender（可选，来源标识，仅日志/观测用）
     llm_output: str = Field("", description="上一轮LLM输出（可选，塑形输入）")
     sender: str = Field("", description="事件发送方标识（可选，观测用）")
+    # [B15] 补 sid 兼容别名：旧客户端 sid 被静默丢弃 → 与其余请求模型一致
+    # （FeedRequest 之前缺该别名，旧客户端 sid 全部静默落进 bus 脑）
+    sid: Optional[str] = Field(None, description="session_id 兼容别名（旧客户端）")
+
+    @model_validator(mode="after")
+    def _apply_sid_alias(self) -> "FeedRequest":
+        """[B15] 旧客户端 sid → session_id 映射（与 ChatRequest 的 P0-3 兼容同款）。"""
+        if self.sid is not None:
+            if self.session_id == "bus":
+                self.session_id = self.sid
+                logger.warning(
+                    f"[FeedRequest] 兼容字段 sid='{self.sid}' 已映射为"
+                    " session_id（P0-3 兼容；新客户端请直接使用 session_id）")
+            elif self.session_id != self.sid:
+                logger.warning(
+                    f"[FeedRequest] 同时收到 session_id='{self.session_id}'"
+                    f" 与 sid='{self.sid}'，以 session_id 为准（P0-3 兼容告警）")
+        return self
 
 
 class FeedResponse(BaseModel):
@@ -397,26 +433,11 @@ def _store_session_allowlist() -> set:
     return allow or {"main"}
 
 
-def _store_dedup_key(user_input: str, llm_output: str) -> str:
-    """幂等键：sha256(user_input, llm_output)（工程惯例，设计附录 B 标注）。"""
-    return hashlib.sha256(
-        f"{user_input}\x00{llm_output}".encode("utf-8")).hexdigest()
-
-
-def _store_dedup_hit(session_id: str, key: str,
-                     window: Optional[float] = None) -> bool:
-    """滑动窗口幂等去重：窗口内同 payload → True（不重复处理）。"""
-    window = _store_dedup_window() if window is None else window
-    now = time.time()
-    with _store_dedup_lock:
-        bucket = _store_dedup.setdefault(session_id, {})
-        expired = [k for k, ts in bucket.items() if now - ts > window]
-        for k in expired:
-            bucket.pop(k, None)
-        if key in bucket:
-            return True
-        bucket[key] = now
-        return False
+# [B21] 旧幂等去重死代码（_store_dedup_key / _store_dedup_hit）已删除：
+# /store 幂等唯一权威 = core/store/ingest（60s 窗口，同 payload 去重）；
+# 保留 _store_dedup / _store_dedup_lock 仅为向后兼容模块级常量引用，不再使用。
+# [B21] 旧 _feed_rate_limited 包装已删除：/feed 直接用 _feed_rate_check（返回
+# 剩余等待秒数，供 429 Retry-After），bool 包装无调用点、误导维护者。
 
 
 async def _store_rate_check(session_id: str) -> Optional[float]:
@@ -487,9 +508,8 @@ async def _feed_rate_check() -> Optional[float]:
         return None
 
 
-async def _feed_rate_limited() -> bool:
-    """兼容包装：仅返回是否限流（bool）。"""
-    return await _feed_rate_check() is not None
+# [B21] 旧 _feed_rate_limited() bool 包装已删除（无调用点）：/feed 直接使用
+# _feed_rate_check()（L773）返回的剩余等待秒数构造 429 Retry-After。
 
 
 # ---------------------------------------------------------------------------
@@ -666,7 +686,11 @@ async def chat(req: ChatRequest):
     scheduler.register_session(req.session_id)
 
     # 获取对话权限（等待做梦完成），更新活动时间
-    acquired = scheduler.acquire_conversation(req.session_id)
+    # [B5] acquire_conversation 内部是同步阻塞锁（timeout=10s），async 端点
+    # 直接调用会冻结整个事件循环（做梦期间最长 10s、多会话写串行化）；
+    # 移入线程池执行，release 不阻塞留在 finally 原样。
+    acquired = await asyncio.get_event_loop().run_in_executor(
+        None, lambda: scheduler.acquire_conversation(req.session_id))
     scheduler.touch(req.session_id)
     if not acquired:
         # 做梦未结束且等待超时：拒绝请求以避免对话处理与后台做梦并发写
@@ -687,7 +711,9 @@ async def chat(req: ChatRequest):
                     None,
                     lambda: loop.bridge.query(req.user_input, memory_context))
                 logger.info(
-                    f"[{req.session_id}] LLM 回复长度: {len(response_text)}")
+                    # [B22] 防御：bridge.query 返回 None 时 len(None) 会抛 TypeError
+                    # （LLM content=None 已被 llm_bridge 归一化为空串，此处双保险）
+                    f"[{req.session_id}] LLM 回复长度: {len(response_text or '')}")
             except Exception as e:
                 logger.error(f"[{req.session_id}] LLM 调用失败: {e}")
                 # T2.6：关键错误审计（LLM 调用失败，不中断服务）
@@ -724,6 +750,7 @@ async def chat_simple(req: SimpleChatRequest):
         raise HTTPException(status_code=400, detail="user_input 不能为空")
 
     sm = get_session_manager()
+    scheduler = get_dream_scheduler()
     loop = sm.get_or_create(req.session_id)
 
     if loop.bridge is None:
@@ -733,11 +760,25 @@ async def chat_simple(req: SimpleChatRequest):
                    "请配置 DEEPSEEK_API_KEY 后重试，或改用 /chat 端点。",
         )
 
+    # [B1] 补做梦互斥：query_llm 内部 process_turn 是写路径，此前 /chat/simple
+    # 无 acquire/release → 可与后台做梦并发写同一脑（J/precision/episodic 撕裂）。
+    # 与 /chat（L669 同款）协调段：register + acquire（失败 503）+ finally release。
+    scheduler.register_session(req.session_id)
+    # [B5] acquire_conversation 内部是同步阻塞锁（timeout=10s），async 端点直接
+    # 调用会冻结事件循环（做梦期间最长 10s）；移入线程池执行，release 不阻塞留在 finally。
+    acquired = await asyncio.get_event_loop().run_in_executor(
+        None, lambda: scheduler.acquire_conversation(req.session_id))
+    scheduler.touch(req.session_id)
+    if not acquired:
+        raise HTTPException(
+            status_code=503,
+            detail="系统正在做梦（记忆巩固中），请稍后重试。")
+
     try:
         response_text = await asyncio.get_event_loop().run_in_executor(
             None, lambda: loop.query_llm(req.user_input))
         logger.info(
-            f"[{req.session_id}] (simple) LLM 回复长度: {len(response_text)}")
+            f"[{req.session_id}] (simple) LLM 回复长度: {len(response_text or '')}")
     except HTTPException:
         raise
     except Exception as e:
@@ -746,6 +787,8 @@ async def chat_simple(req: SimpleChatRequest):
             status_code=500,
             detail=f"LLM 查询失败: {e}",
         )
+    finally:
+        scheduler.release_conversation(req.session_id)
 
     memory_status = _status_for(loop)
     return SimpleChatResponse(
@@ -783,7 +826,10 @@ async def feed(req: FeedRequest):
     loop = sm.get_or_create(req.session_id)
     scheduler.register_session(req.session_id)
 
-    acquired = scheduler.acquire_conversation(req.session_id)
+    # [B5] 同步阻塞锁移出事件循环（见 /chat L669 同款注释）：做梦期间
+    # acquire 最长阻塞 10s，直接调用会冻结整个事件循环
+    acquired = await asyncio.get_event_loop().run_in_executor(
+        None, lambda: scheduler.acquire_conversation(req.session_id))
     scheduler.touch(req.session_id)
     if not acquired:
         raise HTTPException(
@@ -874,7 +920,9 @@ async def store(req: StoreRequest):
     # 4. 做梦协调（与 /chat//feed 同等对待，防并发写记忆状态）
     scheduler = get_dream_scheduler()
     scheduler.register_session(req.session_id)
-    acquired = scheduler.acquire_conversation(req.session_id)
+    # [B5] 同步阻塞锁移出事件循环（见 /chat L669 同款注释）
+    acquired = await asyncio.get_event_loop().run_in_executor(
+        None, lambda: scheduler.acquire_conversation(req.session_id))
     scheduler.touch(req.session_id)
     if not acquired:
         raise HTTPException(
@@ -925,20 +973,18 @@ async def store(req: StoreRequest):
 
             # 6. 后处理新条目 meta（S1-11 字段：core/info_value/ts/gray/source）
             entries = list(loop.memory.iter_episodic())
-            new_entry = entries[-1] if entries else None
+            # [B14] 用 epi_before 切片取"本轮实际新增条目"（可 0~N 条），逐条打
+            # meta——旧实现 entries[-1] 假设"本轮只追加一条"，多条时 meta 只落
+            # 最后一条（core/ts/gray/info_value 缺失）；episodic_size()>epi_before
+            # 判定保留（与旧逻辑一致，防无新增时误打最后一条存量）。
+            new_entries = (entries[epi_before:]
+                           if loop.memory.episodic_size() > epi_before else [])
             stored = False
             reason = None
             info_value = 0.0
-            if new_entry is not None and \
-                    loop.memory.episodic_size() > epi_before:
-                new_entry.core = core or None
-                new_entry.ts = time.time()
-                if gray:
-                    # 灰度标记：三重冻结（不参与重放/聚类/引用加固；
-                    # L1 天然不可见：source_filter='external' 过滤 store_gray）
-                    new_entry.gray = True
-                    new_entry.source = 'store_gray'
+            if new_entries:
                 # 价值分数（论文判据 §6.2；条目已带 process_turn 原生 surprise）
+                # 批量上下文（surprise/ref 全域极值）只算一次，逐条算条目值
                 try:
                     from api.value_filter import (
                         compute_info_value, value_filtered,
@@ -947,18 +993,34 @@ async def store(req: StoreRequest):
                                  for e in entries]
                     refs = [float(getattr(e, 'reference_count', 0) or 0)
                             for e in entries]
-                    info_value = compute_info_value(
-                        surprise=float(getattr(new_entry, 'surprise', 0.0) or 0.0),
-                        reference_count=int(
-                            getattr(new_entry, 'reference_count', 0) or 0),
-                        surprise_max=max(surprises) if surprises else None,
-                        ref_count_max=max(refs) if refs else None,
-                        text=core or req.llm_output,
-                    )
-                    new_entry.info_value = info_value
-                except Exception as e:  # pylint: disable=broad-except
-                    logger.warning(
-                        f"[{req.session_id}] /store info_value 计算失败（fail-open）: {e}")
+                    surprise_max = max(surprises) if surprises else None
+                    ref_count_max = max(refs) if refs else None
+                except Exception:  # pylint: disable=broad-except
+                    compute_info_value, value_filtered = None, None
+                    surprise_max = ref_count_max = None
+                for new_entry in new_entries:
+                    new_entry.core = core or None
+                    new_entry.ts = time.time()
+                    if gray:
+                        # 灰度标记：三重冻结（不参与重放/聚类/引用加固；
+                        # L1 天然不可见：source_filter='external' 过滤 store_gray）
+                        new_entry.gray = True
+                        new_entry.source = 'store_gray'
+                    if compute_info_value is not None:
+                        try:
+                            info_value = compute_info_value(
+                                surprise=float(
+                                    getattr(new_entry, 'surprise', 0.0) or 0.0),
+                                reference_count=int(
+                                    getattr(new_entry, 'reference_count', 0) or 0),
+                                surprise_max=surprise_max,
+                                ref_count_max=ref_count_max,
+                                text=core or req.llm_output,
+                            )
+                            new_entry.info_value = info_value
+                        except Exception as e:  # pylint: disable=broad-except
+                            logger.warning(
+                                f"[{req.session_id}] /store info_value 计算失败（fail-open）: {e}")
                 stored = True
             else:
                 # 未落库：垃圾过滤命中 / embedder 无语义编码（非熔断降级）
@@ -985,9 +1047,11 @@ async def store(req: StoreRequest):
                 "info_value": round(info_value, 4),
                 "reason": reason,
             }
-            if stored and new_entry is not None:
+            if stored and new_entries:
+                # [B14] 报告最近一条新建条目（ingest 的 P1-1 单条目附加契约；
+                # 多条时以最后一条为"本轮主条目"，旧实现 entries[-1] 同语义）
                 # P1-1 待集成点：writer 报告新建条目 → ingest 附加过程字段
-                data["entry"] = new_entry
+                data["entry"] = new_entries[-1]
             return data
 
         wreq = WriteRequest(
@@ -1168,7 +1232,9 @@ async def e3_review(req: E3ReviewRequest):
     scheduler = get_dream_scheduler()
     loop = sm.get_or_create(req.session_id)
     scheduler.register_session(req.session_id)
-    acquired = scheduler.acquire_conversation(req.session_id)
+    # [B5] 同步阻塞锁移出事件循环（见 /chat L669 同款注释）
+    acquired = await asyncio.get_event_loop().run_in_executor(
+        None, lambda: scheduler.acquire_conversation(req.session_id))
     scheduler.touch(req.session_id)
     if not acquired:
         return {"enabled": True, "busy": True, "session_id": req.session_id,
@@ -1308,12 +1374,25 @@ async def snapshot(session_id: str, req: SnapshotRequest):
     session_id 参与路径前清洗为安全字符集，杜绝任何路径穿越。
     """
     sm = get_session_manager()
+    scheduler = get_dream_scheduler()
     loop = sm.get(session_id)
     if loop is None:
         raise HTTPException(
             status_code=404,
             detail=f"会话 '{session_id}' 不存在",
         )
+
+    # [B4] 做梦互斥：save_session_state 是写路径，梦期落盘会读到半巩固状态，
+    # 自动恢复会载入坏状态 → acquire（失败 503）→ 保存 → finally release
+    # （[B5] acquire 是同步阻塞锁，移入线程池防冻结事件循环）
+    scheduler.register_session(session_id)
+    acquired = await asyncio.get_event_loop().run_in_executor(
+        None, lambda: scheduler.acquire_conversation(session_id))
+    scheduler.touch(session_id)
+    if not acquired:
+        raise HTTPException(
+            status_code=503,
+            detail="系统正在做梦（记忆巩固中），请稍后重试。")
 
     try:
         # T2.6：保存前记录将被覆盖的 latest_{session}.pt 旧 sha256（审计对账用）
@@ -1349,6 +1428,8 @@ async def snapshot(session_id: str, req: SnapshotRequest):
             status_code=500,
             detail=f"快照保存失败: {e}",
         )
+    finally:
+        scheduler.release_conversation(session_id)
 
 
 @app.post("/restore/{session_id}")
@@ -1383,6 +1464,35 @@ async def restore(session_id: str, req: RestoreRequest):
             detail=f"快照文件不存在: {full_path}",
         )
 
+    # [B3] 归属校验（load_state 前）：顶层 session_id 非空且与当前会话不符 →
+    # 400 拒绝跨会话恢复（旧实现可跨会话载入整脑，load_state 仅告警继续）。
+    # 用 get_metadata 轻量读（不整包 load）；读不到元数据 → 放行（fail-open，
+    # 向后兼容旧快照无 session_id 字段）。
+    try:
+        meta = loop.snapshot.get_metadata(full_path)
+        owner = (meta or {}).get("session_id")
+    except Exception:  # pylint: disable=broad-except
+        owner = None
+    if owner and str(owner) != str(session_id):
+        raise HTTPException(
+            status_code=400,
+            detail=(f"快照归属会话 {owner}，与 {session_id} 不符，"
+                    "拒绝跨会话恢复"),
+        )
+
+    # [B3] 做梦互斥：load_state 是写路径（重载 J/precision/episodic），
+    # 梦期恢复会与后台做梦并发写同一脑 → acquire（失败 503）→ finally release
+    # （[B5] acquire 是同步阻塞锁，移入线程池防冻结事件循环）
+    scheduler = get_dream_scheduler()
+    scheduler.register_session(session_id)
+    acquired = await asyncio.get_event_loop().run_in_executor(
+        None, lambda: scheduler.acquire_conversation(session_id))
+    scheduler.touch(session_id)
+    if not acquired:
+        raise HTTPException(
+            status_code=503,
+            detail="系统正在做梦（记忆巩固中），请稍后重试。")
+
     try:
         loop.load_state(full_path)
         logger.info(f"[{session_id}] 已从 {full_path} 恢复状态")
@@ -1401,6 +1511,8 @@ async def restore(session_id: str, req: RestoreRequest):
             status_code=500,
             detail=f"恢复失败: {e}",
         )
+    finally:
+        scheduler.release_conversation(session_id)
 
 
 @app.get("/sessions")

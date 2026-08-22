@@ -251,6 +251,12 @@ class AllostaticJController:
         # 2026-08-22 冷启动门修正（dandan 拍板：测试期绕过）：饱和/崩塌是结构
         # 性硬信号（一帧即判，对应论文"越界触发重锚"本意），**绕过冷启动**；
         # 只有 surprise 统计带漂移（需分布）才等 min_samples 窗口。
+        # [A1] z 须在 sat/col 分支前初始化：否则下方 logger.info(...z=%.2f...)
+        # 引用未定义 z → 必抛 UnboundLocalError，被 loop.py 的 fail-open
+        # broad-except 吞掉 → self.j_target = new_target 永不执行 → σ 饱和/崩塌
+        # 时设定点永不重锚（σ 饱和长期无法自愈的根因）。sat/col 分支的 z 无
+        # 统计意义（仅用于日志），取 0.0 中性值即可；fail-open 语义不变。
+        z = 0.0
         if sat:
             new_target, reason = self.j_target - self.step, 'saturation'
         elif col:
@@ -335,7 +341,10 @@ class AllostaticJController:
             win = list(self.surprise_window)
             mean_s = (sum(win) / len(win)) if win else None
             std_s = (statistics.pstdev(win) if len(win) >= 2 else None)
-            events = list(self.events)
+            # [A5] 深拷贝 events：list() 只拷贝引用，下方原地改写 ev['ts_turn']
+            # 会污染 self.events 的历史事件 ts_turn（真实发生轮次被永久覆写为
+            # 当前 turn）。dict(ev) 一层拷贝足够（事件 dict 值均为标量/None）。
+            events = [dict(ev) for ev in self.events]
             if turn_count is not None:
                 for ev in events:
                     ev['ts_turn'] = turn_count
@@ -854,7 +863,11 @@ class AttractorNetwork:
         推断规则（从 FEP 推导）:
             b_q = bias + J @ sigma           # 对数几率（内部模型预测）
             sigma = langevin(b_q)             # Langevin 激活: coth(b) - 1/b
-            sigma += sqrt(2*T) * noise        # Langevin 扩散项（随机性）
+            sigma += T * noise                # Langevin 扩散项（随机性）
+            # [A13] 注释与实现统一（以实现为准）：实现为 randn_like(sigma) *
+            # temperature（L941 附近），扩散项 = T·noise；物理 FEP 标准 Langevin
+            # 形式为 sqrt(2T)·noise，此处按现有标定实现（改实现属行为变化 →
+            # [需批准]，需全量做梦回归）。
             感官节点被 sensory_input * precision clamping（外部证据注入）
 
         Langevin 动力学物理上包含漂移项（确定性激活）和扩散项（随机噪声）。
@@ -968,7 +981,8 @@ class AttractorNetwork:
     def learn(self, activation: Activation, sensory_input: torch.Tensor,
               learning_rate: float = 0.01,
               orth_weight_override: Optional[float] = None,
-              complexity_weight_override: Optional[float] = None) -> None:
+              complexity_weight_override: Optional[float] = None,
+              entropy_correction: bool = False) -> None:
         """FEP 学习：更新耦合矩阵 J。
 
         学习规则（从 FEP 推导）:
@@ -1035,6 +1049,11 @@ class AttractorNetwork:
             learning_rate: 学习率 η。
             orth_weight_override: 临时正交化权重覆盖（E-P2-5）。
             complexity_weight_override: 临时复杂度权重覆盖（E-P2-5）。
+            entropy_correction: 熵校正模式（[A7] 内部参数，非端点签名）。True 时
+                只执行正交化/复杂性梯度增量校正（跳过 Hebbian 强化项与 EWC
+                Fisher 累积），供 _manage_entropy 的二次干预使用——避免同轮
+                第二次完整 learn 造成 J/Hebbian 双重强化（M5"每轮 learn 一次"
+                契约）。
         """
         # E-P2-1: 激活态自动迁移到正确 device
         sigma = activation.state.to(self.device)
@@ -1076,7 +1095,14 @@ class AttractorNetwork:
         # 注意符号: ∂F_accuracy/∂J = -Hebbian（负号因为增强连接降低自由能）
         #          ∂F_complexity/∂J = +complexity_grad（正号因为复杂性增加自由能）
         #          ΔJ = -(∂F_accuracy + ∂F_complexity) = Hebbian - complexity_grad
-        delta_J = hebbian - complexity_grad
+        if entropy_correction:
+            # [A7] 熵校正模式：只做正交化/复杂性梯度增量校正（orth_pressure
+            # 抑制已饱和方向 + 权重衰减），**跳过 Hebbian 强化项**——同一
+            # activation 二次完整 learn 会让 J/Hebbian 双重强化，违反 M5
+            # "每轮 learn 一次"契约（_manage_entropy 两处调用传 True）。
+            delta_J = -complexity_grad
+        else:
+            delta_J = hebbian - complexity_grad
 
         # ── S4（2026-08-18）：EWC 持续学习保护（C 条件触发，只做加法）──
         # 开关关（self.ewc is None 或 enabled=False）→ 本块整体跳过，零参与，
@@ -1093,7 +1119,9 @@ class AttractorNetwork:
         #      对 A 重锚（标量乘 J，只改 ‖J‖ 不改方向）不变——C 豁免 A 的
         #      重锚缩放方向。公式与推导见本方法 docstring。
         ewc = self.ewc
-        if ewc is not None and ewc.enabled:
+        # [A7] 熵校正模式跳过 EWC 块：同 activation 二次累积 Fisher/锚点会
+        # 双重计入保护锚点（熵校正不是完整 learn，不做语义副作用）。
+        if (not entropy_correction) and ewc is not None and ewc.enabled:
             stats = compute_sigma_stats(activation.state)
             col_act = (self.allostatic.col_act
                        if self.allostatic is not None else 5)
@@ -1340,6 +1368,12 @@ class AttractorNetwork:
                 self.allostatic.j_target = max(
                     self.allostatic.j_min,
                     min(self.allostatic.j_max, float(_jt)))
+                # [A6] 同步范数钳制设定点：learn() 的范数钳制读 self.j_target_norm
+                # （L1121 处 getattr 默认 40.0）。恢复 j_target 不回写 →
+                # j_target_norm 保持 stale 值（可能停 40），恢复后 learn() 仍按
+                # 旧设定点钳制，饱和态下恢复的低设定点不生效。此处是恢复路径的
+                # 补充写；在线唯一写者 update_allostatic（L1379）不受影响。
+                self.j_target_norm = self.allostatic.j_target
 
     def reset_state(self) -> None:
         """重置内部状态 sigma 为零（不影响已学习的 J 矩阵）。
