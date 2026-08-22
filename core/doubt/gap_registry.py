@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from typing import Dict, List, Optional
 
@@ -96,13 +97,66 @@ class GapRegistry:
     #  登记
     # ------------------------------------------------------------------ #
 
+    @staticmethod
+    def _fok_core(topic: str) -> str:
+        """归一化核心：剥包装前缀（用户:/助手:）与 [doubt] 协议前缀。"""
+        t = re.sub(r'^(?:用户|助手)\s*[:：]\s*', '', str(topic))
+        t = re.sub(r'^\[doubt\]\s*\w+\s*[:：]\s*', '', t)
+        return t.strip()
+
+    @staticmethod
+    def _fok_similar(a: str, b: str) -> bool:
+        """同一悬案判定：共享前缀 ≥12 字，或字符二元组 Jaccard 相似度 ≥ 0.4。
+
+        (2026-08-22 修复实证：同一悬案三种形态共享前 16 字前缀——"旧结论说
+        等待只是被动，但机械援军独白"——但尾部在第 16 字分叉，长主题稀释
+        Jaccard；故用"前缀长匹配 OR 整体相似"。独立悬案共享 ≤7 字，不误并。)
+        """
+        if not a or not b:
+            return a == b
+        if a == b:
+            return True
+        if len(a) < 8 or len(b) < 8:
+            return a == b
+        # 共享前缀长度
+        n = 0
+        for ca, cb in zip(a, b):
+            if ca != cb:
+                break
+            n += 1
+        if n >= 12:
+            return True
+        # 字符二元组 Jaccard
+        ga = set(zip(a, a[1:]))
+        gb = set(zip(b, b[1:]))
+        inter = len(ga & gb)
+        union = len(ga | gb)
+        return union > 0 and inter / union >= 0.4
+
     def register_fok_unresolved(self, topic: str, detail: str = "",
                                 ts: Optional[float] = None) -> None:
-        """A 类：fok 未决登记（上限 50 条，防膨胀）。"""
+        """A 类：fok 未决登记（上限 50 条，防膨胀）。
+
+        2026-08-22 去重修复：E3 重激活/路径 B 会让同一悬案以不同包装重复登记
+        （gap_registry 实锤：机械援军主题 3 形态、3080 主题 2 形态，间隔 ~21h）。
+        归一化去重键（剥前缀取核心前 20 字）命中已有条目 → 更新 ts/detail
+        （"重新面对"语义），不新增。
+        """
+        topic = str(topic)[:120]
+        core = self._fok_core(topic)
+        now = ts if ts is not None else time.time()
+        for existing in self._fok_unresolved:
+            ex_core = self._fok_core(existing['topic'])
+            if core and self._fok_similar(core, ex_core):
+                existing['ts'] = now
+                if detail:
+                    existing['detail'] = str(detail)[:300]
+                self._persist()
+                return  # 去重：更新已有，不新增
         self._fok_unresolved.append({
-            'topic': str(topic)[:120],
+            'topic': topic,
             'detail': str(detail)[:300],
-            'ts': ts if ts is not None else time.time(),
+            'ts': now,
         })
         self._fok_unresolved = self._fok_unresolved[-50:]
         self._persist()
