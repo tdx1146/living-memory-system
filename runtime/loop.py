@@ -2801,6 +2801,14 @@ class LivingMemoryLoop:
         status['degraded_events'] = int(getattr(self, 'degraded_events', 0) or 0)
         status['last_turn_degraded'] = bool(
             getattr(self, 'last_turn_degraded', False))
+        # 2026-08-22 观察通道（dandan 指示：连续汇报惊讶度）：暴露 /chat 路径
+        # 每轮惊讶度历史（decoder.surprise_history）。纯增量字段，重启后重建。
+        try:
+            hist = list(getattr(getattr(self, 'decoder', None),
+                                'surprise_history', None) or [])
+            status['surprise_history'] = [round(float(x), 3) for x in hist][-40:]
+        except Exception:
+            status['surprise_history'] = []
         try:
             status['capacity_usage'] = self.memory.episodic_size()
             status['capacity_soft_limit'] = self.memory.get_episodic_maxlen()

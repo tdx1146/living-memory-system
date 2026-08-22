@@ -550,6 +550,15 @@ def _status_for(loop) -> dict:
     except Exception:
         status['episodic_buffer_size'] = 0
     status['llm_enabled'] = loop.bridge is not None
+    # 2026-08-22 观察通道（dandan 指示：连续汇报惊讶度）：暴露 /chat 路径
+    # 每轮惊讶度历史（decoder.surprise_history）。纯增量字段（阶段 3 precision
+    # 观测块先例，既有字段逐字节不变——血管不换）。重启后重建，最多 40 条。
+    try:
+        hist = list(getattr(getattr(loop, 'decoder', None),
+                            'surprise_history', None) or [])
+        status['surprise_history'] = [round(float(x), 3) for x in hist][-40:]
+    except Exception:
+        status['surprise_history'] = []
     return status
 
 
