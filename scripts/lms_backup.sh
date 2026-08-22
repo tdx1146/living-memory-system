@@ -6,7 +6,7 @@
 #   1) 15 分钟级：snapshots/ 增量镜像复制 → backups/snapshots-15min/
 #      （rsync -a --delete：幂等、保留 mtime、增量传输；镜像即"最新快照集"）
 #   2) 每小时：snapshots/ 归档 tar.zst → backups/hourly/（保留 BACKUP_KEEP_HOURS 小时）
-#   3) 每日 02:30：tar.zst 全量备份（snapshots/ + data/ + logs/，排除临时文件）
+#   3) 每日 02:30：tar.zst 全量备份（snapshots/ + data/ + logs/ + .env 关键配置，排除临时文件）
 #      → backups/daily/lms-YYYYMMDD.tar.zst，保留 BACKUP_KEEP_DAYS 天滚动
 #   4) 备份元数据：backups/MANIFEST.jsonl（时间/类型/大小/hash）追加式记录
 #   5) 跨机复制（可选）：REMOTE_BACKUP 配置 rsync 目标，默认空 = 仅本机
@@ -217,7 +217,7 @@ run_daily() {
     if ! ( cd "$LMS_HOME" && tar --zstd -cf "$tmp_archive" \
             --exclude='*.lock' --exclude='*.tmp' --exclude='*.swp' \
             --exclude='__pycache__' --exclude='*.pyc' \
-            snapshots data logs ); then
+            snapshots data logs .env .env.bak-* ); then
         rm -f "$tmp_archive" 2>/dev/null || true
         fail "tar.zst 打包失败"
         return 1
