@@ -42,6 +42,9 @@ class SessionManager:
         self._sessions: Dict[str, LivingMemoryLoop] = {}
         self._configs: Dict[str, dict] = {}
         self._lock = threading.RLock()
+        # [B19] 会话级锁表：首访的 LivingMemoryLoop 构造 + torch.load 自动恢复
+        # 只在会话级锁内执行，避免一个会话恢复阻塞所有会话的 get_or_create
+        self._session_locks: Dict[str, threading.Lock] = {}
         self._default_config_factory = (
             default_config_factory or get_api_config
         )
@@ -64,10 +67,26 @@ class SessionManager:
             该 session 的 LivingMemoryLoop 实例。
         """
         if not session_id:
+            # [B6] 空 session_id 静默兜底到 "default" 无日志 → 拼错字段的客户端
+            # 流量全部污染 default 脑；补 WARNING 提升可见性（行为不变）
+            logger.warning(
+                "收到空 session_id，兜底为 'default'"
+                "（客户端字段拼写错误会污染 default 脑）")
             session_id = "default"
 
         with self._lock:
-            if session_id not in self._sessions:
+            existing = self._sessions.get(session_id)
+        if existing is not None:
+            return existing
+
+        # [B19] 会话级锁：首访的 LivingMemoryLoop 构造 + torch.load 自动恢复
+        # （可能秒级）只阻塞同 sid 的并发首访，不阻塞其他会话（旧实现全程持
+        # 全局 RLock → 一个会话恢复时所有会话的 get_or_create 全部被阻塞）。
+        with self._session_lock(session_id):
+            with self._lock:
+                loop = self._sessions.get(session_id)
+                if loop is not None:
+                    return loop
                 # 新建 session
                 cfg = dict(config) if config else self._default_config_factory()
                 # 注入 session_id：供 per-session 持久化使用
@@ -75,18 +94,30 @@ class SessionManager:
                 cfg['session_id'] = session_id
                 logger.info(f"创建新会话: {session_id}")
                 loop = LivingMemoryLoop(cfg)
+            # 全局锁外执行自动恢复（仍在会话级锁内，只阻塞同 sid）：
+            # 阶段1-A 补丁（P0-13 优雅停机的配套），进程重启后自动恢复会话快照
+            self._try_auto_restore(loop, session_id)
+            with self._lock:
+                # [B19] 恢复完成后才注册可见（防并发访问读到半恢复状态；
+                # 与旧实现"恢复完成后才返回"的语义一致；双检防极端路径）
+                existing = self._sessions.get(session_id)
+                if existing is not None:
+                    return existing
                 self._sessions[session_id] = loop
                 self._configs[session_id] = cfg
                 # T2.6：会话创建审计（只加日志，不改业务逻辑）
                 audit("session_created", session_id=session_id,
                       turn_count=loop.turn_count)
-                # 阶段1-A 补丁：启动自动恢复会话快照（P0-13 优雅停机的配套）。
-                # 进程重启后会话从零开始会丢失全部记忆演化，必须自动恢复：
-                #   候选 1）snapshots/{session}/latest_{session}.pt（新命名规范）
-                #   候选 2）snapshots/latest.pt（存量旧格式，向后兼容）
-                # 任何恢复失败仅告警不阻断（fail-open，不因快照损坏拒绝服务）。
-                self._try_auto_restore(loop, session_id)
-            return self._sessions[session_id]
+            return loop
+
+    def _session_lock(self, session_id: str) -> threading.Lock:
+        """[B19] 会话级锁（get-or-create）：全局锁内 get-or-create 会话锁。"""
+        with self._lock:
+            lock = self._session_locks.get(session_id)
+            if lock is None:
+                lock = threading.Lock()
+                self._session_locks[session_id] = lock
+            return lock
 
     def _try_auto_restore(self, loop: LivingMemoryLoop, session_id: str) -> None:
         """启动自动恢复：在候选快照中选择"最有内容"者加载。
@@ -115,6 +146,18 @@ class SessionManager:
                     continue
                 try:
                     st = torch.load(path, map_location="cpu", weights_only=False)
+                    # [B2] 归属校验：顶层/嵌套 session_id 非空且与当前会话不符 →
+                    # 跳过该候选（旧实现把全局 latest.pt 当任意会话候选，load_state
+                    # 对 session_id 不一致仅告警 → 跨会话污染/静默回退过期脑）；
+                    # 旧快照无 session_id 字段 → 放行（向后兼容，保留旧格式恢复能力）
+                    owner = st.get("session_id")
+                    if not owner and isinstance(st.get("meta"), dict):
+                        owner = st.get("meta", {}).get("session_id")
+                    if owner and str(owner) != str(session_id):
+                        logger.warning(
+                            f"[{session_id}] 候选快照 {path} 归属会话 {owner}，"
+                            "跳过（防跨会话污染）")
+                        continue
                     turn = int((st.get("meta") or {}).get("turn_count", 0))
                     if turn > best_turn:
                         best_path, best_turn = path, turn

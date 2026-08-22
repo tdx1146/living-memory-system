@@ -68,6 +68,32 @@ def _get_env(key: str, default: str = "") -> str:
     return val.strip() if isinstance(val, str) else val
 
 
+def _env_int(key: str, default: int) -> int:
+    """[B12] 安全 int 解析：空串/非法值回退默认并 WARNING 指明键名。
+
+    旧实现 ``int(_get_env(...))`` 在 env 为空串时抛 ValueError → 配置构建
+    崩溃 500 且不指向具体键；本助手回退默认 + 告警（不改任何默认值）。
+    """
+    try:
+        return int(_get_env(key, str(default)))
+    except (TypeError, ValueError):
+        logger.warning(
+            "环境变量 %s 非法/为空（%r），回退默认 %s",
+            key, os.environ.get(key), default)
+        return default
+
+
+def _env_float(key: str, default: float) -> float:
+    """[B12] 安全 float 解析：空串/非法值回退默认并 WARNING 指明键名。"""
+    try:
+        return float(_get_env(key, str(default)))
+    except (TypeError, ValueError):
+        logger.warning(
+            "环境变量 %s 非法/为空（%r），回退默认 %s",
+            key, os.environ.get(key), default)
+        return default
+
+
 def build_embedder(embedder_type: str, input_dim: int):
     """根据类型构造嵌入器实例。
 
@@ -92,7 +118,8 @@ def build_embedder(embedder_type: str, input_dim: int):
                 "LMS_CLOUD_EMBED_URL",
                 "https://embed.example.com/v1/embeddings")
             model = _get_env("LMS_CLOUD_EMBED_MODEL", "bge-m3")
-            remote_dim = int(_get_env("LMS_CLOUD_EMBED_DIM", "1024"))
+            # [B12] 空串/非法 env → 回退默认（旧 int() 直接抛 ValueError 崩溃）
+            remote_dim = _env_int("LMS_CLOUD_EMBED_DIM", 1024)
             logger.info(
                 f"使用 CloudEmbedder，API: {api_url}, "
                 f"模型: {model}, 维度: {remote_dim}")
@@ -184,8 +211,9 @@ def get_api_config() -> dict:
     config = default_config()
 
     # --- 网络结构 ---
-    num_nodes = int(_get_env("LMS_NUM_NODES", str(config['num_nodes'])))
-    input_dim = int(_get_env("LMS_INPUT_DIM", str(config['input_dim'])))
+    # [B12] 空串/非法 env → 回退默认（旧 int() 在 env 空串时抛 ValueError 崩溃）
+    num_nodes = _env_int("LMS_NUM_NODES", config['num_nodes'])
+    input_dim = _env_int("LMS_INPUT_DIM", config['input_dim'])
     config['num_nodes'] = num_nodes
     config['input_dim'] = input_dim
 
@@ -220,16 +248,18 @@ def get_api_config() -> dict:
     # --- 自指回路 LLM 增强蒸馏（Phase 3.3；默认关闭，开启后每 interval 轮调一次 LLM）---
     config['self_ref_llm_distill_enabled'] = (
         _get_env("LMS_SELF_REF_LLM_DISTILL_ENABLED", "false").lower() == "true")
-    config['self_ref_llm_distill_interval'] = int(
-        _get_env("LMS_SELF_REF_LLM_DISTILL_INTERVAL", "5"))
+    # [B12] 安全 int 解析（空串/非法回退默认 + 告警）
+    config['self_ref_llm_distill_interval'] = _env_int(
+        "LMS_SELF_REF_LLM_DISTILL_INTERVAL", 5)
 
     # --- T2.8 算法治理开关（全部默认关闭 = 保持原行为；详见 .env.example）---
     # 惊讶度归一化：F /= ‖J‖_F（LMS_NORM_SURPRISE=1 启用）
     config['norm_surprise'] = (
         _get_env("LMS_NORM_SURPRISE", "0") == "1")
     # 回放权重钳制：replay_weight × min(surprise, cap)（0 = 不钳制）
-    config['replay_surprise_cap'] = float(
-        _get_env("LMS_REPLAY_SURPRISE_CAP", "0") or 0)
+    # [B12] 安全 float 解析（空串/非法回退默认 + 告警）
+    config['replay_surprise_cap'] = _env_float(
+        "LMS_REPLAY_SURPRISE_CAP", 0.0)
     # long_term_latent 归一化：consolidate 后除以 L2 范数（=1 启用）
     config['norm_latent'] = (
         _get_env("LMS_NORM_LATENT", "0") == "1")
@@ -247,28 +277,29 @@ def get_api_config() -> dict:
     # 默认关（LMS_J_ALLOSTATIC=0）→ 固定 J 行为完全不变（回滚干净）；
     # 开启后 J_target_norm 由 surprise 序列统计在线重估（Mehra 1970 innovation
     # 法 + Sterling 2012 allostasis），LMS_J_TARGET_NORM 仅作初始设定点。
-    config['j_target_norm'] = float(
-        _get_env("LMS_J_TARGET_NORM", "40.0") or 40.0)
+    # [B12] 全部 j_allostatic_* 改安全解析（空串/非法回退默认 + 告警；
+    # .env 红线值不变：LMS_J_TARGET_NORM 的 12 照常生效，默认 40.0 保持）
+    config['j_target_norm'] = _env_float("LMS_J_TARGET_NORM", 40.0)
     config['j_allostatic'] = (
         _get_env("LMS_J_ALLOSTATIC", "0") == "1")
-    config['j_allostatic_window'] = int(
-        _get_env("LMS_J_ALLOSTATIC_WINDOW", "200"))
-    config['j_allostatic_k'] = float(
-        _get_env("LMS_J_ALLOSTATIC_K", "2.0"))
-    config['j_allostatic_step'] = float(
-        _get_env("LMS_J_ALLOSTATIC_STEP", "0.5"))
-    config['j_allostatic_persist'] = int(
-        _get_env("LMS_J_ALLOSTATIC_PERSIST", "5"))
-    config['j_allostatic_min'] = float(
-        _get_env("LMS_J_ALLOSTATIC_MIN", "3.0"))
-    config['j_allostatic_max'] = float(
-        _get_env("LMS_J_ALLOSTATIC_MAX", "40.0"))
-    config['j_allostatic_min_samples'] = int(
-        _get_env("LMS_J_ALLOSTATIC_MIN_SAMPLES", "30"))
-    config['j_allostatic_sat_frac'] = float(
-        _get_env("LMS_J_ALLOSTATIC_SAT_FRAC", "0.9"))
-    config['j_allostatic_col_act'] = int(
-        _get_env("LMS_J_ALLOSTATIC_COL_ACT", "5"))
+    config['j_allostatic_window'] = _env_int(
+        "LMS_J_ALLOSTATIC_WINDOW", 200)
+    config['j_allostatic_k'] = _env_float(
+        "LMS_J_ALLOSTATIC_K", 2.0)
+    config['j_allostatic_step'] = _env_float(
+        "LMS_J_ALLOSTATIC_STEP", 0.5)
+    config['j_allostatic_persist'] = _env_int(
+        "LMS_J_ALLOSTATIC_PERSIST", 5)
+    config['j_allostatic_min'] = _env_float(
+        "LMS_J_ALLOSTATIC_MIN", 3.0)
+    config['j_allostatic_max'] = _env_float(
+        "LMS_J_ALLOSTATIC_MAX", 40.0)
+    config['j_allostatic_min_samples'] = _env_int(
+        "LMS_J_ALLOSTATIC_MIN_SAMPLES", 30)
+    config['j_allostatic_sat_frac'] = _env_float(
+        "LMS_J_ALLOSTATIC_SAT_FRAC", 0.9)
+    config['j_allostatic_col_act'] = _env_int(
+        "LMS_J_ALLOSTATIC_COL_ACT", 5)
 
     # --- 快照配置 ---
     config['auto_snapshot'] = True
@@ -282,5 +313,6 @@ def get_server_config() -> dict:
     """返回服务监听配置（host/port）。"""
     return {
         'host': _get_env("LMS_API_HOST", DEFAULT_API_HOST),
-        'port': int(_get_env("LMS_API_PORT", str(DEFAULT_API_PORT))),
+        # [B12] 安全 int 解析（空串/非法回退默认 + 告警）
+        'port': _env_int("LMS_API_PORT", DEFAULT_API_PORT),
     }

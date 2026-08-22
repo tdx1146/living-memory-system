@@ -29,7 +29,9 @@ T2.3 归档重建工具：手动/定时触发归档重建（扫描快照 -> 重�
 
 安全说明：
   - 只读快照、只写归档（data/archive/{session}.jsonl），不触碰运行实例；
-  - 重建是"扫描快照重新导出"，幂等（按 (turn, text_hash) 去重）；
+  - [B10] 重建是"扫描快照合并去重，只增不删"（按 (turn, text_hash) 去重）：
+    旧实现整体替换归档会把不在保留快照中的窗口外旧条目永久丢失；
+    现实现先保留现有归档行再追加新记录，旧条目不再丢失；
   - 快照读取失败/条目损坏一律跳过并告警（fail-open），绝不中断整体重建。
 """
 
@@ -137,7 +139,7 @@ def extract_records_from_snapshot(path: Path, session_id: str) -> list:
 # ----------------------------------------------------------------------
 
 def cmd_rebuild(args) -> int:
-    """扫描快照 -> 重建归档索引（幂等，按 (turn, text_hash) 去重）。"""
+    """扫描快照 -> 合并更新归档索引（[B10] 只增不删，按 (turn, text_hash) 去重）。"""
     if args.snapshot_dir:
         snap_dir = Path(args.snapshot_dir).expanduser()
     else:
@@ -163,9 +165,10 @@ def cmd_rebuild(args) -> int:
 
         n = rebuild_archive(sid, records, archive_dir=args.archive_dir)
         arch = archive_path_for(sid, args.archive_dir)
-        print(f"[{sid}] 重建完成：扫描 {len(files)} 个快照，"
-              f"归档 {n} 条 -> {arch}")
-    logger.info("归档重建耗时 %.2fs", time.time() - t0)
+        # [B10] 文案同步合并语义：不再宣称"重建完成"（会误导为整体替换）
+        print(f"[{sid}] 归档合并完成：扫描 {len(files)} 个快照，"
+              f"归档 {n} 条（只增不删，既有条目保留）-> {arch}")
+    logger.info("归档合并耗时 %.2fs", time.time() - t0)
     return 0
 
 

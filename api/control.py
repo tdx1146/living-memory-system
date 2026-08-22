@@ -198,19 +198,52 @@ def _client_id_of(request: Request) -> str:
 
 
 def _check_auth(request: Request) -> None:
-    """只读端点鉴权：token 未配置 → 放行（fail-open 只读）；配置了则必须匹配。"""
+    """只读端点鉴权：token 未配置 → 放行（fail-open 只读）；配置了则必须匹配。
+
+    [B9] 消费方校验：CONTROL_TOKEN 或注册下发的 client token（sha256 比对
+    access.jsonl 注册表）二选一通过——旧实现"只发不收"：register 下发的
+    token 无任何消费方校验，_check_auth 只比对 CONTROL_TOKEN。
+    """
     if READ_ONLY_MODE:
         return
     supplied = (
         request.headers.get("X-Control-Token", "").strip()
         or _bearer_from_header(request.headers.get("Authorization", ""))
     )
-    if not supplied or not hmac.compare_digest(supplied, CONTROL_TOKEN):
+    if not supplied:
         _audit("auth_denied", _client_id_of(request), status="denied")
         raise HTTPException(
             status_code=401,
             detail="无效或缺失的控制令牌（X-Control-Token / Authorization: Bearer）",
         )
+    if hmac.compare_digest(supplied, CONTROL_TOKEN):
+        return
+    # [B9] 注册表 token 校验（sha256 比对；命中 → 放行并审计区分来源）
+    if _registered_token_valid(supplied):
+        _audit("auth_ok_registered", _client_id_of(request))
+        return
+    _audit("auth_denied", _client_id_of(request), status="denied")
+    raise HTTPException(
+        status_code=401,
+        detail="无效或缺失的控制令牌（X-Control-Token / Authorization: Bearer）",
+    )
+
+
+def _registered_token_valid(token: str) -> bool:
+    """[B9] 注册下发的 client token 校验：sha256(token) 命中注册表 token_hash 即通过。
+
+    注册流程（control_register）只存 token 的 sha256 哈希（防泄露即用）；
+    消费方鉴权时把提交 token 哈希后与注册表逐条比对（hmac.compare_digest
+    防时序攻击）。注册表为低频小文件，直接逐次读取可接受。
+    """
+    if not token:
+        return False
+    h = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    for r in _load_registrations():
+        rh = r.get("token_hash")
+        if rh and isinstance(rh, str) and hmac.compare_digest(rh, h):
+            return True
+    return False
 
 
 def _require_write(request: Request) -> None:
@@ -546,14 +579,26 @@ async def control_config_update(request: Request, req: ConfigUpdateRequest):
         for key, value in updates.items():
             _overrides[key] = value.strip() if isinstance(value, str) else str(value)
 
-    _audit("config_update", client, extra={"keys": sorted(updates.keys())},
+    # [B8] 热配置假生效修复：控制面 :8191 与数据面 :8190 是独立进程，数据面直读
+    # os.environ 且无 reload-config 端点 → 本更新仅记账展示，对数据面零生效。
+    # 明示 data_plane_effect=none + 审计标记 data_plane_applied=False + 显式
+    # 告警，不制造"已应用"假象（真生效需 [需批准] 新增 reload 转发端点或重启数据面）。
+    _audit("config_update", client, extra={"keys": sorted(updates.keys()),
+                                           "data_plane_applied": False},
            latency_ms=(time.time() - t0) * 1000)
-    logger.info(f"热配置更新（client={client}）: {sorted(updates.keys())}")
+    logger.warning(
+        f"热配置更新（client={client}）: {sorted(updates.keys())} "
+        "——仅控制面记账，对数据面 :8190 零生效（数据面为独立进程直读 env，"
+        "无 reload 端点；需重启数据面或待 [需批准] reload 转发端点）")
     return {
         "status": "ok",
         "applied": sorted(updates.keys()),
         "overrides": dict(_overrides),
-        "note": "仅内存生效；数据面运行时行为变更需 T2.1 reload-config 或重启数据面",
+        # [B8] 诚实标注：跨进程无法直写数据面 env，热配置对数据面零生效
+        "data_plane_effect": "none",
+        "note": ("控制面与数据面 :8190 为独立进程且数据面无 reload 端点："
+                 "本更新仅记账展示，对数据面零生效，需重启数据面"
+                 "（或待 [需批准] 新增 reload 转发端点）"),
     }
 
 
@@ -699,15 +744,13 @@ async def control_diagnose(request: Request):
     t0 = time.time()
     _check_auth(request)
 
-    # 1) 数据面存活 + 只读检索探针（/recall 纯只读，不写缓冲）
+    # 1) 数据面存活 + 只读探针（[B23] /recall 会 get_or_create("main") 制造幻影
+    # 会话——只读诊断不应有建会话副作用；改打 /health + /landscape/main，
+    # 两者均纯只读：/landscape 用 sm.get 而非 get_or_create，不创建会话）
     api_status, api_body = await _ahttp_json("GET", "/health", timeout=3.0)
-    recall_t0 = time.time()
-    recall_status, recall_body = await _ahttp_json(
-        "POST", "/recall",
-        {"session_id": "main", "query": "__lms_control_diag_probe__", "k": 1},
-        timeout=8.0,
-    )
-    recall_ms = round((time.time() - recall_t0) * 1000, 1)
+    ls_t0 = time.time()
+    ls_status, ls_body = await _ahttp_json("GET", "/landscape/main", timeout=6.0)
+    ls_ms = round((time.time() - ls_t0) * 1000, 1)
 
     # 2) 各会话状态 + 快照新鲜度
     sessions = await _gather_sessions()
@@ -760,10 +803,11 @@ async def control_diagnose(request: Request):
         "api": {
             "reachable": api_status == 200,
             "health": api_body.get("status") if isinstance(api_body, dict) else None,
-            "recall_probe": {
-                "status": recall_status,
-                "duration_ms": recall_ms,
-                "ok": recall_status == 200,
+            # [B23] landscape 探针替代 recall 探针（纯只读，不创建会话）
+            "landscape_probe": {
+                "status": ls_status,
+                "duration_ms": ls_ms,
+                "ok": ls_status == 200,
             },
         },
         "sessions": sessions,

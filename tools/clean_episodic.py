@@ -14,6 +14,8 @@ clean_episodic.py — LMS 记忆垃圾清洗（2026-08-10 设计回归）
   - 默认 --dry-run 只报告不清理
   - --backup 清理前把原快照备份到 snapshots/main/*.pre-clean.pt
   - 只删明确垃圾（正则匹配），真实对话一律保留
+  - [B18] fail-closed：探测 :8190 存活即拒绝执行（live 内存每 ~34s 覆盖磁盘，
+    清洗不生效且无锁直写有撕裂风险）——"前置：服务已停止"从约定升级为强制
 """
 
 import argparse
@@ -63,6 +65,19 @@ def _find_episodic(state: dict):
 
 
 def main() -> int:
+    # [B18] fail-closed 探测：live :8190 运行中清洗会被内存覆盖（每 ~34s
+    # 写一次快照）且本工具无锁直写有撕裂风险 → 拒绝执行（不可达才允许继续）
+    import urllib.request
+    try:
+        with urllib.request.urlopen(
+                "http://127.0.0.1:8190/health", timeout=5) as r:
+            if r.status == 200:
+                print("❌ LMS :8190 正在运行：清洗会被内存覆盖且无锁直写有"
+                      "撕裂风险，请先停服再执行")
+                return 1
+    except Exception:
+        pass  # 不可达 → 允许继续
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--session", default="main")
     ap.add_argument("--dry-run", action="store_true", default=True,

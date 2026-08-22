@@ -1565,10 +1565,41 @@ async def self_ref_voice(session_id: str = "main", limit: int = 5):
 
 
 @app.delete("/sessions/{session_id}")
-async def delete_session(session_id: str):
-    """删除指定 session。"""
+async def delete_session(session_id: str, purge: bool = False):
+    """删除指定 session。
+
+    [B11] purge=true 时同步删除快照目录与归档文件，杜绝"删除后访问即复活"
+    （旧实现只清内存，快照仍在 → 下次 get_or_create 自动恢复即复活）；
+    默认 purge=false 保持旧行为（只清内存），向后兼容。
+    """
     sm = get_session_manager()
     scheduler = get_dream_scheduler()
+
+    # [B11] 删除前取会话快照根目录与归档路径（remove 之后 loop 已不可得）；
+    # 删除失败仅告警不阻断会话删除（fail-open）
+    loop = sm.get(session_id)
+    removed_paths = []
+    if purge and loop is not None:
+        try:
+            from persistence.snapshot import sanitize_session_id
+            snap_dir = loop._snapshot_dir_path() / sanitize_session_id(session_id)
+            if snap_dir.is_dir():
+                import shutil
+                shutil.rmtree(snap_dir, ignore_errors=True)
+                removed_paths.append(str(snap_dir))
+        except Exception as e:  # pylint: disable=broad-except
+            logger.warning(
+                f"[{session_id}] purge 快照目录删除失败（继续删除会话）: {e}")
+        try:
+            from core.archive.archive_store import archive_path_for
+            arch = archive_path_for(session_id)
+            if arch.is_file():
+                arch.unlink()
+                removed_paths.append(str(arch))
+        except Exception as e:  # pylint: disable=broad-except
+            logger.warning(
+                f"[{session_id}] purge 归档删除失败（继续删除会话）: {e}")
+
     deleted = sm.remove(session_id)
     if not deleted:
         raise HTTPException(
@@ -1576,11 +1607,16 @@ async def delete_session(session_id: str):
             detail=f"会话 '{session_id}' 不存在",
         )
     scheduler.unregister_session(session_id)
-    # T2.6：会话删除审计（session_manager.remove 内已 audit，此处补调度器侧信息）
-    audit("session_deleted", session_id=session_id, scheduler_unregistered=True)
+    # T2.6：会话删除审计（session_manager.remove 内已 audit，此处补调度器侧信息
+    # + purge 标记与已删路径清单——B11）
+    audit("session_deleted", session_id=session_id,
+          scheduler_unregistered=True, purge=purge,
+          removed_paths=removed_paths)
     return {
         "session_id": session_id,
         "deleted": True,
+        "purged": purge,
+        "removed_paths": removed_paths,
     }
 
 

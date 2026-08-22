@@ -204,14 +204,32 @@ class LMSMCPServer:
         return {"result": status}
 
     def _cmd_save_snapshot(self, params: dict) -> dict:
-        """保存当前状态到快照。"""
+        """保存当前状态到快照。
+
+        [B20] 客户端路径钳制：仅允许 snapshots/ 内（复用持久层命名，
+        防任意路径写文件）——旧实现接受客户端任意路径（可写任意文件）。
+        """
         if self.loop is None:
             return {"error": "not initialized"}
 
-        path = params.get(
-            "path",
-            str(Path(__file__).resolve().parent.parent / "snapshots" / "lms_latest.pt"),
-        )
+        import time  # noqa: E402  （轻量模块：time 仅在快照命名时使用）
+        # [B20] 本地同语义钳制（server.py 的 _clamp_snapshot_path 在 fastapi
+        # 模块内不便复用）：只允许 snapshots/ 根内路径，拒绝穿越
+        snap_root = Path(__file__).resolve().parent.parent / "snapshots"
+        raw = params.get("path") or ""
+        if raw:
+            try:
+                cand = Path(raw).expanduser().resolve()
+                cand.relative_to(snap_root.resolve())
+            except (ValueError, OSError):
+                return {"error": f"非法快照路径（仅允许 {snap_root}/ 内）: {raw}"}
+            path = str(cand)
+        else:
+            # [B20] 缺省路径按会话隔离命名（复用持久层清洗规则）
+            from persistence.snapshot import sanitize_session_id  # noqa: E402
+            sid = sanitize_session_id(
+                getattr(self.loop, 'session_id', None) or 'main')
+            path = str(snap_root / sid / f"snapshot_mcp_{int(time.time())}.pt")
         # 确保目录存在
         os.makedirs(os.path.dirname(path), exist_ok=True)
         self.loop.save_state(path)

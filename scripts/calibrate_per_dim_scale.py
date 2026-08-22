@@ -60,6 +60,12 @@ def main() -> None:
             samples.append(act.per_dim_surprise.detach().cpu().flatten())
         surprises.append(act.surprise)
 
+    # [C15] 空样本守卫：全部 per_dim_surprise=None 时 torch.cat([]) 崩溃；
+    # 打印提示并跳过分布统计（不退出非零，工具语义=校准无样本可跳过）
+    if not samples:
+        print("无 per_dim_surprise 样本（全部为 None），跳过分布统计")
+        return
+
     all_vals = torch.cat(samples).numpy()
     per_turn_means = [float(s.mean()) for s in samples]
     sorted_vals = sorted(all_vals.tolist())

@@ -166,7 +166,11 @@ class LLMBridge:
                     max_tokens=self.max_tokens,
                     temperature=self.temperature,
                 )
-                return response.choices[0].message.content
+                # [B22] content=None 归一化为空串：LLM 返回 content=None 会被
+                # 误判为调用失败（server.py 侧 len(None) 抛 TypeError → 被包装
+                # 成 degraded 错误）；归一化后 /chat 的 degraded 分支只对真异常触发
+                content = response.choices[0].message.content
+                return (content or "")
 
             except Exception as e:
                 last_error = e

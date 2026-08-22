@@ -32,6 +32,12 @@ from typing import Any, List, Optional
 import torch
 
 from core.types import Activation, SensoryInput
+# [B16] embed 熔断器：与 bridge/encoder.py:67 同款（写侧 embed 三处共用同一
+# 熔断状态）；recall_from_hourglass 的 embed 调用统一走熔断，故障不裸抛/挂起
+from core.sensory.circuit_breaker import (  # noqa: E402
+    CircuitOpenError,
+    get_default_embed_circuit,
+)
 
 
 # ================================================================== #
@@ -558,10 +564,14 @@ class TranslationLayer:
                 " 或使用 sync_to_hourglass + client.search 组合。")
 
         # 获取查询语义向量
+        # [B16] 统一走熔断器（与 encoder.py:67 同款）：embed 服务故障时快速抛
+        # CircuitOpenError（不触网死等），调用方按熔断降级处理——旧实现裸调
+        # embed_text 会重试链 5-10s 挂起或裸抛 embed 异常
+        cb = get_default_embed_circuit()
         if hasattr(embedder, 'embed_text'):
-            query_vector = embedder.embed_text(query_text)
+            query_vector = cb.call(lambda: embedder.embed_text(query_text))
         elif hasattr(embedder, 'embed_text_raw'):
-            query_vector = embedder.embed_text_raw(query_text)
+            query_vector = cb.call(lambda: embedder.embed_text_raw(query_text))
         else:
             raise ValueError(
                 "embedder 必须提供 embed_text 或 embed_text_raw 方法"

@@ -392,10 +392,14 @@ def query_archive(session_id: str, query_vec, k: int = 5,
 
 def rebuild_archive(session_id: str, records: Iterable[dict],
                     archive_dir: Optional[str] = None) -> int:
-    """用 records 整体重建归档文件（原子替换，受伴生锁保护）。
+    """合并去重、只增不删地更新归档文件（原子替换，受伴生锁保护）。
 
     供 tools/archive_job.py 扫描快照后重建索引使用；按 (turn, text_hash)
     去重后整文件重写。
+
+    [B10] 语义变更：旧实现用扫描到的 records **整体替换**归档文件 → 不在
+    保留快照中的旧归档条目（窗口外记忆）被工具重新引入丢失。现改为合并：
+    先读现有归档行并入 seen（保留），再追加新记录，只增不删。
 
     参数:
         session_id: 会话标识。
@@ -403,15 +407,25 @@ def rebuild_archive(session_id: str, records: Iterable[dict],
         archive_dir: 归档目录覆盖。
 
     返回:
-        重建后归档中的唯一条目数。
+        更新后归档中的唯一条目数。
     """
     path = archive_path_for(session_id, archive_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
 
     fd = _acquire_lock(_lock_path_for(path), exclusive=True, timeout=10.0)
     try:
-        seen = set()
-        uniq = []
+        # [B10] 先读现有归档行（坏行由 _iter_records 跳过），并入去重建 seen——
+        # 窗口外旧归档条目保留，不再被整体替换丢失
+        existing = list(_iter_records(path)) if path.exists() else []
+        seen: set = set()
+        uniq: List[dict] = []
+        for rec in existing:
+            turn = int(rec.get("turn", -1) or -1)
+            h = rec.get("text_hash") or text_hash(str(rec.get("text", "")))
+            key = (turn, h)
+            if key not in seen:
+                seen.add(key)
+                uniq.append(rec)
         for rec in records:
             if not isinstance(rec, dict) or not rec.get("text"):
                 continue
@@ -427,7 +441,8 @@ def rebuild_archive(session_id: str, records: Iterable[dict],
             for rec in uniq:
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
         os.replace(tmp, path)  # 原子替换
-        logger.info("[%s] 归档重建完成：%d 条 -> %s", session_id, len(uniq), path)
+        logger.info("[%s] 归档合并完成：%d 条（含既有 %d 条）-> %s",
+                    session_id, len(uniq), len(existing), path)
         return len(uniq)
     finally:
         _release_lock(fd)
