@@ -28,11 +28,12 @@ LOG_FILE = "/vol2/1000/AI专用/living-memory-system-cloud/logs/lms_entropy_watc
 SNAP_DIR = "/vol2/1000/AI专用/living-memory-system-cloud/snapshots/main"
 ENV_DUMP = "/tmp/lms-orig-env.txt"
 
-ENTROPY_BURNT = 0.9995   # 熵烧焦线
-SIGMA_BURNT = 0.95       # σ 顶格线
+ENTROPY_BURNT = 0.9995   # 熵烧焦线（真正焦蛋才换蛋）
+SIGMA_SATURATED = 0.95   # σ 顶格线（饱和 → 轻量 σ 重置，不换蛋）
 ENTROPY_HEALTHY = 0.995  # 低于此线记"健康"
 BURNT_STREAK_NEED = 2    # 连续 N 次烧焦才处置（防抖动）
 DISPOSE_COOLDOWN_S = 1800  # 处置后冷却
+SIGMA_RESET_COOLDOWN_S = 300  # σ 重置后冷却（比换蛋短：重置是轻操作）
 
 
 def log(msg):
@@ -78,6 +79,45 @@ def latest_snapshot():
             os.path.join(SNAP_DIR, p)))
     except Exception:
         return ""
+
+
+def reset_sigma(state, reason):
+    """轻量 σ 重置：σ 饱和掉坑 → 把 σ 归零（保留 J/记忆），不重启、不换蛋。
+
+    2026-08-23：dandan 指出——σ 饱和是轻症状，用重置即可；换蛋（恢复
+    快照重启）只应留给熵真正烧焦（0.9995+）。此前把 σ>0.95 当换蛋触发，
+    一夜 18 次杀进程重启，属于用重操作治轻病。
+    """
+    log(f"♻️ σ 饱和重置（{reason}）")
+    try:
+        script = '''
+import torch, warnings; warnings.filterwarnings("ignore")
+from api.session_manager import SessionManager
+from api.config import get_api_config
+sm = SessionManager(default_config_factory=get_api_config)
+loop = sm.get_or_create("main")
+net = loop.attractor
+net.reset_state()  # E-P2-1：sigma 归零，不影响已学习的 J
+loop.save_session_state()
+print("sigma reset ok, J preserved")
+'''
+        env = dict(os.environ)
+        if os.path.exists(ENV_DUMP):
+            for line in open(ENV_DUMP):
+                line = line.rstrip("\n")
+                if "=" in line:
+                    k, v = line.split("=", 1)
+                    env[k] = v
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd="/vol2/1000/AI专用/living-memory-system-cloud",
+            env=env, capture_output=True, text=True, timeout=120)
+        out = (proc.stdout + proc.stderr).strip()
+        log(f"  重置输出: {out[-100:]}")
+        return "sigma reset ok" in out
+    except Exception as e:
+        log(f"❌ σ 重置失败: {e}")
+        return False
 
 
 def dispose_burnt(state, reason):
@@ -165,9 +205,24 @@ def main():
             log(f"✅ 已记录健康快照: {snap[:40]} (σmax {sigma_max:.3f} / 熵 {entropy:.4f})")
         return 0
 
-    # 烧焦判定
-    burnt = entropy > ENTROPY_BURNT or sigma_max > SIGMA_BURNT
-    if burnt:
+    # 烧焦判定（2026-08-23 两级化：dandan 指出 σ 饱和≠焦蛋）
+    #  - σ 饱和（σmax > SIGMA_SATURATED）→ 轻量 σ 重置（不重启不换蛋）
+    #  - 熵烧焦（entropy > ENTROPY_BURNT）→ 重量换蛋（恢复快照重启）
+    sigma_sat = sigma_max > SIGMA_SATURATED
+    ent_burnt = entropy > ENTROPY_BURNT
+
+    if sigma_sat and not ent_burnt:
+        # 轻症状：σ 饱和但熵未烧焦 → σ 重置
+        cooldown = state.get("last_sigma_reset", 0)
+        if now - cooldown < SIGMA_RESET_COOLDOWN_S:
+            return 0
+        state["streak"] = 0
+        if reset_sigma(state, f"σmax {sigma_max:.3f} / 熵 {entropy:.4f}"):
+            state["last_sigma_reset"] = now
+            write_state(state)
+        return 0
+
+    if ent_burnt:
         state["streak"] = state.get("streak", 0) + 1
         write_state(state)
         log(f"⚠️ 烧焦信号（熵 {entropy:.4f} / σmax {sigma_max:.3f}），连续 {state['streak']}/{BURNT_STREAK_NEED}")
