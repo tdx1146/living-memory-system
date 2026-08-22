@@ -432,8 +432,22 @@ class AttractorNetwork:
         # 无自连接
         self.J.fill_diagonal_(0)
 
-        # 偏置向量：初始为 0
-        self.bias: torch.Tensor = torch.zeros(num_nodes, device=self.device)
+        # 偏置向量：初始为 0（中性）；LMS_BIAS_SCALE>0 时给节点一个静息
+        # 电位，把 σ 从平凡不动点 σ≈0 唤醒（2026-08-22 场动力学修复第一步）。
+        # 常量偏置 b 使 σ ≈ coth(b)−1/b：b=1.5 → σ≈0.44、b=2 → σ≈0.54
+        # （离开 0 又未饱和 ±1 的活跃区）。默认 0 = 逐字节不变。
+        _bias_scale = 0.0
+        try:
+            _bias_scale = float(os.environ.get("LMS_BIAS_SCALE", "0") or 0)
+        except Exception:
+            _bias_scale = 0.0
+        if _bias_scale > 0:
+            self.bias: torch.Tensor = torch.full(
+                (num_nodes,), _bias_scale, device=self.device)
+            logger.warning(
+                "LMS_BIAS_SCALE=%.3f 启用：bias 非零（场唤醒实验）", _bias_scale)
+        else:
+            self.bias: torch.Tensor = torch.zeros(num_nodes, device=self.device)
 
         # 当前状态 sigma：初始为 0（中性状态）
         self.sigma: torch.Tensor = torch.zeros(num_nodes, device=self.device)
