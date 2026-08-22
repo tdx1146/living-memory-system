@@ -68,17 +68,19 @@ def is_doubt_event(text: str) -> bool:
     即带 kind+冒号）才判为怀疑事件；裸 [doubt] 前缀（锚定行首）判定不变，
     正文提及不误伤。E3 路径 B 产物（"用户: [doubt] conflict: …" 合法协议）
     仍被正确识别，08-22 断环语义保持。
+
+    [F3 回归修复 2026-08-23] 上一版把"裸 [doubt] 锚定"做在**剥离前缀前**
+    的原始 text 上：loop.py 的 text 带 "用户: " 包装（text=f"用户:
+    {user_input}"），`^\s*\[doubt\]` 对 "用户: [doubt] gap: ..." 不锚定，
+    → 系统事件漏判（test_commit_obs_sys_event_skipped 回归）。
+    修法：① 先剥离 "用户:/助手:" 包装前缀，再判定（顺序与 08-22 断环
+    修复一致）；② 判定统一走协议路径——parse_doubt_event 非空（kind 在
+    _KNOWN_KINDS 含 gap）即系统事件；裸 "正文提及 [doubt" 或 "用户:
+    [doubt] 是什么意思？" 无合法 kind+冒号 → 判普通对话（正确入库）。
     """
     if not text:
         return False
-    # 锚定行首：裸 [doubt] 前缀（含未知 kind 的协议行）→ 系统事件（同旧语义）
-    if _DOUBT_EVENT_RE.search(text):
-        return True
-    # E3 路径 B 产物：剥离 "用户:/助手:" 包装后须是**合法协议事件**
-    # （kind+冒号），"用户: [doubt] 是什么意思？" 这类真实提问不满足
-    # _DOUBT_PREFIX_RE（无 kind+冒号）→ 判为普通对话（正确入库）。
-    stripped = _strip_artifact_prefix(text)
-    return stripped != text and parse_doubt_event(stripped) is not None
+    return parse_doubt_event(text) is not None
 
 
 def parse_doubt_event(text: str) -> Optional[dict]:
