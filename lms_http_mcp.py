@@ -147,16 +147,20 @@ def lms_status(sid: str = DEFAULT_SESSION) -> dict:
         
         response.raise_for_status()
         data = response.json()
-        
+
+        # 2026-08-22 修复：/status/{sid} 响应体是 {"session_id":..., "status":{...}}
+        # 嵌套结构，旧代码读顶层字段 → 永远返回 0/null。需先解包 status。
+        status = data.get("status", {}) if isinstance(data, dict) else {}
+
         return {
             "success": True,
             "exists": True,
-            "turn_count": data.get("turn_count", 0),
-            "num_nodes": data.get("num_nodes", 256),
-            "last_entropy": data.get("last_entropy"),
-            "last_surprise": data.get("last_surprise"),
-            "precision_mean": data.get("precision_mean"),
-            "episodic_buffer_size": data.get("episodic_buffer_size", 0)
+            "turn_count": status.get("turn_count", 0),
+            "num_nodes": status.get("num_nodes", 256),
+            "last_entropy": status.get("last_entropy"),
+            "last_surprise": status.get("last_surprise"),
+            "precision_mean": status.get("precision_mean"),
+            "episodic_buffer_size": status.get("episodic_buffer_size", 0)
         }
     except Exception as e:
         return {"success": False, "error": str(e)}
