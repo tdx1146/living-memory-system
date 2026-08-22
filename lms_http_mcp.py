@@ -403,9 +403,14 @@ def main():
                 if response:  # 只响应有id的请求
                     print(json.dumps(response, ensure_ascii=False))
                     sys.stdout.flush()
+                buffer = ""   # [C10] 成功解析才清 buffer
             except json.JSONDecodeError:
-                pass
-            buffer = ""
+                # [C10] 半截请求（多行 JSON 未完整到达）：保留 buffer 等下一行补全，
+                # 原实现无条件清空 buffer → 半截请求被丢弃、调用方超时
+                if len(buffer) > 1_000_000:
+                    # 上限保护：持续无法解析的 buffer 无限增长 → 清空并告警（防内存膨胀）
+                    logging.warning("stdin buffer 超 1MB 仍无法解析，丢弃并告警")
+                    buffer = ""
 
 
 if __name__ == "__main__":

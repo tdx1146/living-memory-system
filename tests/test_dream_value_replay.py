@@ -82,7 +82,10 @@ class TestD1AntiExample:
         vr = result.get('value_replay', {})
         ids = vr.get('replay_set_ids', [])
         # 旧条目（turn=1）进入重放集——与 101 轮后的新条目同池竞争
-        assert old.turn in ids, f"旧条目未被重放：replay_set_ids={ids}"
+        # [A14] 条目标识改为文本哈希（同 turn 多条目不撞键，issue A14），
+        # 按 _entry_id 判定（旧断言 `old.turn in ids` 编码旧格式）
+        assert DreamEngine._entry_id(old) in ids, (
+            f"旧条目未被重放：replay_set_ids={ids}")
         # 被采中 → 加固（reference_count+1 且 last_reinforced_turn 刷新）
         assert old.reference_count >= 1
         assert old.last_reinforced_turn == 101 + 4, (
@@ -111,7 +114,10 @@ class TestReinforcement:
         engine.memory._episodic_buffer.append(e2)
         vr = engine._value_replay(k=2)
         # k=2 ≥ 候选数 → 全部被采中
-        assert sorted(vr['reinforced_ids']) == sorted([10, 11])
+        # [A14] 条目标识改为文本哈希（issue A14），按 _entry_id 判定
+        # （旧断言按 turn 值比较编码旧格式）
+        assert sorted(vr['reinforced_ids']) == sorted(
+            [DreamEngine._entry_id(e1), DreamEngine._entry_id(e2)])
         assert e1.reference_count >= 1
         assert e1.last_reinforced_turn == 11  # 当前最大 turn
         assert e2.last_reinforced_turn == 11
@@ -125,9 +131,11 @@ class TestReinforcement:
         engine.memory._episodic_buffer.append(gray)
         vr = engine._value_replay(k=5)
         ids = vr['replay_set_ids']
-        assert gray.turn not in ids
+        # [A14] 条目标识改为文本哈希（issue A14），按 _entry_id 判定
+        # （旧断言按 turn 值比较编码旧格式）
+        assert DreamEngine._entry_id(gray) not in ids
         assert gray.reference_count == 0
-        assert normal.turn in ids
+        assert DreamEngine._entry_id(normal) in ids
 
     def test_cluster_failopen_and_representative(self, engine):
         """聚类 fail-open＋代表幸存加固（加固事件 3）。"""

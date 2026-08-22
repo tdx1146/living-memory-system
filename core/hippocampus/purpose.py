@@ -304,7 +304,9 @@ class PurposeLayer:
         avg_precision = history_tensor.mean(dim=0)    # [input_dim]
         target_dim = int(avg_precision.argmax().item())
 
-        # 强化目标维度：设为最大值（探索新方向）
+        # [A15] 强化已关注方向：将历史窗口内平均 precision 最高的维度设为
+        # 最大值（meta-flip 强化，非"探索新方向"——旧注释与实现语义矛盾，
+        # 实际是强化已关注方向而非探索；只改注释，代码不动）
         self.sensory_precision[target_dim] = self.precision_max
 
         # 轻微衰减其他维度（腾出注意力空间，但不至于归零）

@@ -308,6 +308,17 @@ class Recovery:
             attr_state[key] = val.clone() if isinstance(val, torch.Tensor) else val
         for key in ('num_nodes', 'input_dim'):
             attr_state[key] = getattr(attractor, key, None)
+        # [A11] 回滚快照补 allostatic：恢复路径会经 set_landscape 改写
+        # allostatic.j_target（B 级恢复），而旧回滚快照不含该字段 →
+        # 回滚无法复原已被改写的设定点。j_target 为标量、j_history 为
+        # float 列表，深拷贝无共享引用问题；allostatic 为 None（开关关）
+        # 时跳过（行为不变）。
+        allostatic = getattr(attractor, 'allostatic', None)
+        if allostatic is not None:
+            attr_state['allostatic'] = {
+                'j_target': getattr(allostatic, 'j_target', None),
+                'j_history': list(getattr(allostatic, 'j_history', [])),
+            }
         snapshot['attractor'] = attr_state
 
         # purpose 状态（对齐 _restore_purpose 的 purpose_state 字典结构）

@@ -108,6 +108,9 @@ def main():
     posted = 0
     max_seq = prev_seq
     turns = 0
+    # [C7] 水位只推进到最后一个成功 POST 的 assistant seq（未配对 user 不跳）
+    last_paired_seq = prev_seq
+    cap_hit = False   # [C8] 本轮是否触达回填上限（触达 → 剩余轮次不 POST、不推进水位）
 
     for ev in events:
         seq = ev.get("seq")
@@ -132,7 +135,12 @@ def main():
             if not text or pending_user is None:
                 continue
             if not backfilled and turns >= BACKFILL_MAX_TURNS:
-                # 首次回填已达上限：推进水位但不 POST 剩余
+                # [C8] 达上限：本轮剩余轮次跳过 POST 且**不推进水位**（下轮继续按上限回填）——
+                # 上限语义是"每轮最多 N 轮"，不是"全局只回填 N 轮"。
+                # 原实现"推进水位 + 置 backfilled=True"：① 置 True 反而解除上限 → 同轮全量冲刷；
+                # ② 水位越过未 POST 的轮次 → 该批对话永久丢失。修复：跳过但水位不动。
+                cap_hit = True
+                pending_user = None
                 continue
             u_seq, u_text = pending_user
             try:
@@ -141,9 +149,11 @@ def main():
                 turns += 1
                 print(f"[{time.strftime('%H:%M:%S')}] fed turn (u:{u_seq}->a:{seq}): "
                       f"{u_text[:40]!r}...")
-                # 推进水位到当前 assistant seq
+                # [C7] 水位只推进到当前已配对 assistant seq
+                last_paired_seq = seq
+                # [C8] backfilled 只在"完整扫完"时置 True（见收尾段）；触上限的轮次保持 False
                 watermark = {"file": path, "seq": seq,
-                             "backfilled": backfilled or turns >= BACKFILL_MAX_TURNS}
+                             "backfilled": backfilled}
                 with open(WATERMARK_FILE, "w") as f:
                     json.dump(watermark, f)
             except Exception as e:
@@ -152,13 +162,24 @@ def main():
                 return 1
             pending_user = None
 
-    # 没有新内容也把水位对齐到最新 seq（跳过 chunk/tool 等噪音事件）
+    # [C8] 完整扫完未触上限（posted>0 且全程未触发 cap 分支）→ 初始回填已排空，
+    # 置 backfilled=True（解除每轮上限；只有"完整扫完"才置 True，触上限的轮次保持 False）
+    if not backfilled and posted > 0 and not cap_hit:
+        backfilled = True
+        watermark = {"file": path, "seq": last_paired_seq, "backfilled": True}
+        with open(WATERMARK_FILE, "w") as f:
+            json.dump(watermark, f)
+        print(f"[{time.strftime('%H:%M:%S')}] backfill complete; watermark -> {last_paired_seq}")
+
+    # [C7] 无配对可喂（posted==0，如末尾是未配对 user / 纯噪音事件）：
+    # 水位只推进到最后一个已配对 assistant seq（即 prev_seq），绝不跳到未配对 user 的 seq
+    # ——未配对 user 下轮续配（seq 未推进 → 下轮重新扫描该事件），该轮对话不再永久丢失
     if max_seq > prev_seq and posted == 0:
-        watermark = {"file": path, "seq": max_seq,
+        watermark = {"file": path, "seq": last_paired_seq,
                      "backfilled": backfilled}
         with open(WATERMARK_FILE, "w") as f:
             json.dump(watermark, f)
-        print(f"[{time.strftime('%H:%M:%S')}] no feedable pairs; watermark -> {max_seq}")
+        print(f"[{time.strftime('%H:%M:%S')}] no feedable pairs; watermark 停在已配对 seq {last_paired_seq}")
 
     print(f"[{time.strftime('%H:%M:%S')}] done: posted={posted} file={os.path.basename(os.path.dirname(path))}")
     return 0

@@ -22,10 +22,18 @@ DOCS = [
 
 
 def split_chunks(text: str, size: int = CHUNK):
-    """按句子边界分块，避免切断语义。"""
+    """按句子边界分块；无句边界的超长段按硬长度二次切分（防文档尾部永久丢失）。"""
     parts = re.split(r"(?<=[。！？!?\n])", text)
     chunks, cur = [], ""
     for p in parts:
+        # [C9] 单段超长（无句边界，如超长代码/URL 段）→ 按硬长度二次切分，
+        # 否则原实现 chunk[:CHUNK] 截断后剩余部分被丢弃 → 文档尾部永久丢失
+        while len(p) > size:
+            if cur:
+                chunks.append(cur.strip())
+                cur = ""
+            chunks.append(p[:size].strip())
+            p = p[size:]
         if len(cur) + len(p) > size and cur:
             chunks.append(cur.strip())
             cur = p
@@ -44,7 +52,7 @@ def main():
                 state = json.load(f)
         except Exception:
             state = {}
-    ok, total = 0, 0
+    ok, total, failed = 0, 0, 0
     for fname in DOCS:
         try:
             with open(WS + fname) as f:
@@ -75,10 +83,11 @@ def main():
                 print(f"OK {fname} chunk {i} ({len(chunk)} chars)", flush=True)
             except Exception as e:
                 print(f"FAIL {fname} chunk {i}: {e}", flush=True)
+                failed += 1   # [C9] 失败计数：任何块失败 → 退出码非零，运维可见（原实现失败也 exit 0）
                 time.sleep(2)
             time.sleep(0.5)
-    print(f"done: fed={ok} total_chunks={total}", flush=True)
-    return 0
+    print(f"done: fed={ok} total_chunks={total} failed={failed}", flush=True)
+    return 1 if failed else 0   # [C9] 失败必须非零退出；失败块不写 done → 下轮重试
 
 
 if __name__ == "__main__":

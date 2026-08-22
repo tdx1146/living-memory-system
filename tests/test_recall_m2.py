@@ -493,7 +493,10 @@ class TestRecallReadonlyM2:
     def test_last_recall_suspicion_populated(self, loop_precision_adapt):
         """怀疑投影进 last_recall_suspicion（内存态），条目零改写。"""
         loop = loop_precision_adapt
-        loop.process_turn("用户: 你好")
+        # [A16] 存储文本统一带"用户:"前缀（issue A16）：旧测试传已带前缀的
+        # 输入会被二次加前缀（"用户: 用户: 你好"）→ 改为裸输入，存储仍为
+        # "用户: 你好"，后续断言不变
+        loop.process_turn("你好")
         # 写侧合法置 labile（模拟去稳定化，写侧时相动作）
         entry = next(iter(loop.memory.iter_episodic()))
         entry.labile = True

@@ -154,7 +154,10 @@ def classify_processes(procs: list) -> dict:
             http_mcp.append(p)
         elif "glue_server.py" in cmd:
             glue.append(p)
-    orphans = [p for p in api + mcp + http_mcp + glue if p["ppid"] == 1]
+    # [C6] api.run/run_control 是 setsid 守护，PPID=1 属设计常态（crontab 注释实锤），
+    # 不判孤儿（API 可用性由 L1 /health 覆盖）；孤儿只针对 MCP/glue 回收对象。
+    # 修前 api 含在孤儿判定内 → 每 5 分钟 WARN 一条，告警通道被噪音淹没。
+    orphans = [p for p in mcp + http_mcp + glue if p["ppid"] == 1]
     return {"api": api, "mcp": mcp, "http_mcp": http_mcp,
             "glue": glue, "orphans": orphans}
 
@@ -241,7 +244,7 @@ class Monitor:
                 f"http={status} status_field={body and body.get('status')}")
             self.alert("L1", SEV_CRIT, "存活", f"API 不可用：{detail}")
         fields = {"turn_count": None, "process_count": None,
-                  "api_count": None, "mcp_count": None, "mcp_orphan_count": None,
+                  "api_count": None, "mcp_count": None, "orphan_count": None,
                   "glue_count": None, "avail_mb": None, "swap_used_mb": None,
                   "api_rss_mb": None, "snapshot_freshness_s": None,
                   "snapshot_count": None, "checks": checks}
@@ -254,12 +257,22 @@ class Monitor:
         checks = dict(l1.get("checks", {}))
         # /recall 探针：端点设计上空 query 返回 400（fail-closed，正确行为），
         # 因此用最小非空查询验证就绪（走编码+检索，不 process_turn、不调 LLM）。
-        status, lat, body = http_request(
-            f"{self.base_url}/recall",
-            payload={"session_id": "default", "query": DEFAULT_RECALL_QUERY, "k": 1},
-            timeout=15)
+        # [C12] 探针不再写死 session_id="default"（POST /recall 会 get_or_create 幻影会话）：
+        # 先取真实会话列表，无会话则跳过 recall 探针（只报 health）
+        s_status, _s_lat, s_body = http_request(f"{self.base_url}/sessions", timeout=5)
+        sids = (s_body or {}).get("sessions", []) if isinstance(s_body, dict) else []
+        probe_sid = sids[0] if sids else None
+        if probe_sid:
+            status, lat, body = http_request(
+                f"{self.base_url}/recall",
+                payload={"session_id": probe_sid, "query": DEFAULT_RECALL_QUERY, "k": 1},
+                timeout=15)
+        else:
+            # 无会话：recall 探针跳过（缺省 main 会创建幻影会话）
+            status, lat, body = 0, 0.0, {}
         checks["recall_http"] = status
         checks["recall_body_ok"] = bool(body and "results" in body)
+        checks["recall_probe_sid"] = probe_sid
         # 快照目录可写
         checks["snapdir_writable"] = self._snap_state_cache.get("writable", False)
 
@@ -275,7 +288,7 @@ class Monitor:
 
         ok = l1["ok"] and status == 200 and checks["recall_body_ok"]
         fields = {"turn_count": None, "process_count": None,
-                  "api_count": None, "mcp_count": None, "mcp_orphan_count": None,
+                  "api_count": None, "mcp_count": None, "orphan_count": None,
                   "glue_count": None, "avail_mb": None, "swap_used_mb": None,
                   "api_rss_mb": None, "snapshot_freshness_s": None,
                   "snapshot_count": None, "checks": checks}
@@ -344,8 +357,10 @@ class Monitor:
         checks["orphan_count"] = orphan_count
         if orphan_count:
             self.alert("L3", SEV_WARN, "深度-孤儿进程",
-                       f"检测到 {orphan_count} 个 PPID=1 的 LMS 孤儿进程"
-                       "（systemd 接管后 API 不应为孤儿；MCP 孤儿待回收 cron）")
+                       # [C6] 文案同步：孤儿判定已排除 setsid API 守护（PPID=1 是设计常态），
+                       # 此处仅指 MCP/glue 孤儿（待回收 cron 的对象）
+                       f"检测到 {orphan_count} 个 PPID=1 的 MCP/glue 孤儿进程"
+                       "（API 为 setsid 守护属常态，不计入；MCP 孤儿待回收 cron）")
 
         # ④ 内存水位
         mem = read_meminfo()
@@ -370,7 +385,8 @@ class Monitor:
         ok = l2["ok"] and session_status_ok
         fields = {"turn_count": turn_total, "process_count": process_count,
                   "api_count": api_count, "mcp_count": mcp_count,
-                  "mcp_orphan_count": orphan_count, "glue_count": glue_count,
+                  # [C12] 字段改名 mcp_orphan_count → orphan_count（C6 后孤儿=MCP/glue，名实相符）
+                  "orphan_count": orphan_count, "glue_count": glue_count,
                   "avail_mb": avail_mb, "swap_used_mb": swap_used_mb,
                   "api_rss_mb": api_rss_mb,
                   "snapshot_freshness_s": round(max_age, 1) if max_age else 0,

@@ -13,7 +13,9 @@
   - 自愈后验证：重启后等 20s，若仍烧焦 → 记警（交给人工，不再自动循环）。
 
 用法（cron 每 5 分钟）：
-  */5 * * * * .venv/bin/python scripts/lms_entropy_watchdog.py >> logs/lms_entropy_watchdog.log 2>&1
+  # [C11] stdout 建议重定向 /dev/null：log() 已只写日志文件（不再 print），
+  # 避免 cron 与 log() 双写同一文件造成每条两行（crontab 属运维侧）
+  */5 * * * * .venv/bin/python scripts/lms_entropy_watchdog.py > /dev/null 2>&1
 """
 import json
 import os
@@ -33,7 +35,17 @@ SIGMA_SATURATED = 0.95   # σ 顶格线（饱和 → 轻量 σ 重置，不换�
 ENTROPY_HEALTHY = 0.995  # 低于此线记"健康"
 BURNT_STREAK_NEED = 2    # 连续 N 次烧焦才处置（防抖动）
 DISPOSE_COOLDOWN_S = 1800  # 处置后冷却
-SIGMA_RESET_COOLDOWN_S = 300  # σ 重置后冷却（比换蛋短：重置是轻操作）
+# [C11] σ 重置冷却 600s = 2× cron 周期（300s）：原 300s 恰等于 cron 周期 → 实际无冷却
+SIGMA_RESET_COOLDOWN_S = 600
+
+# [C2] 选蛋标准（lms-field-restore 技能）：健康蛋 ≠ 近当前态（每 34s 覆盖的 latest）
+EGG_MIN_AGE_S = 2 * 3600        # [C2] 蛋龄下限 2h：近当前态不是蛋，是刚孵化的鸡
+EGG_J_BAND = (5.0, 9.0)         # [C2] J 范数健康带（健康≈7；烧焦≈12）
+EGG_ISOLATION_S = 2 * 3600      # [C2] 换蛋后隔离期：2h 内不记录 last_healthy
+# [C2] 灰池修复完成时刻（2026-08-22 12:28:52，epoch 1787372932）；早于它的蛋不用。
+# 注：方案稿字面值 1724322532 系 2024-08-22 的笔误，与注释日期矛盾；按注释日期取正确 epoch，
+# 否则灰池修复前的旧蛋（pre-clean 08-10/08-17 等）会通过过滤被当作健康蛋。
+GRAY_FIX_MTIME = 1787372932.0
 
 
 def log(msg):
@@ -43,7 +55,8 @@ def log(msg):
             f.write(line + "\n")
     except Exception:
         pass
-    print(line, flush=True)
+    # [C11] 不再 print：cron 重定向 stdout 到同一日志文件会造成每条两行；
+    # 如需 stdout 留痕，改由 crontab 重定向到 /dev/null（运维侧动作，见方案 C11）
 
 
 def http_get(path, timeout=6):
@@ -81,26 +94,14 @@ def latest_snapshot():
         return ""
 
 
-def reset_sigma(state, reason):
-    """轻量 σ 重置：σ 饱和掉坑 → 把 σ 归零（保留 J/记忆），不重启、不换蛋。
-
-    2026-08-23：dandan 指出——σ 饱和是轻症状，用重置即可；换蛋（恢复
-    快照重启）只应留给熵真正烧焦（0.9995+）。此前把 σ>0.95 当换蛋触发，
-    一夜 18 次杀进程重启，属于用重操作治轻病。
-    """
-    log(f"♻️ σ 饱和重置（{reason}）")
+def _probe_snapshot_jnorm(snap_path):
+    """[C2] 子进程 torch.load 探测 J 范数（fail-open 返回 None，不阻塞主流程）。"""
+    script = ('import torch,warnings; warnings.filterwarnings("ignore");'
+              f'd=torch.load({os.path.join(SNAP_DIR, snap_path)!r},'
+              ' map_location="cpu", weights_only=False);'
+              'J=d["attractor"]["J"];'
+              'print(round(float(torch.norm(J, p="fro").item()),2))')
     try:
-        script = '''
-import torch, warnings; warnings.filterwarnings("ignore")
-from api.session_manager import SessionManager
-from api.config import get_api_config
-sm = SessionManager(default_config_factory=get_api_config)
-loop = sm.get_or_create("main")
-net = loop.attractor
-net.reset_state()  # E-P2-1：sigma 归零，不影响已学习的 J
-loop.save_session_state()
-print("sigma reset ok, J preserved")
-'''
         env = dict(os.environ)
         if os.path.exists(ENV_DUMP):
             for line in open(ENV_DUMP):
@@ -111,21 +112,71 @@ print("sigma reset ok, J preserved")
         proc = subprocess.run(
             [sys.executable, "-c", script],
             cwd="/vol2/1000/AI专用/living-memory-system-cloud",
-            env=env, capture_output=True, text=True, timeout=120)
-        out = (proc.stdout + proc.stderr).strip()
-        log(f"  重置输出: {out[-100:]}")
-        return "sigma reset ok" in out
-    except Exception as e:
-        log(f"❌ σ 重置失败: {e}")
-        return False
+            env=env, capture_output=True, text=True, timeout=60)
+        return float(proc.stdout.strip().splitlines()[-1])
+    except Exception:
+        return None
+
+
+def _pick_healthy_egg(now):
+    """[C2] 候选蛋筛选：蛋龄≥2h + mtime≥灰池修复 + J∈[5,9]（近当前态/毒蛋一律排除）。
+
+    按 mtime 从新到旧探测，第一个合格即返回（通常 1 次 torch.load 即止）；
+    无合格候选返回 None（保守：宁可无蛋也不回滚到近当前态）。"""
+    try:
+        cands = sorted(
+            (p for p in os.listdir(SNAP_DIR) if p.endswith(".pt")),
+            key=lambda p: os.path.getmtime(os.path.join(SNAP_DIR, p)),
+            reverse=True)
+    except Exception:
+        return None
+    for p in cands:
+        full = os.path.join(SNAP_DIR, p)
+        try:
+            mtime = os.path.getmtime(full)
+        except OSError:
+            continue
+        age = now - mtime
+        if age < EGG_MIN_AGE_S or mtime < GRAY_FIX_MTIME:
+            continue
+        j = _probe_snapshot_jnorm(p)
+        if j is None:
+            continue
+        if EGG_J_BAND[0] <= j <= EGG_J_BAND[1]:
+            return p
+    return None
+
+
+def reset_sigma(state, reason):
+    """[C3] σ 饱和处置 —— 获批前安全止血：不写磁盘、只告警。
+
+    2026-08-23：dandan 指出 σ 饱和是轻症状用重置即可；但独立进程 get_or_create
+    加载磁盘副本 reset + save 对 live :8190 **无效**（live 内存 σ 依然饱和，且 live
+    每 34s 覆盖磁盘，重置仅存活 ~34s），两进程并发写同一 latest_main.pt 还有撕裂风险。
+    进程内重置需新增 POST /control/reset-sigma 端点（新增端点 = 血管级 → [需批准]，dandan 未批）。
+    获批前：不 spawn 子进程、不写盘，仅 CRIT 告警提示人工处置。
+    """
+    log(f"♻️ σ 饱和（{reason}）——进程内重置端点未获批，本轮不处置、不写盘；建议人工 /control/reset-sigma（待 dandan 批准后接线）")
+    return False
 
 
 def dispose_burnt(state, reason):
-    """自动换蛋：停服 → 恢复健康快照 → 设 bias → 存档 → 重启。"""
+    """自动换蛋：停服 → 恢复健康快照 → 设 bias → 存档 → 重启（重启后验证）。"""
     log(f"⚠️ 触发自动换蛋（{reason}）")
+    now = time.time()
     snap = state.get("last_healthy", "")
     if not snap or not os.path.exists(os.path.join(SNAP_DIR, snap)):
         log("❌ 无健康快照可用（从未记录），跳过自动处置，交人工")
+        return False
+    # [C2] 毒蛋字段弃用校验：last_healthy 不满足蛋龄/灰池修复时刻 → 不换蛋
+    # （旧实现回滚近当前态 latest_main.pt → 恢复后 ~35 分钟再度饱和，换蛋循环丢记忆）
+    try:
+        mtime = os.path.getmtime(os.path.join(SNAP_DIR, snap))
+    except OSError:
+        log("❌ last_healthy 读取失败，跳过处置交人工")
+        return False
+    if mtime < GRAY_FIX_MTIME or now - mtime < EGG_MIN_AGE_S:
+        log(f"❌ last_healthy 不满足蛋龄/灰池修复校验（mtime {mtime}），毒蛋字段弃用，跳过处置交人工")
         return False
     try:
         # 停服
@@ -160,6 +211,10 @@ print("restored:", "{SNAP_DIR}/{snap}")
             cwd="/vol2/1000/AI专用/living-memory-system-cloud",
             env=env, capture_output=True, text=True, timeout=120)
         log(f"  恢复输出: {proc.stdout.strip()[-100:]} {proc.stderr.strip()[-100:]}")
+        # [C5] 恢复脚本 returncode 检查：rc!=0 → 假成功换蛋（30 分钟盲区）；一律不重启
+        if proc.returncode != 0:
+            log(f"❌ 恢复脚本失败（rc={proc.returncode}），不重启，交人工: {proc.stderr.strip()[-200:]}")
+            return False
         # 重启
         subprocess.Popen(
             [sys.executable, "-m", "api.run", "--host", "127.0.0.1",
@@ -167,7 +222,21 @@ print("restored:", "{SNAP_DIR}/{snap}")
             cwd="/vol2/1000/AI专用/living-memory-system-cloud",
             env=env, stdout=open("/tmp/lms-api.log", "a"),
             stderr=subprocess.STDOUT, start_new_session=True)
-        log("✅ 自动换蛋完成，LMS 已重启")
+        # [C5] 兑现 docstring"等 20s 验证"承诺：重启后复读 /status /landscape，
+        # 仍烧焦/饱和 → 返回 False（main() 不置 last_dispose，下轮可重试/升级人工）
+        time.sleep(20)
+        st2 = http_get("/status/main")
+        ls2 = http_get("/landscape/main")
+        if "error" in st2 or "error" in ls2:
+            log("❌ 重启后状态不可读（fail-open 复核失败）——不置 last_dispose（下轮重试/升级人工）")
+            return False
+        ent2 = float(st2.get("status", {}).get("entropy_ratio", 0) or 0)
+        top2 = ls2.get("landscape", {}).get("activation", {}).get("top_activated", [])
+        sig2 = max([n.get("sigma", 0) for n in top2], default=0)
+        if ent2 > ENTROPY_BURNT or sig2 > SIGMA_SATURATED:
+            log(f"❌ 重启后仍烧焦/饱和（熵 {ent2:.4f} / σmax {sig2:.3f}）——不置 last_dispose（下轮重试/升级人工）")
+            return False
+        log(f"✅ 换蛋成功且验证通过（熵 {ent2:.4f} / σmax {sig2:.3f}），LMS 已重启")
         return True
     except Exception as e:
         log(f"❌ 自动换蛋失败: {e}")
@@ -193,34 +262,14 @@ def main():
     top = act.get("top_activated", [])
     sigma_max = max([n.get("sigma", 0) for n in top], default=0)
 
-    # 记录健康快照（2026-08-22 修复：原判据"熵<0.995"对高位场永远不满足，
-    # 导致 last_healthy 恒空、自动换蛋无从换起。改判据：σ 未顶格(<0.9)即视为
-    # 可用健康蛋——σ 是更早的烧焦信号，熵会滞后。低熵低σ双健康时也记录。）
-    if sigma_max < 0.9 or entropy < ENTROPY_HEALTHY:
-        snap = latest_snapshot()
-        if snap:
-            state["last_healthy"] = snap
-            state["streak"] = 0
-            write_state(state)
-            log(f"✅ 已记录健康快照: {snap[:40]} (σmax {sigma_max:.3f} / 熵 {entropy:.4f})")
-        return 0
-
-    # 烧焦判定（2026-08-23 两级化：dandan 指出 σ 饱和≠焦蛋）
-    #  - σ 饱和（σmax > SIGMA_SATURATED）→ 轻量 σ 重置（不重启不换蛋）
-    #  - 熵烧焦（entropy > ENTROPY_BURNT）→ 重量换蛋（恢复快照重启）
+    # [C4] 判定顺序重构（2026-08-23 审计）：先判烧焦/饱和，再判健康——
+    # 原实现"σ<0.9 或 熵<0.995"先于烧焦判定：σ 饱和但熵<0.995 的 onset 阶段会把
+    # 饱和快照记为 last_healthy（毒蛋）且 return，σ 重置分支永不触发。
+    # 两级化（2026-08-23 dandan 指出 σ 饱和≠焦蛋）：
+    #   - 熵烧焦（entropy > ENTROPY_BURNT）→ 重量换蛋（恢复健康蛋快照重启）
+    #   - σ 饱和（σmax > SIGMA_SATURATED）→ 轻量 σ 重置（C3 获批前只告警不写盘）
     sigma_sat = sigma_max > SIGMA_SATURATED
     ent_burnt = entropy > ENTROPY_BURNT
-
-    if sigma_sat and not ent_burnt:
-        # 轻症状：σ 饱和但熵未烧焦 → σ 重置
-        cooldown = state.get("last_sigma_reset", 0)
-        if now - cooldown < SIGMA_RESET_COOLDOWN_S:
-            return 0
-        state["streak"] = 0
-        if reset_sigma(state, f"σmax {sigma_max:.3f} / 熵 {entropy:.4f}"):
-            state["last_sigma_reset"] = now
-            write_state(state)
-        return 0
 
     if ent_burnt:
         state["streak"] = state.get("streak", 0) + 1
@@ -231,6 +280,31 @@ def main():
                 state["streak"] = 0
                 state["last_dispose"] = now
                 write_state(state)
+        return 0
+
+    if sigma_sat:
+        # σ 饱和但熵未烧焦 → 轻量 σ 重置（不重启不换蛋；C3 获批前只告警不写盘）
+        cooldown = state.get("last_sigma_reset", 0)
+        if now - cooldown < SIGMA_RESET_COOLDOWN_S:
+            return 0
+        state["streak"] = 0
+        if reset_sigma(state, f"σmax {sigma_max:.3f} / 熵 {entropy:.4f}"):
+            state["last_sigma_reset"] = now
+            write_state(state)
+        return 0
+
+    # 未烧焦未饱和 → 健康记录：
+    # [C4] σmax<0.9 **且** 熵<ENTROPY_HEALTHY 同时成立才记录健康蛋；σmax>0.9 时绝不写
+    # last_healthy（防毒蛋）；中间带（0.995≤熵≤0.9995 且 σ<0.9）不健康也不烧焦 → 只清 streak。
+    # [C2] 健康蛋按选蛋标准记录（蛋龄≥2h + 灰池修复后 + J∈[5,9]）；换蛋后隔离期内跳过记录。
+    if sigma_max < 0.9 and entropy < ENTROPY_HEALTHY:
+        if now - state.get("last_dispose", 0) >= EGG_ISOLATION_S:
+            snap = _pick_healthy_egg(now)
+            if snap:
+                state["last_healthy"] = snap
+                log(f"✅ 已记录健康蛋: {snap[:40]} (σmax {sigma_max:.3f} / 熵 {entropy:.4f})")
+        state["streak"] = 0
+        write_state(state)
     else:
         state["streak"] = 0
         write_state(state)

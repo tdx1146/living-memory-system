@@ -668,7 +668,9 @@ class TestDreamEngineIntegration:
             loop.process_turn(t)
 
         # 做梦前检索："人工智能" 应是 top-1
-        query = loop.embedder.embed_text("人工智能")
+        # [A16] 存储文本统一带"用户:"前缀（issue A16 修复）→ 检索 query 需与
+        # 存储格式同构（旧裸文本 query 与新前缀存储不再同向量）
+        query = loop.embedder.embed_text("用户: 人工智能")
         entries_before = loop.memory.recall_episodic(query, top_k=1)
         assert len(entries_before) == 1
         assert "人工智能" in entries_before[0].text

@@ -19,6 +19,7 @@ import torch
 from runtime.dream_scheduler import DreamScheduler
 from runtime.loop import LivingMemoryLoop
 from runtime.config import default_config
+from core.hippocampus.dream_engine import DreamEngine
 
 
 def make_loop(tmp_path) -> LivingMemoryLoop:
@@ -86,7 +87,11 @@ class TestDreamStateJson:
         assert 'sampled_via_prob' in latest
         assert 'session_id' in latest and latest['session_id'] == 'main'
         # 重放集含测试记忆（turn=1）
-        assert 1 in latest['replay_set_ids']
+        # [A14] 条目标识改为文本哈希（issue A14）：同一测试记忆的 id =
+        # _entry_id(该条目)——用 make_loop 存入的条目判定（旧断言按 turn
+        # 值比较编码旧格式）
+        entry = next(iter(loop.memory.iter_episodic()))
+        assert DreamEngine._entry_id(entry) in latest['replay_set_ids']
 
         # 容量观测
         cap = state.get('capacity', {})

@@ -233,20 +233,28 @@ if _systemd_ok; then
     esac
 else
     case "$ACTION" in
-        start)   manual_start ;;
+        # [C13] start/restart 失败即退出（原实现丢弃 manual_start 返回值 →
+        # 启动失败仍继续执行 → 部署怀疑钩子把失败记成成功事件）
+        start)   manual_start || exit 1 ;;
         stop)    manual_stop ;;
-        restart) manual_stop && manual_start ;;
+        restart) manual_stop && manual_start || exit 1 ;;
         status)  manual_status ;;
         *)       fail "未知动作: $ACTION（支持 start|stop|restart|status）" ;;
     esac
 fi
 
 # ── 怀疑钩子：部署/重启后自动怀疑（fail-open 不阻断）────────────────
-# 每次 LMS API 启动/重启后生成 novelty 怀疑，喂 LMS 塑形 + 账本留痕
-if [ "$ACTION" = "start" ] || [ "$ACTION" = "restart" ]; then
+# 每次 LMS API 启动/重启成功后生成 novelty 怀疑，喂 LMS 塑形 + 账本留痕
+# [C13] 只在启动/重启**成功**后才触发：非 systemd 分支失败已在上方 exit 1；
+# systemd 分支 start/restart 失败也会 fail 退出——能走到这里的 start/restart 均为成功。
+_run_doubt_hook() {
+    local action="$1"
     _HOOK="$LMS_HOME/../Agent OS/doubt-system/doubt_hook.py"
     if [ -f "$_HOOK" ]; then
-        python3 "$_HOOK" --deploy "lms_ctl.sh $ACTION $(date '+%F %T')" \
+        python3 "$_HOOK" --deploy "lms_ctl.sh $action $(date '+%F %T')" \
             --health "$HEALTH_URL" --topic deploy-lms --quiet 2>/dev/null || true
     fi
+}
+if [ "$ACTION" = "start" ] || [ "$ACTION" = "restart" ]; then
+    _run_doubt_hook "$ACTION"
 fi
