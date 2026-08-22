@@ -1,4 +1,6 @@
 """在线学习环（主循环）
+⛔ 红线：process_turn 九步生命周期（ingest→encode→query→retrieve→integrate→doubt_check→commit→state_update→emit）
+   是观测/回滚的固定契约，改顺序=改系统语义。E3/再巩固/去稳定化都锚在九步内。改动前必读红线清单。
 
 活体记忆系统的主循环，对每轮对话执行完整的记忆循环：
 编码输入 -> 推断 -> 学习 -> 调整目的 -> 巩固记忆 -> 检索记忆 -> 解码context -> 返回

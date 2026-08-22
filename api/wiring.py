@@ -1,4 +1,6 @@
 # -*- coding: utf-8 -*-
+# ⛔ 红线文件（血管不换）：端点路径/请求参数/返回结构逐字节同构，改动前先读
+#    /vol1/@apphome/trim.openclaw/data/dsh/package/红线清单-LMS-给毛手毛脚的自己-20260822.md
 """api/wiring —— M1 接线段：/store /feed 端点 → core/store 写侧统一入口
 
 规格依据：`四妹-LMS核心重写规格v2-20260817.md` §1.5 / §4.1 / §5.2。

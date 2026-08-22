@@ -1,4 +1,6 @@
 """结构化怀疑摄入（体验层 D，设计 v1.1 §6.6 / §8.1）—— fail-open。
+⛔ 红线：_strip_artifact_prefix（2026-08-22 自喂断环）剥离"用户:/助手:"包装前缀——
+   移除会导致 E3 路径B 产物无限自喂、gap_registry 嵌套 [doubt] 主题堆积。
 
 数据源链路：doubt_ingest（/feed 结构化摄入）→ gap_registry（登记）→
 /status doubt.gaps + 回魂怀疑灯。
