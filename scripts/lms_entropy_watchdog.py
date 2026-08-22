@@ -153,13 +153,16 @@ def main():
     top = act.get("top_activated", [])
     sigma_max = max([n.get("sigma", 0) for n in top], default=0)
 
-    # 记录健康快照
-    if entropy < ENTROPY_HEALTHY:
+    # 记录健康快照（2026-08-22 修复：原判据"熵<0.995"对高位场永远不满足，
+    # 导致 last_healthy 恒空、自动换蛋无从换起。改判据：σ 未顶格(<0.9)即视为
+    # 可用健康蛋——σ 是更早的烧焦信号，熵会滞后。低熵低σ双健康时也记录。）
+    if sigma_max < 0.9 or entropy < ENTROPY_HEALTHY:
         snap = latest_snapshot()
         if snap:
             state["last_healthy"] = snap
             state["streak"] = 0
             write_state(state)
+            log(f"✅ 已记录健康快照: {snap[:40]} (σmax {sigma_max:.3f} / 熵 {entropy:.4f})")
         return 0
 
     # 烧焦判定
