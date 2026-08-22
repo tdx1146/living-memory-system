@@ -947,9 +947,12 @@ class TestAutoSnapshot:
         for i in range(5):
             loop.process_turn(f"快照测试第{i+1}轮")
 
-        # 新命名规范：default 会话子目录下的 snapshot_default_5_*.pt
+        # 新命名规范：default 会话子目录下的 snapshot_default_*.pt
+        # [A16] issue A16 修复：自动快照用增量前 turn 命名（_auto_snapshot
+        # 在 _increment_turn 之后运行，turn_count 已 +1，条目内容用增量前
+        # turn）→ 第5轮触发（turn_count=5）命名的快照为 snapshot_default_4_*.pt
         snapshots = glob.glob(
-            os.path.join(str(tmp_path), "default", "snapshot_default_5_*.pt"))
+            os.path.join(str(tmp_path), "default", "snapshot_default_4_*.pt"))
         assert len(snapshots) == 1, (
             f"第5轮应创建会话级快照文件，实际: {snapshots}"
         )
@@ -961,9 +964,10 @@ class TestAutoSnapshot:
         """快照按间隔创建，不是每轮都创建。
 
         设置 interval=5，运行7轮：
-          - 第5轮：turn_count=5, 5%5==0 → 创建 snapshot_default_5_*.pt
+          - 第5轮：turn_count=5, 5%5==0 → 触发快照
           - 第1-4轮, 6-7轮：不创建快照
         （T1.1/P0-5：会话级子目录命名）
+        [A16] 快照命名 = 增量前 turn：turn 5/10 触发 → 文件 4/9
         """
         config = make_test_config(
             auto_snapshot=True,
@@ -975,23 +979,24 @@ class TestAutoSnapshot:
         for i in range(7):
             loop.process_turn(f"间隔测试第{i+1}轮")
 
-        # 第5轮应创建快照
+        # 第5轮应创建快照（[A16] 命名 = 增量前 turn = 4）
         snap5 = glob.glob(
-            os.path.join(str(tmp_path), "default", "snapshot_default_5_*.pt"))
+            os.path.join(str(tmp_path), "default", "snapshot_default_4_*.pt"))
         assert len(snap5) == 1, f"第5轮应创建快照，实际: {snap5}"
 
-        # 非间隔轮次不应创建快照
-        for n in [1, 2, 3, 4, 6, 7]:
+        # 非间隔轮次不应创建快照（[A16] 命名偏移：触发轮 5/10 → 文件 4/9，
+        # 故 1/2/3/5/6/7/8 均不应有文件）
+        for n in [1, 2, 3, 5, 6, 7, 8]:
             paths = glob.glob(
                 os.path.join(str(tmp_path), "default", f"snapshot_default_{n}_*.pt"))
             assert not paths, f"第{n}轮不应创建快照，但文件存在: {paths}"
 
-        # 继续运行到第10轮，应创建第二个快照
+        # 继续运行到第10轮，应创建第二个快照（[A16] 命名 = 9）
         for i in range(7, 10):
             loop.process_turn(f"间隔测试第{i+1}轮")
 
         snap10 = glob.glob(
-            os.path.join(str(tmp_path), "default", "snapshot_default_10_*.pt"))
+            os.path.join(str(tmp_path), "default", "snapshot_default_9_*.pt"))
         assert len(snap10) == 1, f"第10轮应创建第二个快照，实际: {snap10}"
 
     def test_auto_snapshot_disabled_by_default(self, loop):

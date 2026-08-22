@@ -119,11 +119,13 @@ class TestWriteSideReinforcement:
         a = [e for e in hits if e.text == "条目A"][0]
         assert a.reference_count >= 1
         assert a.last_reinforced_turn == 42
-        # 既有语义（体验层 D 起）：count_reference 对全部得分条目计数（非仅 top_k），
-        # 加固刷新跟随同一路径——B 也被计数并刷新（L1 零回归，不改既有行为）
+        # [A3] issue A3 修复：先截取 top_k 后加固——只有真正进入 top_k 的条目
+        # 被计数/刷新。旧断言编码"count_reference 对全部得分条目计数"的 bug
+        # 语义（每轮给整批相似命中、含从未进 LLM context 的条目虚增引用/
+        # 置信度/磨损计时）——B 不在 top-1，不再虚增，保持入库原值。
         b = [e for e in m.iter_episodic() if e.text == "条目B"][0]
-        assert b.reference_count >= 1
-        assert b.last_reinforced_turn == 42
+        assert b.reference_count == 0
+        assert b.last_reinforced_turn == 11  # 入库 turn，未被刷新
 
     def test_reinforce_turn_none_no_refresh(self):
         """reinforce_turn=None（默认）不刷新 last_reinforced_turn（向后兼容）。"""

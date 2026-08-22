@@ -310,8 +310,11 @@ class TestSelfExternalCorrelation:
 
         similarities = []
         for ext_text, self_text in zip(external_texts, self_voice_texts):
+            # [A16] 存储文本统一带"用户:"前缀（issue A16）：系统消费/自述
+            # 蒸馏基于存储形态（"用户: {input}"）——相关度度量用同构输入，
+            # 否则裸文本与新前缀形态不再同向量（自述-外部相关度失真）
             ext_vec = loop.encoder.encode(
-                ext_text, loop.tokenizer, loop.embedder).vector
+                f"用户: {ext_text}", loop.tokenizer, loop.embedder).vector
             self_vec = loop.encoder.encode(
                 self_text, loop.tokenizer, loop.embedder).vector
             sim = SelfReferentialLoop._cosine_similarity(ext_vec, self_vec)

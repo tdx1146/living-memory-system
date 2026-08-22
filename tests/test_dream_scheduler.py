@@ -823,7 +823,9 @@ class TestSchedulerIntegration:
             scheduler.stop()
 
         # 验证记忆仍可被检索（做梦不破坏已有记忆）
-        query = loop.embedder.embed_text("重要的AI记忆内容")
+        # [A16] 存储文本统一带"用户:"前缀（issue A16）→ 检索 query 需与
+        # 存储格式同构（裸文本 query 与新前缀存储不再同向量）
+        query = loop.embedder.embed_text("用户: 重要的AI记忆内容")
         entries = loop.memory.recall_episodic(query, top_k=3)
         assert len(entries) > 0, "做梦后情景记忆仍应可被检索"
         assert "AI" in entries[0].text, (
