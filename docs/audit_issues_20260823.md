@@ -111,3 +111,42 @@
 
 **修复优先级**：C1（备份止血）→ A1（内在自愈根因）→ C2/C4/C5（watchdog 循环与毒蛋）→ B1/B2（并发/跨会话）→ A2/A3 → 其余按严重度。
 **需 dandan 批准**：C3（新增 /control/reset-sigma 端点，血管级）。
+
+---
+
+## 第1轮审计发现（独立复核，2026-08-23，追加）
+
+> 独立审计员复核结论：**全部 10 项 P0（A1/A2/A3/B1/B2/C1/C2/C4/C5，C3 按红线 [需批准] 仅止血）均已真正修复**；
+> py_compile/bash -n 全过；靶向单测全绿；全量 1241 passed。以下为本轮**新发现/计划偏差/存量问题**存档。
+
+### 新发现（本轮引入或计划未兑现）
+
+- [F1][2] **B17 未兑现**：`core/doubt/gap_registry.py` 全程**无 threading 锁**（grep `threading|RLock|Lock(` 零命中）。
+  模块 B 提交说明声称"B7/B17 由模块 A 的 A4 统一判定助手与 gap_registry RLock 一并覆盖"，但模块 A 改动
+  （被 03:50-04:10 auto-commit 抢先落库）只实现了 A4 `_same_case`（B7 属实），**RLock 从未落地**。
+  做梦线程 vs API 线程跨线程读写竞态（json.dump RuntimeError 被吞/列表推导期间增删丢更新）仍存在。
+  修法：按 fix_plan B17 方案补 `threading.RLock` + 全方法持锁（register_*/mark_resolved/is_resolved/snapshot/_persist 等）。
+- [F2][2] **B23 计划偏差（响应字段替换而非追加）**：fix_plan B23 明确"响应**新增** landscape_probe 字段（追加字段，向后兼容）"；
+  实现将 `/control/diagnose` 响应的 `recall_probe` **整体替换**为 `landscape_probe`。仓库内无 recall_probe 消费方（grep 证实），
+  但外部控制面 :8191 消费方若解析旧字段会断。建议：保留 recall_probe（值可置 null/ok:false 注明已废弃）或与 dandan 确认无外部消费方后归档。
+- [F3][2] **测试隔离缺陷（存量放大）**：tests 构造 `GapRegistry()` 直读共享 `data/gap_registry.json`（gitignored），
+  跨测试/跨运行污染 → 本次全量跑出现 4 例 doubt/e3 假失败（`test_ab_classes_in_lamp_c_class_diagnostic_only`、
+  `test_mark_resolved_lifecycle`、`test_switch_off_zero_participation`、`test_reactivation_path_a_persists_to_queue`），
+  在 clean 状态（HEAD worktree，空 data/）下 **4/4 全部通过**——非本轮代码回归，是测试卫生问题。
+  修法：conftest 为 GapRegistry 注入 tmp_path persist_path 隔离（推荐）或测试后清理该文件。
+
+### 存量失败（非本轮引入，需另排期）
+
+- `test_allostatic_j.py::TestColdStart::test_cold_start_keeps_init` / `TestNativeIntegration::test_cold_start_no_slide`：
+  断言 08-22 冷启动门旧行为，与 dandan 08-22"饱和/崩塌绕过冷启动"拍板冲突（286085b 即失败，已用 worktree 实证）。
+- `test_garbage_filter.py::TestLegacyGarbageUnchanged::test_garbage_re_count`：`_GARBAGE_TEXT_RE` 已 15 条而断言 12 条（早期增量未同步断言；286085b 即失败）。
+- `test_doubt_recall_exclusion.py::TestProcessTurnStoreGuard::test_is_doubt_event_helper`：
+  `is_doubt_event("用户: [doubt] 是什么意思？")` 返回 True——守卫把"用户提问提及 [doubt]"误判为 doubt 事件（286085b 即失败）。
+
+### 复核备注（验证要点）
+
+- **A1 属实且已修**：在 286085b worktree 复跑冷启动用例，日志出现 `cannot access local variable 'z'`（A1 根因实锤）；HEAD 下 z=0.0 初始化后该异常消失，j_target 重锚路径可达。
+- **C2 GRAY_FIX_MTIME 修正正确**：fix_plan 字面值 1724322532 系 2024-08-22 的 epoch 笔误；实现按注释日期重算为 1787372932（=2026-08-22 12:28:52+08）✓。
+- **C5 验证接线正确**：重启后复核读 `/status/main` 的 `status.entropy_ratio` 与 `/landscape/main` 的 `landscape.activation.top_activated[].sigma`，与端点实际返回结构逐字段核对一致。
+- **C3 红线合规**：`reset_sigma()` 改为不 spawn 子进程、不写盘、仅 CRIT 告警；/reset-sigma 端点未新增 ✓。
+- **过程备注**：模块 A 改动无独立 `fix(core)` 提交，被 10 分钟 auto-commit cron 抢先落入 fed0af2/9bc86b6/8af0a89（B/C 模块 commit 为完成标记或独立提交）——代码已落库，仅提交粒度不合规，后续可考虑禁止 auto-commit 抢占手工 fix 提交窗口。
