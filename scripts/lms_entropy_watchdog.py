@@ -158,6 +158,19 @@ def reset_sigma(state, reason):
     """
     token = os.environ.get("LMS_CONTROL_TOKEN", "").strip()
     if not token:
+        # cron 环境不加载 .env → 兜底解析 .env 文件（审计 P1：产线 token 缺失
+        # 导致自动重置死路）。只读，不污染进程环境。
+        try:
+            env_path = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), "..", ".env")
+            for line in open(env_path, encoding="utf-8"):
+                line = line.strip()
+                if line.startswith("LMS_CONTROL_TOKEN="):
+                    token = line.split("=", 1)[1].strip().strip('"').strip("'")
+                    break
+        except Exception:
+            token = ""
+    if not token:
         log(f"♻️ σ 饱和（{reason}）——LMS_CONTROL_TOKEN 未配置，无法调控制面，跳过（交人工）")
         return False
     try:

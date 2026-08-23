@@ -648,6 +648,9 @@ async def control_snapshot(request: Request, req: Optional[SnapshotRequest] = No
 
 class ResetSigmaRequest(BaseModel):
     session_id: str = Field("main", description="要重置 σ 的会话；缺省 main")
+    reanchor: bool = Field(
+        True, description="是否同时重锚 bias（默认 True：σ 归零 + bias←LMS_BIAS_SCALE，"
+                          "防重置后 30s 级回弹——纯重置请传 False）")
     # 兼容旧客户端 sid 别名（与数据面 /reset-sigma/{sid} 同策略，防静默丢弃）
     sid: Optional[str] = Field(None, description="session_id 兼容别名（旧客户端）")
 
@@ -678,7 +681,8 @@ async def control_reset_sigma(request: Request,
             sid = req.session_id
 
     rc, body = await _ahttp_json(
-        "POST", f"/reset-sigma/{urllib.parse.quote(sid)}", {}, timeout=15.0)
+        "POST", f"/reset-sigma/{urllib.parse.quote(sid)}",
+        {"reanchor": req.reanchor if req else True}, timeout=15.0)
     if rc != 200:
         _audit("reset_sigma", client, status="failed",
                extra={"session_id": sid, "rc": rc, "error": str(body)[:200]},

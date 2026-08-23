@@ -1433,7 +1433,7 @@ async def snapshot(session_id: str, req: SnapshotRequest):
 
 
 @app.post("/reset-sigma/{session_id}")
-async def reset_sigma(session_id: str):
+async def reset_sigma(session_id: str, req: Optional[dict] = None):
     """轻量 σ 重置（C3，2026-08-23 dandan 批准新增端点）。
 
     处置强度与症状匹配原则：σ 饱和是轻症状（工作点卡在饱和盆地），
@@ -1443,9 +1443,19 @@ async def reset_sigma(session_id: str):
     （审计 P0-8 实锤）；本端点让重置在 live 进程内生效，watchdog 改走
     控制面转发调用（见 api/control.py /control/reset-sigma）。
 
+    [C3-P2 有效性] reset_state() 只清 σ 向量、不动 J/bias 决定的吸引子
+    定点——若不重锚 bias，下一次 infer/dream 直接收敛回饱和盆地（审计
+    实测：重置后 33s 被自动做梦灌回 σ=0.999）。因此端点默认**同时重锚
+    bias**（=watchdog dispose_burnt 的既有方案）：bias ← LMS_BIAS_SCALE
+    （.env 默认 0.9），HomeostaticBias 同步——让重置后第一次做梦收敛到
+    健康工作点而非饱和盆地。req.reanchor=False 可关闭（纯重置）。
+
     与 snapshot/restore 同款做梦互斥：σ 是写路径，梦期重置会干扰
     半巩固状态 → acquire（失败 503）→ 重置 → finally release。
     """
+    reanchor = True
+    if isinstance(req, dict):
+        reanchor = bool(req.get("reanchor", True))
     sm = get_session_manager()
     scheduler = get_dream_scheduler()
     loop = sm.get(session_id)
@@ -1469,16 +1479,41 @@ async def reset_sigma(session_id: str):
         net = loop.attractor
         before = float(getattr(net, "sigma", torch.zeros(0)).abs().max().item() or 0)
         net.reset_state()  # E-P2-1：sigma 归零，不影响已学习的 J
-        loop.save_session_state()  # 落盘（live 进程内，与快照写者同源，无并发撕裂）
-        logger.info(f"[{session_id}] σ 重置完成（before_max={before:.4f}）")
+        if reanchor:
+            # [C3-P2] bias 重锚（=dispose_burnt 既有方案）：σ 归零后若不动
+            # bias，吸引子定点不变，下次做梦仍收敛回饱和盆地（审计实测
+            # 33s 回弹）。bias ← LMS_BIAS_SCALE（.env，默认 0.9），
+            # HomeostaticBias 同步（其接管时按自身目标带继续自适应）。
+            import os as _os
+            bias_scale = float(
+                _os.environ.get("LMS_BIAS_SCALE", "0.9") or 0.9)
+            net.bias = torch.full((net.num_nodes,), bias_scale,
+                                  device=net.bias.device)
+            hb = getattr(net, "homeostatic_bias", None)
+            if hb is not None:
+                hb.bias = bias_scale
+                hb.init_bias = bias_scale
+        # [C3-P2] 落盘结果显式反馈（P1-1 策略）：save_session_state 在快照写锁
+        # 超时返回 None（fail-open）——内存 σ 已清零但磁盘未更新，若声称成功，
+        # 进程崩溃后重启会从磁盘载入饱和态。与 /snapshot（1401-1407）同款：
+        # path None → 503 显式失败，不谎报成功。
+        path = loop.save_session_state()
+        if path is None:
+            raise HTTPException(
+                status_code=503,
+                detail="快照写锁超时，σ 重置落盘被跳过，请稍后重试",
+            )
+        logger.info(f"[{session_id}] σ 重置完成（before_max={before:.4f}, reanchor={reanchor}）")
         audit("reset_sigma", session_id=session_id,
               sigma_max_before=round(before, 4),
+              reanchor=reanchor,
               turn_count=loop.turn_count)
         return {
             "session_id": session_id,
             "reset": True,
             "sigma_max_before": round(before, 6),
             "j_preserved": True,
+            "bias_reanchored": bool(reanchor),
             "turn_count": loop.turn_count,
         }
     except Exception as e:
