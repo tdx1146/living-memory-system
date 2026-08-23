@@ -1465,6 +1465,7 @@ async def reset_sigma(session_id: str):
             detail="系统正在做梦（记忆巩固中），请稍后重试。")
 
     try:
+        import torch  # pylint: disable=import-outside-toplevel（与模块级轻导入约定一致）
         net = loop.attractor
         before = float(getattr(net, "sigma", torch.zeros(0)).abs().max().item() or 0)
         net.reset_state()  # E-P2-1：sigma 归零，不影响已学习的 J
