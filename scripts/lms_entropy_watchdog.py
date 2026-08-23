@@ -25,6 +25,7 @@ import time
 import urllib.request
 
 LMS_URL = "http://127.0.0.1:8190"
+CONTROL_URL = "http://127.0.0.1:8191"
 STATE_FILE = "/vol2/1000/AI专用/living-memory-system-cloud/runtime/entropy_watchdog_state.json"
 LOG_FILE = "/vol2/1000/AI专用/living-memory-system-cloud/logs/lms_entropy_watchdog.log"
 SNAP_DIR = "/vol2/1000/AI专用/living-memory-system-cloud/snapshots/main"
@@ -148,16 +149,34 @@ def _pick_healthy_egg(now):
 
 
 def reset_sigma(state, reason):
-    """[C3] σ 饱和处置 —— 获批前安全止血：不写磁盘、只告警。
+    """[C3] σ 饱和处置 —— 走控制面 :8191 /control/reset-sigma（dandan 2026-08-23 批准）。
 
-    2026-08-23：dandan 指出 σ 饱和是轻症状用重置即可；但独立进程 get_or_create
-    加载磁盘副本 reset + save 对 live :8190 **无效**（live 内存 σ 依然饱和，且 live
-    每 34s 覆盖磁盘，重置仅存活 ~34s），两进程并发写同一 latest_main.pt 还有撕裂风险。
-    进程内重置需新增 POST /control/reset-sigma 端点（新增端点 = 血管级 → [需批准]，dandan 未批）。
-    获批前：不 spawn 子进程、不写盘，仅 CRIT 告警提示人工处置。
+    原理：数据面新增 POST /reset-sigma/{session_id} 端点在 **live 进程内**
+    执行 attractor.reset_state()（σ 归零、保留 J 与记忆、不重启不换蛋），
+    由数据面唯一写者落盘。此前独立进程加载磁盘副本重置对 live 无效且
+    与快照写者并发写同一 .pt（审计 P0-8）；本实现消除无效处置与撕裂风险。
     """
-    log(f"♻️ σ 饱和（{reason}）——进程内重置端点未获批，本轮不处置、不写盘；建议人工 /control/reset-sigma（待 dandan 批准后接线）")
-    return False
+    token = os.environ.get("LMS_CONTROL_TOKEN", "").strip()
+    if not token:
+        log(f"♻️ σ 饱和（{reason}）——LMS_CONTROL_TOKEN 未配置，无法调控制面，跳过（交人工）")
+        return False
+    try:
+        req = urllib.request.Request(
+            CONTROL_URL + "/control/reset-sigma",
+            data=json.dumps({"session_id": "main"}).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "X-Control-Token": token,
+            },
+            method="POST")
+        with urllib.request.urlopen(req, timeout=15) as r:
+            body = json.loads(r.read().decode("utf-8", errors="replace"))
+        ok = bool(body.get("reset")) or bool(body.get("status") == "ok")
+        log(f"♻️ σ 饱和重置（{reason}）→ {'成功' if ok else '响应异常'} {str(body)[:120]}")
+        return ok
+    except Exception as e:
+        log(f"❌ σ 饱和重置失败（{reason}）: {e}")
+        return False
 
 
 def dispose_burnt(state, reason):
