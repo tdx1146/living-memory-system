@@ -1432,6 +1432,63 @@ async def snapshot(session_id: str, req: SnapshotRequest):
         scheduler.release_conversation(session_id)
 
 
+@app.post("/reset-sigma/{session_id}")
+async def reset_sigma(session_id: str):
+    """轻量 σ 重置（C3，2026-08-23 dandan 批准新增端点）。
+
+    处置强度与症状匹配原则：σ 饱和是轻症状（工作点卡在饱和盆地），
+    用轻处置——attractor.reset_state() 把 σ 归零、**保留已学习的 J 矩阵
+    与全部记忆**，不重启、不换蛋、不丢记忆。此前 watchdog 在独立进程里
+    加载磁盘副本重置——对 live 进程内存无效且与快照写者并发写同一文件
+    （审计 P0-8 实锤）；本端点让重置在 live 进程内生效，watchdog 改走
+    控制面转发调用（见 api/control.py /control/reset-sigma）。
+
+    与 snapshot/restore 同款做梦互斥：σ 是写路径，梦期重置会干扰
+    半巩固状态 → acquire（失败 503）→ 重置 → finally release。
+    """
+    sm = get_session_manager()
+    scheduler = get_dream_scheduler()
+    loop = sm.get(session_id)
+    if loop is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"会话 '{session_id}' 不存在",
+        )
+
+    scheduler.register_session(session_id)
+    acquired = await asyncio.get_event_loop().run_in_executor(
+        None, lambda: scheduler.acquire_conversation(session_id))
+    scheduler.touch(session_id)
+    if not acquired:
+        raise HTTPException(
+            status_code=503,
+            detail="系统正在做梦（记忆巩固中），请稍后重试。")
+
+    try:
+        net = loop.attractor
+        before = float(getattr(net, "sigma", torch.zeros(0)).abs().max().item() or 0)
+        net.reset_state()  # E-P2-1：sigma 归零，不影响已学习的 J
+        loop.save_session_state()  # 落盘（live 进程内，与快照写者同源，无并发撕裂）
+        logger.info(f"[{session_id}] σ 重置完成（before_max={before:.4f}）")
+        audit("reset_sigma", session_id=session_id,
+              sigma_max_before=round(before, 4),
+              turn_count=loop.turn_count)
+        return {
+            "session_id": session_id,
+            "reset": True,
+            "sigma_max_before": round(before, 6),
+            "j_preserved": True,
+            "turn_count": loop.turn_count,
+        }
+    except Exception as e:
+        logger.error(f"[{session_id}] σ 重置失败: {e}")
+        audit("critical_error", component="reset_sigma",
+              session_id=session_id, error=str(e)[:200])
+        raise HTTPException(status_code=500, detail=f"σ 重置失败: {e}")
+    finally:
+        scheduler.release_conversation(session_id)
+
+
 @app.post("/restore/{session_id}")
 async def restore(session_id: str, req: RestoreRequest):
     """从快照恢复指定 session 的状态。

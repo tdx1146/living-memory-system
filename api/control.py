@@ -646,6 +646,50 @@ async def control_snapshot(request: Request, req: Optional[SnapshotRequest] = No
     }
 
 
+class ResetSigmaRequest(BaseModel):
+    session_id: str = Field("main", description="要重置 σ 的会话；缺省 main")
+    # 兼容旧客户端 sid 别名（与数据面 /reset-sigma/{sid} 同策略，防静默丢弃）
+    sid: Optional[str] = Field(None, description="session_id 兼容别名（旧客户端）")
+
+
+@app.post("/control/reset-sigma")
+async def control_reset_sigma(request: Request,
+                              req: Optional[ResetSigmaRequest] = None):
+    """轻量 σ 重置（C3，2026-08-23 dandan 批准新增端点）。
+
+    透传数据面 :8190 POST /reset-sigma/{session_id}——在 **live 进程内**
+    执行 attractor.reset_state()（σ 归零、保留 J 与记忆、不重启不换蛋），
+    由数据面唯一写者落盘（无并发撕裂）。此前 watchdog 在独立进程加载
+    磁盘副本重置，对 live 内存无效且与快照写者并发写同一 .pt（审计
+    P0-8）；本端点修复该无效处置，watchdog 改走本端点。
+
+    鉴权：走 _require_write（LMS_CONTROL_TOKEN 或注册 client token）。
+    """
+    t0 = time.time()
+    _require_write(request)
+    client = _client_id_of(request)
+
+    sid = "main"
+    if req is not None:
+        if req.sid is not None and req.session_id == "main":
+            # 旧客户端 sid 别名（session_id 显式指定时以它为准）
+            sid = req.sid
+        elif req.session_id != "main":
+            sid = req.session_id
+
+    rc, body = await _ahttp_json(
+        "POST", f"/reset-sigma/{urllib.parse.quote(sid)}", {}, timeout=15.0)
+    if rc != 200:
+        _audit("reset_sigma", client, status="failed",
+               extra={"session_id": sid, "rc": rc, "error": str(body)[:200]},
+               latency_ms=(time.time() - t0) * 1000)
+        raise HTTPException(status_code=rc if rc else 502,
+                            detail=f"数据面 σ 重置失败: {body}")
+    _audit("reset_sigma", client, extra={"session_id": sid, **body},
+           latency_ms=(time.time() - t0) * 1000)
+    return {"status": "ok", "control": True, **body}
+
+
 @app.post("/control/register")
 async def control_register(request: Request, req: RegisterRequest):
     """接入方注册：写入 access.jsonl（client_id/用途/时间），返回一次性 client token。
