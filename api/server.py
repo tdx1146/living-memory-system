@@ -1516,6 +1516,12 @@ async def reset_sigma(session_id: str, req: Optional[dict] = None):
             "bias_reanchored": bool(reanchor),
             "turn_count": loop.turn_count,
         }
+    except HTTPException:
+        # 显式 HTTP 异常（404/503 等）原样透传，不被兜底 500 吞掉
+        # （与 /snapshot 端点 1420 行同款；否则 save_session_state 返回
+        # None 触发的 503 会被 except Exception 改写成 500，违背 P1-1
+        # "落盘失败显式 503" 的契约——2026-08-23 单测实证）
+        raise
     except Exception as e:
         logger.error(f"[{session_id}] σ 重置失败: {e}")
         audit("critical_error", component="reset_sigma",
