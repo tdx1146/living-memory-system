@@ -31,9 +31,11 @@ BACKFILL_MAX_TURNS = 20  # 首次见到某会话时最多回填的对话轮数
 
 
 def find_newest_session_file():
-    """返回最新被修改的 session.jsonl.zstd 绝对路径（工作区会话目录内）。"""
-    base = os.path.join(DSH_SESSIONS_DIR, WORKSPACE_DIR)
-    candidates = glob.glob(os.path.join(base, "session-*", "session.jsonl.zstd"))
+    """返回最新被修改的 session.jsonl.zstd 绝对路径。
+    2026-08-25 改造：遍历 sessions 下所有工作区目录（不再硬编码单一工作区），
+    使新建工作区（如 AI专用）的会话也能被喂入 LMS。"""
+    base = DSH_SESSIONS_DIR
+    candidates = glob.glob(os.path.join(base, "*", "session-*", "session.jsonl.zstd"))
     if not candidates:
         return None
     return max(candidates, key=os.path.getmtime)
