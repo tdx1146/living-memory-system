@@ -16,3 +16,5 @@ github.token.md
 *.key
 data/migration/*.pt
 *.pt.bak
+runtime/*.json
+*.jsonl
