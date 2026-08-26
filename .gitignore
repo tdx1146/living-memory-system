@@ -5,3 +5,14 @@ __pycache__/
 logs/
 *.egg-info/
 snapshots/
+# 敏感文件（2026-08-26 补：换盘整理时加）
+.env
+.env.*
+*.token
+key.md
+github.token.md
+*secret*
+*.pem
+*.key
+data/migration/*.pt
+*.pt.bak

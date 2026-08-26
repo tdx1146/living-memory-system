@@ -1,2 +1,7 @@
 {"event": "note", "kind": "round1_caliber", "round": 1, "msg": "round 1 口径=双写起始一致性（合并后唯一条目数/不丢记忆口径）：旧侧=迁移输入快照 419 条 + 归档唯一新增 25 条 = 444 （原始输入 419+165=584，其中 140 条与快照重复去重，公式 419+165-140=444）；新侧=迁移产物合并后 444 条。原始总数口径 584 vs 444 因去重天然不一致，不作为切单写闸门口径；闸门使用逐轮增量（loop 接线见 runtime/m7_dual_write.py docstring）。", "ts": 1787052234.2365038}
 {"event": "round", "round": 1, "old_increment": 444, "new_increment": 444, "match": true, "ts": 1787052242.4915147}
+{"event": "round", "round": 1865, "old_increment": 1, "new_increment": 1, "match": true, "ts": 1787725604.6724355}
+{"event": "round", "round": 1866, "old_increment": 1, "new_increment": 1, "match": true, "ts": 1787726651.3058136}
+{"event": "round", "round": 1867, "old_increment": 1, "new_increment": 1, "match": true, "ts": 1787728808.3553288}
+{"event": "round", "round": 1868, "old_increment": 1, "new_increment": 1, "match": true, "ts": 1787729570.4608526}
+{"event": "round", "round": 1869, "old_increment": 1, "new_increment": 1, "match": true, "ts": 1787731972.7038755}
