@@ -1,0 +1,77 @@
+# =============================================================================
+# LMS 活体记忆系统 - HTTP API systemd 用户单元（T1.9 / P0-8）
+# -----------------------------------------------------------------------------
+# 背景：阶段 1-A 之前 API 为 PPID=1 孤儿进程（最长静默不可用 4 天），
+#   无看门狗、无自愈。本单元提供：Restart=always 自动拉起 + 优雅停机配合
+#   （server.py 内置 30s 落盘看门狗）+ 环境注入 + 日志统一落 logs/。
+#
+# 安装（用户单元，不要求 root；生效步骤见阶段1C报告 §T1.9）：
+#   mkdir -p ~/.config/systemd/user
+#   ln -s /vol2/1000/AI专用/living-memory-system-cloud/scripts/lms-api.service \
+#         ~/.config/systemd/user/lms-api.service
+#   export XDG_RUNTIME_DIR=/run/user/$(id -u)     # 非登录 shell 需手动导出
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now lms-api
+#
+# 注意：
+#   * EnvironmentFile 指向项目 .env（含 DEEPSEEK_API_KEY 等，权限已 0600/项目私有）；
+#   * .env 中 LMS_API_HOST/LMS_API_PORT 若被修改，会覆盖下方 ExecStart 参数
+#     （run.py 参数优先于环境变量，二者一致即可）。
+#   * StandardOutput=append 相对路径基于 WorkingDirectory 解析，logs/ 须存在
+#     （ExecStartPre 兜底 mkdir）。
+# =============================================================================
+
+[Unit]
+Description=LMS Living Memory System HTTP API (:8190, 唯一快照写者)
+# 数据面端口，等网络就绪后再启动（用户管理器下 network.target 仅作排序参考）
+After=network.target
+# 防崩溃风暴：60s 内超过 10 次重启则进入 failed，等待人工介入
+StartLimitIntervalSec=60
+StartLimitBurst=10
+
+[Service]
+Type=simple
+
+# 项目根：run.py 内部会 os.chdir 到项目根，此处同时兜底相对路径
+# （logs/、snapshots/、.env 的相对引用）。
+WorkingDirectory=/vol2/1000/AI专用/living-memory-system-cloud
+
+# 环境注入：.env 为 shell 兼容格式（KEY=VALUE，无引号/无内联注释），
+# systemd EnvironmentFile 可直接解析。
+EnvironmentFile=/vol2/1000/AI专用/living-memory-system-cloud/.env
+
+# 启动命令：与 start_all.sh 完全一致（.venv 3.11 + api.run 模块入口）。
+# --host/--port 显式固定 127.0.0.1:8190（不对外暴露）。
+ExecStart=/vol2/1000/AI专用/living-memory-system-cloud/.venv/bin/python -m api.run --host 127.0.0.1 --port 8190
+
+# logs/ 目录兜底（克隆/迁移后首次启动也能落盘）
+ExecStartPre=/bin/mkdir -p logs run
+
+# ---- 监督策略（P0-8）----
+# 崩溃即拉起，5s 后重试
+Restart=always
+RestartSec=5
+# 启动含 embedder/模型初始化（cloud embed 网络握手），最长 90s
+TimeoutStartSec=90
+# 优雅停机：server.py 有 30s 落盘看门狗（LMS_SHUTDOWN_GRACE_SECONDS，默认 30），
+# systemd 给 35s 裕量，超时 SIGKILL（T1.7/P0-13 配套）
+TimeoutStopSec=35
+# 内存优先存活（P2-8）：OOM 时优先杀 MCP/其他进程，保护唯一快照写者
+OOMScoreAdjust=-200
+
+# ---- 日志（T1.10/P1-7）----
+# uvicorn 与应用 logging 均写 stderr（server.py 无 Python 侧文件 handler），
+# 统一 append 到 logs/lms_api.log（绝对路径，systemd-analyze verify 通过），
+# 由 scripts/lms_logrotate.conf 轮转。
+# 注：append: 模式下进程持有同一 fd，logrotate 需配 copytruncate（已配）。
+StandardOutput=append:/vol2/1000/AI专用/living-memory-system-cloud/logs/lms_api.log
+StandardError=inherit
+
+# ---- 可选：systemd 看门狗 ----
+# WatchdogSec 需要服务主动 sd_notify 喂狗（WATCHDOG=1）；uvicorn/FastAPI
+# 当前未实现 → 开启会被 systemd 误杀。保留配置位，待 API 侧接入 sd_notify
+# （python systemd 绑定或 ctypes 调 sd_notify）后再启用：
+# WatchdogSec=120
+
+[Install]
+WantedBy=default.target
