@@ -55,6 +55,23 @@ log()  { echo "[lms_ctl] $*"; }
 warn() { echo "[lms_ctl][WARN] $*" >&2; }
 fail() { echo "[lms_ctl][ERROR] $*" >&2; exit 1; }
 
+# 总线部署事件（2026-08-29）：门禁拒绝/配置漂移写 event_bus.jsonl（Agent OS 总线）
+_bus_event() {
+    local type="$1" detail="$2" bus
+    bus="/vol2/1000/AI专用/Agent OS/iso-sand/data/event_bus.jsonl"
+    [ -f "$bus" ] || return 0
+    python3 - "$type" "$detail" "$bus" <<'PYEOF'
+import json, sys, uuid
+from datetime import datetime
+etype, detail, bus = sys.argv[1], sys.argv[2], sys.argv[3]
+rec = {"t": datetime.now().isoformat(), "schema_version": "1.1",
+       "event_id": str(uuid.uuid4()), "event_type": etype,
+       "producer": "lms_ctl/preflight", "result": {"detail": detail}}
+with open(bus, "a", encoding="utf-8") as f:
+    f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+PYEOF
+}
+
 # systemd 用户管理器可用 + 单元已安装？
 _systemd_ok() {
     [ "$FORCE_MANUAL" -eq 1 ] && return 1
@@ -132,6 +149,29 @@ manual_start() {
         return 0
     fi
     [ -f "$LMS_HOME/.env" ] || fail "缺少 $LMS_HOME/.env（含密钥与嵌入配置）"
+    # ── pre-flight 门禁（2026-08-29 dandan 拍板：防瞎改——错误在启动前暴露）──
+    # 架构约束：LMS embedder 必须走手机（LMS_EMBEDDER=cloud），本地/pretrained 是错误配置
+    if ! grep -q '^LMS_EMBEDDER=cloud' "$LMS_HOME/.env"; then
+        log "❌ pre-flight 拒绝启动: LMS_EMBEDDER 必须 =cloud（架构要求手机 embedder，部署手册 §第1步）"
+        _bus_event deploy.preflight_fail "LMS_EMBEDDER!=cloud"
+        exit 1
+    fi
+    # 手机 11435（embed，LMS 命脉）必须可达
+    if ! (echo > /dev/tcp/192.168.0.103/11435) 2>/dev/null; then
+        log "❌ pre-flight 拒绝启动: 手机 embed(11435) 不通——LMS 命脉（部署手册 §第1步）"
+        log "   手机 Termux: cd ~/embed-server && nohup node embed-server.mjs &"
+        _bus_event deploy.preflight_fail "phone_embed_11435_down"
+        exit 1
+    fi
+    # .env 关键键齐全（缺任一 = 配置漂移/不完整）
+    for _k in LMS_EMBEDDER LMS_CLOUD_EMBED_URL LMS_DATA_DIR DREAM_IDLE_THRESHOLD; do
+        if ! grep -q "^$_k=" "$LMS_HOME/.env"; then
+            log "❌ pre-flight 拒绝启动: .env 缺关键键 $_k（配置漂移）"
+            _bus_event deploy.preflight_fail "missing_env_$_k"
+            exit 1
+        fi
+    done
+    log "✅ pre-flight 通过（cloud embedder + 手机 11435 + .env 键齐全）"
     mkdir -p "$RUN_DIR" "$LMS_HOME/logs"
     log "启动（非 systemd 模式，日志: $LOG_FILE）..."
     # 镜像 start_all.sh 范式：子 shell 内 cd + source .env + setsid 独立会话
