@@ -8,12 +8,16 @@ LMS MCP 工具 - 通过HTTP API调用活体记忆系统
 - lms_status: 查询记忆系统状态
 """
 
+import os
 import sys
 import json
 import requests
 from typing import Optional
 
-LMS_API_URL = "http://localhost:8190"
+# [2026-08-30 修复] V1 LMS :8190 已停用（四妹 V2 切换：agentos-v2/lms-api 监听 :8191）。
+# 旧硬编码导致 DSH 的 MCP 工具调用死等（toolCallTimeoutMs 15s）→ 四妹“思考几秒就已停止”。
+# 改为 env 可覆盖，默认指向当前在跑的 V2。
+LMS_API_URL = os.environ.get("LMS_URL", "http://localhost:8191")
 DEFAULT_SESSION = "main"
 
 

@@ -22,7 +22,13 @@ import zstandard
 
 DSH_SESSIONS_DIR = "/vol1/@apphome/trim.openclaw/data/home/.dsh/sessions"
 WORKSPACE_DIR = "--vol1-~0040apphome-trim.openclaw-data-dsh-package--"
-LMS_API_URL = "http://localhost:8190"
+# [2026-08-30 修复] V1 LMS :8190 已停用（四妹 V2 切换：agentos-v2/lms-api 监听 :8191）。
+# 旧硬编码导致本 watcher 每 2 分钟失败（当日 1426 次）→ 四妹的对话进不了共享脑。
+# 另：V1 的 /chat（可检索写路径）在 V2 不存在；V2 的 /store 就是完整写入路径
+# （走 ingest→encode→retrieve→commit 全生命周期，entries 增长且可检索，已实测），
+# payload 字段与 /chat 同构（session_id/user_input/llm_output）。两者均可 env 覆盖。
+LMS_API_URL = os.environ.get("LMS_URL", "http://localhost:8191")
+LMS_WRITE_PATH = os.environ.get("LMS_WRITE_PATH", "/store")
 WATERMARK_FILE = "/vol2/1000/AI专用/living-memory-system-cloud/runtime/lms_dsh_feed_watermark.json"
 SID = "main"
 USER_TEXT_MAX = 2000
@@ -70,9 +76,9 @@ def extract_text(obj, kind):
 
 
 def chat(user_input, llm_output):
-    """POST /chat；503（做梦）抛异常由调用方处理。"""
+    """POST 写入端点（V1 /chat → V2 /store，env LMS_WRITE_PATH 可覆盖）；503（做梦）抛异常由调用方处理。"""
     r = requests.post(
-        f"{LMS_API_URL}/chat",
+        f"{LMS_API_URL}{LMS_WRITE_PATH}",
         json={"session_id": SID, "user_input": user_input, "llm_output": llm_output},
         timeout=30,
     )
