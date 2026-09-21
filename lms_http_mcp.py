@@ -45,13 +45,14 @@ def lms_recall(user_input: str, sid: str = DEFAULT_SESSION) -> dict:
         response = requests.post(
             f"{LMS_API_URL}/recall",
             json={"session_id": sid, "query": user_input, "k": 5},
-            timeout=10
+            timeout=30
         )
         response.raise_for_status()
         data = response.json()
 
         # /recall 响应自带 turn_count 锚点（只读校验用，测试与可观测性）
-        anchor_turn = int(data.get("turn_count", 0) or 0) \
+        # 2026-09-21：v2 /recall 平铺字段名是 turn（不是 turn_count）
+        anchor_turn = int(data.get("turn", 0) or 0) \
             if isinstance(data, dict) else 0
 
         # 组装 memory_context（相关记忆文本；与旧 /chat 返回形态同构）
@@ -70,12 +71,13 @@ def lms_recall(user_input: str, sid: str = DEFAULT_SESSION) -> dict:
         memory_state = {}
         turn_count = anchor_turn
         try:
-            st = requests.get(f"{LMS_API_URL}/status/{sid}", timeout=5)
+            st = requests.get(f"{LMS_API_URL}/status/{sid}", timeout=15)
             if st.status_code == 200:
-                status = st.json().get("status", {})
+                # 2026-09-21：v2 /status 是**平铺**的（无 "status" 嵌套；键= turn）
+                status = st.json()
                 if isinstance(status, dict):
                     memory_state = status
-                    turn_count = int(status.get("turn_count", 0) or 0)
+                    turn_count = int(status.get("turn", 0) or 0)
         except Exception:
             pass  # /recall 的 turn_count 锚点兜底
 
@@ -105,22 +107,30 @@ def lms_store(user_input: str, llm_output: str = "", sid: str = DEFAULT_SESSION)
         # 字段（服务端 pydantic 默认忽略未知字段）→ 所有 MCP 存储静默落进 default 脑。
         # 现在真正 POST {session_id, user_input, llm_output}，文本由服务端
         # process_turn(user_input, llm_output) 落库（session_id 为统一字段名）。
+        #
+        # 2026-09-21 修复单（另一处 v2 契约漂移）：端点原打 /chat——**v2 无此
+        # 路由** ⇒ 恒 404 ⇒ 本工具从 v2 切换起就一直在"把记忆写进虚空"。改为
+        # v2 真实写口 /store（StoreRequest 契约一致）；响应改读 v2 平铺字段。
+        # 超时 10s→60s：实测 /store 11-17s（手机端 embed 4.5-6.5ms/字 + process
+        # 3.4s）⇒ 原 10s 内必然放弃（假失败）。
         response = requests.post(
-            f"{LMS_API_URL}/chat",
+            f"{LMS_API_URL}/store",
             json={
                 "session_id": sid,
                 "user_input": user_input,
                 "llm_output": llm_output,
             },
-            timeout=10
+            timeout=60
         )
         response.raise_for_status()
         data = response.json()
         
         return {
             "success": True,
-            "stored": True,
-            "turn_count": data.get("memory_state", {}).get("turn_count", 0)
+            "stored": bool(data.get("stored", True)),
+            "dedup_hit": bool(data.get("dedup_hit", False)),
+            "turn_count": int(data.get("turn", 0) or 0),
+            "surprise": data.get("surprise"),
         }
     except Exception as e:
         return {"success": False, "error": str(e)}
@@ -152,15 +162,22 @@ def lms_status(sid: str = DEFAULT_SESSION) -> dict:
         response.raise_for_status()
         data = response.json()
         
+        # 2026-09-21 修复单：原字段名（turn_count/num_nodes=256恒兜底/last_*/
+        # precision_mean/episodic_buffer_size）在 v2 **一个都不存在** ⇒ 恒返
+        # 假值（turn=0 / 256 / None）。改为 v2 真实平铺字段（四妹 09-19 实测值域）；
+        # 无等价物的旧键**删掉**（不留"看起来有值"的恒兜底假读数）。
+        cap = data.get("capacity") or {}
         return {
             "success": True,
             "exists": True,
-            "turn_count": data.get("turn_count", 0),
-            "num_nodes": data.get("num_nodes", 256),
-            "last_entropy": data.get("last_entropy"),
-            "last_surprise": data.get("last_surprise"),
-            "precision_mean": data.get("precision_mean"),
-            "episodic_buffer_size": data.get("episodic_buffer_size", 0)
+            "turn_count": int(data.get("turn", 0) or 0),
+            "j_target": data.get("j_target"),
+            "surprise": data.get("surprise"),
+            "entropy": data.get("entropy"),
+            "degraded": data.get("degraded"),
+            "capacity": data.get("capacity"),
+            "num_nodes": cap.get("num_nodes"),
+            "entries": cap.get("entries"),
         }
     except Exception as e:
         return {"success": False, "error": str(e)}
@@ -178,15 +195,21 @@ def lms_dream(sid: str = DEFAULT_SESSION) -> dict:
     try:
         response = requests.post(
             f"{LMS_API_URL}/dream/{sid}",
-            timeout=30
+            timeout=120
         )
         response.raise_for_status()
         data = response.json()
         
+        # 2026-09-21 修复单：原实现"只要 HTTP 200 就报做梦完成"——status
+        # 为 skipped/failed 也报成功（假成功）。按服务端真实值域判（四妹实测
+        # 成功值="dreamed"）：仅 None/skipped/failed 视为未完成。
+        _res = data.get("result") or {}
+        _st = _res.get("status")
         return {
             "success": True,
-            "dream_completed": True,
-            "details": data
+            "dream_completed": _st not in (None, "skipped", "failed"),
+            "dream_status": _st,
+            "details": _res,
         }
     except Exception as e:
         return {"success": False, "error": str(e)}
@@ -204,7 +227,9 @@ def lms_snapshot(sid: str = DEFAULT_SESSION) -> dict:
     try:
         response = requests.post(
             f"{LMS_API_URL}/snapshot/{sid}",
-            timeout=10
+            # 2026-09-21：实测快照 json.dumps 18s+、写盘 35-70s；原 timeout=10
+            # 必然"客户端放弃/服务端已写"（假失败，诱发 133MB 重试）。
+            timeout=180
         )
         response.raise_for_status()
         data = response.json()

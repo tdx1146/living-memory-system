@@ -32,6 +32,7 @@ import os
 import sys
 import json
 import logging
+import threading
 from typing import Any
 
 logger = logging.getLogger("mcp_memory_server")
@@ -50,12 +51,15 @@ LMS_API_URL = os.environ.get("LMS_URL", "http://localhost:8190").rstrip("/")
 SESSION_ID = os.environ.get("LMS_MCP_SESSION_ID", "main").strip() or "main"
 
 # 各端点超时（秒）：与 lms_http_mcp.py 的约定对齐（检索/存储放宽到 15s）
+# [2026-09-21 修复单] 预算对齐真实端点耗时——原值天然超时：
+#   /feed 与 /store 同量级（embed 4.5-6.5ms/字 + process ~3.4s ⇒ 11-17s，长文更久），
+#   原 15s 必然超；/snapshot 实测 35-70s（json.dumps 18s+ / 写盘 133MB），原 15s 必失败。
 _TIMEOUTS = {
-    "recall": 15.0,   # /recall 只读检索（目标 ~1s，放宽兜底）
-    "feed": 15.0,     # /feed 塑形写（process_turn，无 LLM）
-    "snapshot": 15.0,  # /snapshot 触发 API 落盘
-    "status": 8.0,    # /status 状态查询
-    "dream": 60.0,    # /dream 做梦（最慢路径，放宽）
+    "recall": 30.0,    # /recall 只读检索（长 query embed 可 >15s）
+    "feed": 60.0,      # /feed 塑形写（process_turn + embed，实测 11-17s+）
+    "snapshot": 120.0,  # /snapshot 落盘（实测 35-70s；仅后台线程用）
+    "status": 30.0,    # /status（会话锁串行时可能排队）
+    "dream": 120.0,    # /dream 做梦（最慢路径，放宽）
 }
 
 
@@ -112,6 +116,42 @@ def _to_json(obj: Any) -> str:
 
 
 # ---------------------------------------------------------------------------
+# 快照后台触发（2026-09-21 修复单）
+# ---------------------------------------------------------------------------
+_snapshot_lock = threading.Lock()
+_snapshot_inflight = False
+
+
+def _schedule_snapshot() -> bool:
+    """后台触发一次 /snapshot（daemon 线程）；已在跑则跳过（防堆积）。
+
+    返回 True=本次已发起，False=已有在跑被跳过。失败只告警（不影响存储本身）。
+    """
+    global _snapshot_inflight
+    with _snapshot_lock:
+        if _snapshot_inflight:
+            logger.info("快照已在后台进行，跳过本次触发")
+            return False
+        _snapshot_inflight = True
+
+    def _run() -> None:
+        global _snapshot_inflight
+        try:
+            snap = _http_post(f"/snapshot/{SESSION_ID}", {},
+                              _TIMEOUTS["snapshot"])
+            logger.info("后台快照完成: saved=%s path=%s",
+                        snap.get("saved"), snap.get("path", ""))
+        except Exception as e:  # fail-open：不影响已成功的存储
+            logger.warning(f"后台快照触发失败（不影响存储本身）: {e}")
+        finally:
+            with _snapshot_lock:
+                _snapshot_inflight = False
+
+    threading.Thread(target=_run, name="mcp-snapshot", daemon=True).start()
+    return True
+
+
+# ---------------------------------------------------------------------------
 # 工具逻辑实现（薄桥转发，纯函数可独立测试）
 # ---------------------------------------------------------------------------
 
@@ -134,8 +174,9 @@ def do_recall_memory(query: str) -> str:
     # 附加当前会话状态（只读 GET，失败不影响检索结果本身）
     try:
         st_data = _http_get(f"/status/{SESSION_ID}", _TIMEOUTS["status"])
-        status = st_data.get("status", {}) if isinstance(st_data, dict) else {}
-        buffer_size = status.get("episodic_buffer_size", 0)
+        # [2026-09-21 修复单] v2 /status 是平铺的（无 "status" 嵌套）⇒ 原取法恒得 {}
+        status = st_data if isinstance(st_data, dict) else {}
+        buffer_size = (status.get("capacity") or {}).get("entries", 0)
     except Exception as e:
         logger.warning(f"检索后获取状态失败（忽略）: {e}")
 
@@ -190,6 +231,12 @@ def do_store_memory(text: str) -> str:
       2. POST /snapshot/{sid} → 触发 API 统一落盘（快照写者只有 API，P0-4 根除）；
       3. GET /status/{sid}    → 回填状态字段，保持旧返回契约的信息量。
     任一步失败均不静默：抛异常 → MCP 侧 is_error 可见。
+
+    [2026-09-21 修复单] 本工具"超时"根因 = 调用方预算不足 + 快照阻塞：
+      · /feed 实测 11-17s+（embed 随文本线性增长），原 timeout=15s 必然超；
+      · /snapshot 实测 35-70s（大会话 133MB），同步等待必超预算，且失败诱发
+        重试（每次重试多写 133MB）。⇒ /feed 超时放宽到 60s；**快照改为后台
+        触发**（只发起不等待，结果由服务端日志观测），工具在写入后即返回。
     """
     # 语义校验（保留原解析函数，确认文本非空）
     user_input, _ = _parse_conversation(text)
@@ -203,34 +250,31 @@ def do_store_memory(text: str) -> str:
         "source": "mcp",
     }, _TIMEOUTS["feed"])
 
-    # 2. 触发 API 落盘快照（保持旧"存储即保存快照"语义；失败仅告警不阻断）
-    snapshot_saved = False
-    snapshot_path = ""
-    try:
-        snap = _http_post(f"/snapshot/{SESSION_ID}", {}, _TIMEOUTS["snapshot"])
-        snapshot_saved = bool(snap.get("saved", False))
-        snapshot_path = snap.get("path", "")
-    except Exception as e:
-        logger.warning(f"快照触发失败（不影响存储本身）: {e}")
+    # 2. 触发 API 落盘快照（保持旧"存储即保存快照"语义）——[2026-09-21 修复单]
+    #    改为**后台触发**：大会话快照 35-70s，同步等待必然超出调用方预算（实测
+    #    store_memory 15s 超时），且假失败诱发重试（每次多写 133MB）。这里只
+    #    "发起"，不阻塞本工具返回；已在跑则跳过（防堆积）。
+    snapshot_scheduled = _schedule_snapshot()
 
-    # 3. 回填状态
+    # 3. 回填状态（[2026-09-21] v2 /status 平铺：键= turn/entropy/surprise/
+    #    capacity{entries,...}；旧键名在 v2 不存在 ⇒ 不再恒返假值/空值）
     status = {}
+    cap = {}
     try:
         st_data = _http_get(f"/status/{SESSION_ID}", _TIMEOUTS["status"])
-        status = st_data.get("status", {}) if isinstance(st_data, dict) else {}
+        status = st_data if isinstance(st_data, dict) else {}
+        cap = status.get("capacity") or {}
     except Exception as e:
         logger.warning(f"存储后获取状态失败（忽略）: {e}")
 
     result = {
         "status": "已存储",
-        "turn_count": int(feed.get("turn_count", status.get("turn_count", 0)) or 0),
-        "episodic_buffer_size": status.get("episodic_buffer_size", 0),
-        "last_entropy": status.get("last_entropy"),
-        "last_surprise": status.get("last_surprise"),
-        "precision_mean": status.get("precision_mean"),
-        "purpose_coherence": status.get("purpose_coherence"),
-        "snapshot_saved": snapshot_saved,
-        "snapshot_path": snapshot_path,
+        "turn_count": int(feed.get("turn_count", status.get("turn", 0)) or 0),
+        "episodic_buffer_size": cap.get("entries", 0),
+        "entropy": status.get("entropy"),
+        "surprise": status.get("surprise"),
+        "snapshot_scheduled": snapshot_scheduled,
+        "snapshot_note": "快照改为后台触发（大会话 35-70s，同步等待必超预算）",
         # /feed 不返回 memory_context（服务端丢弃）；置空并说明，避免调用方误用
         "memory_context": "",
     }
